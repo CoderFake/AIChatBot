@@ -1,5 +1,13 @@
 # Cấu trúc Dự án Hệ thống Agentic RAG
 
+## Tech Stack
+- **Database**: PostgreSQL
+- **Vector Database**: Milvus  
+- **Cache**: Redis
+- **Object Storage**: MinIO
+- **Embedding Model**: BAAI/bge-M3 (Multilingual)
+- **Framework**: FastAPI + LangGraph
+
 ```
 AIChatBot/
 ├── README.md
@@ -14,7 +22,10 @@ AIChatBot/
 │   ├── config/
 │   │   ├── __init__.py
 │   │   ├── settings.py            # Cấu hình ứng dụng
-│   │   ├── database.py            # Database connection config
+│   │   ├── database.py            # PostgreSQL connection config
+│   │   ├── redis_config.py        # Redis configuration
+│   │   ├── minio_config.py        # MinIO configuration
+│   │   ├── milvus_config.py       # Milvus configuration
 │   │   └── auth_config.py         # Authentication configuration
 │   │
 │   ├── core/
@@ -64,7 +75,7 @@ AIChatBot/
 │   │   └── vector/
 │   │       ├── __init__.py
 │   │       ├── milvus_models.py  # Milvus collection schemas
-│   │       └── embedding_models.py # Embedding model definitions
+│   │       └── embedding_models.py # BAAI/bge-M3 model definitions
 │   │
 │   ├── services/
 │   │   ├── __init__.py
@@ -74,12 +85,16 @@ AIChatBot/
 │   │   │   └── permission_service.py # Permission management
 │   │   ├── embedding/
 │   │   │   ├── __init__.py
-│   │   │   ├── embedding_service.py # Text embedding service
-│   │   │   └── model_manager.py     # Embedding model management
+│   │   │   ├── embedding_service.py # BAAI/bge-M3 embedding service
+│   │   │   └── model_manager.py     # BGE-M3 model management
 │   │   ├── vector/
 │   │   │   ├── __init__.py
 │   │   │   ├── milvus_service.py    # Milvus operations
 │   │   │   └── collection_manager.py # Collection management
+│   │   ├── storage/
+│   │   │   ├── __init__.py
+│   │   │   ├── minio_service.py     # MinIO object storage service
+│   │   │   └── file_manager.py      # File upload/download management
 │   │   ├── document/
 │   │   │   ├── __init__.py
 │   │   │   ├── document_service.py  # Document CRUD operations
@@ -210,8 +225,13 @@ AIChatBot/
 ├── deployment/
 │   ├── docker/
 │   │   ├── Dockerfile           # Application Dockerfile
-│   │   ├── Dockerfile.admin     # Admin panel Dockerfile
-│   │   └── docker-compose.prod.yml # Production compose
+│   │   ├── docker-compose.yml   # Development compose
+│   │   ├── docker-compose.prod.yml # Production compose
+│   │   └── services/
+│   │       ├── postgres.yml     # PostgreSQL service
+│   │       ├── redis.yml        # Redis service
+│   │       ├── minio.yml        # MinIO service
+│   │       └── milvus.yml       # Milvus service
 │   ├── kubernetes/
 │   │   ├── namespace.yaml       # Kubernetes namespace
 │   │   ├── configmap.yaml       # Configuration maps
@@ -225,8 +245,9 @@ AIChatBot/
 │       └── templates/           # Helm templates
 │
 ├── data/
-│   ├── embeddings/              # Embedding model files
-│   ├── documents/               # Document storage
+│   ├── models/
+│   │   └── bge-m3/              # BAAI/bge-M3 model files
+│   ├── documents/               # Document storage (local fallback)
 │   │   ├── hr/                  # HR documents
 │   │   ├── it/                  # IT documents
 │   │   ├── finance/             # Finance documents
@@ -251,8 +272,11 @@ AIChatBot/
 ### 1. Core Framework
 - **FastAPI**: API layer với automatic documentation
 - **LangGraph**: Workflow orchestration engine
+- **PostgreSQL**: Relational database cho metadata và user management
 - **Milvus**: Vector database với multi-collection support
 - **Redis**: Multi-layer caching system
+- **MinIO**: Object storage cho documents và files
+- **BAAI/bge-M3**: Multilingual embedding model
 
 ### 2. Security & Permissions
 - **JWT Authentication**: Token-based authentication
@@ -265,9 +289,43 @@ AIChatBot/
 - **Version control**: Document versioning với retention policies
 - **Freshness SLA**: Tiered update guarantees
 - **Multi-source ingestion**: SharePoint, Git, Slack, etc.
+- **Object storage**: MinIO cho document files với versioning
+- **Multilingual support**: BAAI/bge-M3 cho Vietnamese và English
 
 ### 4. AI Agents & Workflow
 - **Router Agent**: Query routing với permission awareness
 - **Domain Agents**: Specialized agents cho từng phòng ban
 - **Tool Agents**: Dynamic tool loading theo permissions
 - **Synthesis Agent**: Response aggregation với content filtering
+
+## Infrastructure Services
+
+### PostgreSQL
+- **User Management**: Authentication, authorization, permissions
+- **Metadata Storage**: Document metadata, audit logs, tool configurations
+- **Multi-tenant Support**: Tenant isolation với database schemas
+
+### Redis  
+- **L1 Cache**: Agent memory và frequent queries
+- **L2 Cache**: Document embeddings và search results
+- **Session Management**: User sessions và workflow state
+- **Rate Limiting**: API rate limiting và usage tracking
+
+### MinIO
+- **Document Storage**: Original files với versioning support
+- **Backup Storage**: System backups và document archives
+- **Model Storage**: Embedding model files và custom models
+- **Multi-tenant Buckets**: Isolated storage per tenant
+
+### Milvus
+- **Vector Collections**: Department-specific collections với ACL
+- **Embedding Storage**: BAAI/bge-M3 vectors (1024 dimensions)
+- **Similarity Search**: Semantic search với permission filtering
+- **Index Optimization**: HNSW/IVF indexes cho performance
+
+### BAAI/bge-M3 Features
+- **Multilingual**: Vietnamese, English, Chinese support
+- **Dense Retrieval**: High-quality semantic embeddings
+- **Cross-lingual**: Query trong một ngôn ngữ, retrieve documents ở ngôn ngữ khác
+- **Instruction Following**: Better understanding của complex queries
+- **1024 Dimensions**: Optimal balance giữa quality và performance
