@@ -124,7 +124,7 @@ class IntelligentAgentOrchestrator:
         context: Optional[Dict[str, Any]] = None
     ) -> AgentSelectionResult:
         """
-        🎯 Core method: Phân tích query và select agents bằng LLM
+        Core method: Phân tích query và select agents bằng LLM
         
         Args:
             query: User query cần phân tích
@@ -134,7 +134,7 @@ class IntelligentAgentOrchestrator:
         Returns:
             AgentSelectionResult với agents được chọn
         """
-        logger.info(f"🧠 Orchestrating agent selection for query: {query[:100]}...")
+        logger.info(f"Orchestrating agent selection for query: {query[:100]}...")
         
         try:
             # 1. Get enabled LLM provider
@@ -156,18 +156,17 @@ class IntelligentAgentOrchestrator:
             # 5. Validate và adjust selection
             validated_result = await self._validate_agent_selection(selection_result)
             
-            logger.info(f"✅ Selected agents: {[agent.value for agent in validated_result.selected_agents]} "
+            logger.info(f"Selected agents: {[agent.value for agent in validated_result.selected_agents]} "
                        f"(confidence: {validated_result.confidence:.2f})")
             
             return validated_result
             
         except Exception as e:
-            logger.error(f"❌ Orchestrator selection failed: {e}")
+            logger.error(f"Orchestrator selection failed: {e}")
             return await self._get_fallback_selection(query, language)
     
     async def _get_orchestrator_llm(self):
         """Get LLM instance cho orchestrator"""
-        # Use configured orchestrator model từ admin
         orchestrator_model = getattr(settings, 'ORCHESTRATOR_MODEL', 'gemini-2.0-flash')
         
         enabled_providers = getattr(settings, 'enabled_providers', [])
@@ -185,7 +184,6 @@ class IntelligentAgentOrchestrator:
     ) -> str:
         """Tạo sophisticated prompt cho LLM orchestrator"""
         
-        # Agent capabilities description
         agents_desc = []
         for agent_name, capabilities in self.agent_capabilities.items():
             if self.available_agents.get(agent_name, False):
@@ -209,32 +207,31 @@ Additional context:
 - Session history: {context.get('session_context', 'None')}
 """
         
-        # Multi-language prompt templates
         prompt_templates = {
             "vi": f"""Bạn là AI Orchestrator chuyên nghiệp, nhiệm vụ phân tích query và chọn agents phù hợp.
 
-🎯 NHIỆM VỤ: Phân tích query sau và quyết định agents nào cần tham gia:
+NHIỆM VỤ: Phân tích query sau và quyết định agents nào cần tham gia:
 
 Query người dùng: "{query}"
 Ngôn ngữ: {language}
 {context_info}
 
-📋 CÁC AGENTS KHẢ DỤNG:
+CÁC AGENTS KHẢ DỤNG:
 {available_agents_text}
 
-🧠 PHÂN TÍCH YÊU CẦU:
+PHÂN TÍCH YÊU CẦU:
 1. Xác định domain expertise cần thiết
 2. Đánh giá độ phức tạp (0.0-1.0)
 3. Quyết định single-agent hay multi-agent
 4. Ước tính thời gian xử lý
 
-⚠️ NGUYÊN TẮC QUAN TRỌNG:
+NGUYÊN TẮC QUAN TRỌNG:
 - ƯU TIÊN single-agent nếu có thể (hiệu quả hơn)
 - Chỉ dùng multi-agent khi thực sự cần cross-domain
 - General assistant là fallback an toàn
 - Confidence thấp = chọn general assistant
 
-🎯 TRẢ VỀ JSON ĐỊNH DẠNG:
+TRẢ VỀ JSON ĐỊNH DẠNG:
 {{
     "selected_agents": ["hr_specialist"],
     "complexity_score": 0.6,
@@ -249,28 +246,28 @@ Phân tích và quyết định:""",
 
             "en": f"""You are a professional AI Orchestrator. Analyze the query and select appropriate agents.
 
-🎯 TASK: Analyze the following query and decide which agents should participate:
+TASK: Analyze the following query and decide which agents should participate:
 
 User query: "{query}"
 Language: {language}
 {context_info}
 
-📋 AVAILABLE AGENTS:
+AVAILABLE AGENTS:
 {available_agents_text}
 
-🧠 ANALYSIS REQUIREMENTS:
+ANALYSIS REQUIREMENTS:
 1. Identify required domain expertise
 2. Assess complexity (0.0-1.0)
 3. Decide single-agent vs multi-agent
 4. Estimate processing time
 
-⚠️ IMPORTANT PRINCIPLES:
+IMPORTANT PRINCIPLES:
 - PREFER single-agent when possible (more efficient)
 - Use multi-agent only when truly cross-domain
 - General assistant is safe fallback
 - Low confidence = choose general assistant
 
-🎯 RETURN JSON FORMAT:
+RETURN JSON FORMAT:
 {{
     "selected_agents": ["hr_specialist"],
     "complexity_score": 0.6,
@@ -295,7 +292,6 @@ Analysis and decision:"""
         """Parse response từ LLM thành structured result"""
         
         try:
-            # Extract JSON từ response
             json_start = llm_response.find('{')
             json_end = llm_response.rfind('}') + 1
             
@@ -303,7 +299,6 @@ Analysis and decision:"""
                 json_str = llm_response[json_start:json_end]
                 parsed = json.loads(json_str)
                 
-                # Convert string agent names to AgentDomain enums
                 selected_agents = []
                 for agent_name in parsed.get("selected_agents", []):
                     if "hr" in agent_name.lower():
@@ -328,7 +323,6 @@ Analysis and decision:"""
         except Exception as e:
             logger.warning(f"Failed to parse LLM response: {e}")
             
-        # Fallback parsing
         return await self._get_fallback_selection(query, language)
     
     async def _validate_agent_selection(
@@ -337,7 +331,6 @@ Analysis and decision:"""
     ) -> AgentSelectionResult:
         """Validate và adjust agent selection"""
         
-        # 1. Check if selected agents are actually enabled
         valid_agents = []
         for agent in selection.selected_agents:
             agent_key = f"{agent.value}_specialist" if agent != AgentDomain.GENERAL else "general_assistant"
@@ -345,17 +338,14 @@ Analysis and decision:"""
             if self.available_agents.get(agent_key, False):
                 valid_agents.append(agent)
         
-        # 2. Fallback nếu không có valid agents
         if not valid_agents:
             valid_agents = [AgentDomain.GENERAL]
-            selection.confidence *= 0.5  # Reduce confidence
+            selection.confidence *= 0.5
             selection.reasoning += " (Fallback to general assistant due to agent availability)"
         
-        # 3. Adjust complexity cho single agent
         if len(valid_agents) == 1 and selection.complexity_score > 0.8:
-            selection.complexity_score = 0.8  # Cap complexity cho single agent
+            selection.complexity_score = 0.8 
         
-        # 4. Update selection
         selection.selected_agents = valid_agents
         
         return selection
@@ -389,13 +379,13 @@ Analysis and decision:"""
         agent_names = {
             "vi": {
                 AgentDomain.HR: "Chuyên gia Nhân sự",
-                AgentDomain.FINANCE: "Chuyên gia Tài chính", 
+                AgentDomain.FINANCE: "Chuyên gia Tài chính, Marketing", 
                 AgentDomain.IT: "Chuyên gia Công nghệ",
                 AgentDomain.GENERAL: "Trợ lý Tổng quát"
             },
             "en": {
                 AgentDomain.HR: "HR Specialist",
-                AgentDomain.FINANCE: "Finance Specialist",
+                AgentDomain.FINANCE: "Finance Specialist, Marketing Specialist",
                 AgentDomain.IT: "IT Specialist", 
                 AgentDomain.GENERAL: "General Assistant"
             }

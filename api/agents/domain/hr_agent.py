@@ -328,7 +328,6 @@ class HRSpecialistAgent:
     async def _simulate_web_search(self, query: str) -> Dict[str, Any]:
         """Simulate web search (placeholder for real implementation)"""
         
-        # This would be replaced with actual web search tool call
         return {
             "sources": ["HR News Vietnam", "Labour Law Updates"],
             "content": ["Latest HR trends in Vietnam", "Recent policy changes"]

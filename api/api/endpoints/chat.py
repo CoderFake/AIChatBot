@@ -17,7 +17,6 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 logger = get_logger(__name__)
 settings = get_settings()
 
-# Initialize orchestrator service globally
 orchestrator_service = OrchestratorService()
 
 @router.post("/", response_model=ChatResponse)
@@ -49,10 +48,8 @@ async def chat_endpoint(
             }
         }
         
-        # Check orchestrator enabled in admin settings
         if getattr(settings, 'ENABLE_INTELLIGENT_ORCHESTRATOR', True):
-            # 🧠 Use Intelligent Orchestrator (LLM-based agent selection)
-            logger.info("🧠 Using Intelligent Orchestrator for agent selection")
+            logger.info("Using Intelligent Orchestrator for agent selection")
             
             orchestrated_response = await orchestrator_service.orchestrate_query(
                 query=request.query,
@@ -61,30 +58,25 @@ async def chat_endpoint(
                 session_id=session_id
             )
             
-            # Extract orchestrated results
             response_content = orchestrated_response["response"]
             citations = orchestrated_response.get("citations", [])
             metadata = orchestrated_response.get("metadata", {})
             
-            # Log orchestration results
             orchestration_method = metadata.get("orchestration_method", "unknown")
             selected_agents = metadata.get("selected_agents", [])
             
-            logger.info(f"✅ Orchestration completed using: {orchestration_method}")
-            logger.info(f"🎯 Selected agents: {selected_agents}")
+            logger.info(f"Orchestration completed using: {orchestration_method}")
+            logger.info(f"Selected agents: {selected_agents}")
             
         else:
-            # 🔄 Fallback to simple LLM response (no orchestration)
-            logger.info("🔄 Orchestrator disabled, using simple LLM response")
+            logger.info("Orchestrator disabled, using simple LLM response")
             
             response_content, citations, metadata = await _get_simple_llm_response(
                 request.query, request.language, user_context
             )
         
-        # Calculate execution time
         execution_time = (datetime.now() - start_time).total_seconds()
         
-        # Create response
         chat_response = ChatResponse(
             response=response_content,
             session_id=session_id,
@@ -98,7 +90,6 @@ async def chat_endpoint(
             }
         )
         
-        # Background task: Save conversation history
         if getattr(settings, 'ENABLE_CONVERSATION_HISTORY', True):
             background_tasks.add_task(
                 _save_conversation_history,
@@ -108,13 +99,12 @@ async def chat_endpoint(
                 metadata=chat_response.metadata
             )
         
-        logger.info(f"✅ Chat response completed in {execution_time:.2f}s")
+        logger.info(f"Chat response completed in {execution_time:.2f}s")
         return chat_response
         
     except Exception as e:
-        logger.error(f"❌ Chat endpoint error: {e}")
+        logger.error(f"Chat endpoint error: {e}")
         
-        # Generate error response
         error_response = await _get_error_response(
             request.query, request.language, str(e), session_id
         )
@@ -132,14 +122,12 @@ async def _get_simple_llm_response(
     """
     
     try:
-        # Get primary LLM provider
         enabled_providers = getattr(settings, 'enabled_providers', [])
         if not enabled_providers:
             raise ValueError("No LLM providers enabled in admin settings")
             
         llm = await llm_provider_manager.get_provider(enabled_providers[0])
         
-        # Simple prompt based on language
         language_prompts = {
             "vi": f"""
 Bạn là AI Assistant thông minh và hữu ích. Hãy trả lời câu hỏi sau một cách chính xác và chi tiết:
@@ -173,7 +161,6 @@ Provide helpful and factual information. If uncertain about information, please 
         
         prompt = language_prompts.get(language, language_prompts["vi"])
         
-        # Get LLM response
         response = await llm.ainvoke(prompt)
         
         return (
@@ -189,7 +176,6 @@ Provide helpful and factual information. If uncertain about information, please 
     except Exception as e:
         logger.error(f"Simple LLM response failed: {e}")
         
-        # Last resort fallback
         fallback_messages = {
             "vi": "Xin lỗi, tôi không thể xử lý câu hỏi của bạn lúc này. Vui lòng thử lại sau.",
             "en": "Sorry, I cannot process your question at this time. Please try again later.",
@@ -243,8 +229,6 @@ async def _save_conversation_history(
     """
     
     try:
-        # Implement conversation history storage
-        # This could integrate with PostgreSQL, Redis, or other storage
         
         conversation_record = {
             "session_id": session_id,
@@ -254,26 +238,18 @@ async def _save_conversation_history(
             "timestamp": datetime.now().isoformat()
         }
         
-        logger.info(f"💾 Saving conversation history for session: {session_id}")
-        
-        # TODO: Implement actual database storage
-        # await conversation_db.save_history(conversation_record)
+        logger.info(f"Saving conversation history for session: {session_id}")
         
     except Exception as e:
-        logger.error(f"❌ Failed to save conversation history: {e}")
+        logger.error(f"Failed to save conversation history: {e}")
 
 @router.get("/health")
 async def chat_health_check():
     """Health check for chat service"""
     
     try:
-        # Check orchestrator service
         orchestrator_status = "enabled" if getattr(settings, 'ENABLE_INTELLIGENT_ORCHESTRATOR', True) else "disabled"
-        
-        # Check available agents
         available_agents = list(orchestrator_service.agents.keys())
-        
-        # Check enabled providers
         enabled_providers = getattr(settings, 'enabled_providers', [])
         
         return {
@@ -295,15 +271,12 @@ async def chat_health_check():
 @router.post("/stream", response_model=Dict[str, Any])
 async def streaming_chat_endpoint(request: StreamingChatRequest):
     """
-    🌊 Streaming Chat Endpoint với Orchestrator Support
+    Streaming Chat Endpoint với Orchestrator Support
     """
+
     
-    # Note: Implement streaming support for orchestrator in future
-    # For now, redirect to regular chat endpoint
+    logger.info("Streaming chat requested, using regular orchestrated chat")
     
-    logger.info("🌊 Streaming chat requested, using regular orchestrated chat")
-    
-    # Convert streaming request to regular chat request
     chat_request = ChatRequest(
         query=request.query,
         language=request.language,
@@ -312,7 +285,6 @@ async def streaming_chat_endpoint(request: StreamingChatRequest):
         user_preferences=request.user_preferences
     )
     
-    # Use regular orchestrated chat
     response = await chat_endpoint(chat_request, BackgroundTasks())
     
     return {

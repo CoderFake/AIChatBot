@@ -1,9 +1,9 @@
 from fastapi import APIRouter
-from api.v1.endpoints import health, query, documents
+from api.v1.endpoints import health, query, documents, admin
 
 api_router = APIRouter()
 
-# Include endpoint routers
+# Core API endpoints
 api_router.include_router(
     health.router, 
     prefix="/health", 
@@ -20,4 +20,10 @@ api_router.include_router(
     documents.router, 
     prefix="/documents", 
     tags=["Document Management"]
+)
+
+api_router.include_router(
+    admin.router,
+    prefix="/admin",
+    tags=["Admin Configuration"]
 )

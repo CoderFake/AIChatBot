@@ -16,7 +16,15 @@ from .document_schemas import (
     DocumentReprocessResponse
 )
 
+from .query_schemas import (
+    QueryRequest,
+    QueryResponse,
+    HealthResponse
+)
+    
+
 __all__ = [
+    # Document schemas
     "DocumentMetadata",
     "DocumentResponse", 
     "DocumentSearchRequest",
@@ -26,5 +34,10 @@ __all__ = [
     "DocumentListResponse",
     "DocumentStatsResponse",
     "DocumentDeleteResponse",
-    "DocumentReprocessResponse"
+    "DocumentReprocessResponse",
+    
+    # Query schemas
+    "QueryRequest",
+    "QueryResponse",
+    "HealthResponse"
 ] 

@@ -1,779 +1,1468 @@
-from typing import Dict, Any, List, Optional, TypedDict, Annotated
-from dataclasses import dataclass, field
-import json
+from typing import Dict, Any, List, Optional, Literal, Annotated
+from typing_extensions import TypedDict
 from datetime import datetime
+import asyncio
 
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages  
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.redis import RedisSaver
-from langgraph.prebuilt import ToolNode
 
 from config.settings import get_settings
-from core.exceptions import LangGraphError, WorkflowError
+from services.config.config_manager import config_manager, ConfigSubscriber, ConfigChange, ConfigChangeType
 from services.llm.provider_manager import llm_provider_manager
-from services.tools.tool_manager import tool_manager
-from utils.logging import get_logger, log_performance
+from services.tools.tool_service import ToolService
+from services.orchestrator.agent_orchestrator import AgentOrchestrator
+from utils.logging import get_logger
 
 logger = get_logger(__name__)
-settings = get_settings()
 
-class WorkflowState(TypedDict):
-    """LangGraph workflow state schema"""
-    # Input
-    query: str
+class RAGState(TypedDict):
+    """RAG workflow state schema"""
+    
+    # Messages - Core LangGraph pattern
+    messages: Annotated[List[BaseMessage], add_messages]
+    
+    # Query processing
+    original_query: str
+    processed_query: str
+    language: str
+    
+    # User context
     user_id: Optional[str]
-    session_id: Optional[str]
+    session_id: str
     conversation_history: List[Dict[str, Any]]
     
-    # Processing
-    current_step: str
-    routing_decision: Optional[str]
-    retrieved_documents: List[Dict[str, Any]]
-    tool_results: List[Dict[str, Any]]
+    # Agent orchestration
+    selected_agents: List[str]
+    agent_outputs: Dict[str, Dict[str, Any]]
+    orchestrator_reasoning: str
+    complexity_score: float
     
-    # Output
-    response: Optional[str]
-    sources: List[Dict[str, Any]]
-    follow_up_questions: List[str]
+    # Tool execution
+    tool_calls: List[Dict[str, Any]]
+    tool_outputs: List[Dict[str, Any]]
+    
+    # Document retrieval
+    retrieved_documents: List[Dict[str, Any]]
+    document_sources: List[str]
+    
+    # Response generation
+    draft_response: str
+    final_response: str
+    confidence_score: float
+    
+    # Quality control
+    quality_checks: Dict[str, bool]
+    content_safety: Dict[str, Any]
     
     # Metadata
-    processing_time: float
-    tokens_used: int
-    error: Optional[str]
     workflow_id: str
-    
-    # Configuration (dynamic từ admin)
-    enabled_tools: Dict[str, bool]
-    enabled_providers: List[str]
-    workflow_config: Dict[str, Any]
+    processing_time: float
+    iteration_count: int
 
-@dataclass
-class RAGWorkflowConfig:
-    """Configuration cho RAG workflow"""
-    max_iterations: int = 10
-    timeout_seconds: int = 300
-    
-    # Model assignments (configurable từ admin)
-    router_model: str = field(default_factory=lambda: settings.ROUTER_MODEL)
-    retrieval_model: str = field(default_factory=lambda: settings.RETRIEVAL_MODEL)
-    synthesis_model: str = field(default_factory=lambda: settings.SYNTHESIS_MODEL)
-    reflection_model: str = field(default_factory=lambda: settings.REFLECTION_MODEL)
-    
-    # Workflow features (configurable từ admin)
-    enable_reflection: bool = field(default_factory=lambda: settings.ENABLE_REFLECTION_WORKFLOW)
-    enable_semantic_routing: bool = field(default_factory=lambda: settings.ENABLE_SEMANTIC_ROUTING)
-    enable_document_grading: bool = field(default_factory=lambda: settings.ENABLE_DOCUMENT_GRADING)
-    enable_citation_generation: bool = field(default_factory=lambda: settings.ENABLE_CITATION_GENERATION)
-    enable_query_expansion: bool = field(default_factory=lambda: settings.ENABLE_QUERY_EXPANSION)
-    enable_hallucination_check: bool = field(default_factory=lambda: settings.ENABLE_ANSWER_HALLUCINATION_CHECK)
-
-class RAGWorkflow:
+class ConfigAwareRAGWorkflow(ConfigSubscriber):
     """
-    Agentic RAG Workflow sử dụng LangGraph
-    Tất cả configurations được load từ admin settings
+    Configuration-aware RAG Workflow
+    Automatically reloads when admin changes settings
     """
     
     def __init__(self):
-        self.graph: Optional[StateGraph] = None
-        self.compiled_graph = None
+        self.settings = get_settings()
+        self.tool_service = ToolService()
+        self.orchestrator = AgentOrchestrator()
+        self.graph = None
         self.checkpointer = None
-        self.config = RAGWorkflowConfig()
-        self.initialized = False
-    
+        self._initialized = False
+        self._rebuilding = False
+        
     async def initialize(self):
-        """Initialize RAG workflow với configuration từ admin"""
+        """Initialize workflow với config subscription"""
         try:
-            logger.info("Initializing LangGraph RAG workflow...")
-            
-            # Setup checkpointer based on admin config
             await self._setup_checkpointer()
+            await self._build_graph()
             
-            # Load current configuration từ admin
-            await self._load_admin_configuration()
+            # Subscribe to configuration changes
+            config_manager.subscribe("workflow", self)
             
-            # Build workflow graph
-            await self._build_workflow_graph()
-            
-            # Compile graph
-            self.compiled_graph = self.graph.compile(
-                checkpointer=self.checkpointer,
-                debug=settings.ENABLE_LANGGRAPH_DEBUG
-            )
-            
-            self.initialized = True
-            logger.info("LangGraph RAG workflow initialized successfully")
+            self._initialized = True
+            logger.info("Config-aware RAG Workflow initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize RAG workflow: {e}")
-            raise LangGraphError(f"Workflow initialization failed: {e}")
+            logger.error(f"Failed to initialize RAG Workflow: {e}")
+            raise
+    
+    async def on_config_change(self, change: ConfigChange) -> bool:
+        """
+        Handle configuration changes from admin
+        Automatically reload affected components
+        """
+        try:
+            logger.info(f"Workflow received config change: {change.change_type} for {change.component_name}")
+            
+            # Prevent concurrent rebuilds
+            if self._rebuilding:
+                logger.info("Workflow rebuild already in progress, skipping")
+                return True
+            
+            self._rebuilding = True
+            
+            # Reload settings first
+            from config.settings import reload_settings
+            self.settings = reload_settings()
+            
+            # Handle different types of changes
+            if change.change_type in [
+                ConfigChangeType.PROVIDER_ENABLED,
+                ConfigChangeType.PROVIDER_DISABLED,
+                ConfigChangeType.PROVIDER_CONFIG_CHANGED
+            ]:
+                await self._handle_provider_change(change)
+                
+            elif change.change_type in [
+                ConfigChangeType.TOOL_ENABLED,
+                ConfigChangeType.TOOL_DISABLED,
+                ConfigChangeType.TOOL_CONFIG_CHANGED
+            ]:
+                await self._handle_tool_change(change)
+                
+            elif change.change_type in [
+                ConfigChangeType.AGENT_ENABLED,
+                ConfigChangeType.AGENT_DISABLED,
+                ConfigChangeType.AGENT_CONFIG_CHANGED
+            ]:
+                await self._handle_agent_change(change)
+                
+            elif change.change_type == ConfigChangeType.WORKFLOW_CONFIG_CHANGED:
+                await self._handle_workflow_change(change)
+            
+            # Rebuild workflow graph with new configuration
+            await self._rebuild_workflow()
+            
+            self._rebuilding = False
+            
+            logger.info(f"Workflow successfully adapted to config change: {change.component_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to handle config change: {e}")
+            self._rebuilding = False
+            return False
+    
+    async def _handle_provider_change(self, change: ConfigChange):
+        """Handle LLM provider configuration changes"""
+        logger.info(f"Handling provider change: {change.component_name}")
+        
+        # Reinitialize LLM provider manager
+        if llm_provider_manager._initialized:
+            llm_provider_manager._initialized = False
+            await llm_provider_manager.initialize()
+    
+    async def _handle_tool_change(self, change: ConfigChange):
+        """Handle tool configuration changes"""
+        logger.info(f"Handling tool change: {change.component_name}")
+        
+        # Reinitialize tool service
+        if self.tool_service._initialized:
+            self.tool_service._initialized = False
+            await self.tool_service.initialize()
+    
+    async def _handle_agent_change(self, change: ConfigChange):
+        """Handle agent configuration changes"""
+        logger.info(f"Handling agent change: {change.component_name}")
+        
+        # Agent orchestrator doesn't need reinitialization
+        # It reads from settings dynamically
+        pass
+    
+    async def _handle_workflow_change(self, change: ConfigChange):
+        """Handle workflow configuration changes"""
+        logger.info("Handling workflow configuration change")
+        
+        # Workflow will be rebuilt with new settings
+        # No additional actions needed
+        pass
+    
+    async def _rebuild_workflow(self):
+        """Rebuild workflow graph with updated configuration"""
+        try:
+            logger.info("Rebuilding workflow graph with updated configuration...")
+            
+            # Setup checkpointer if type changed
+            await self._setup_checkpointer()
+            
+            # Rebuild graph
+            await self._build_graph()
+            
+            logger.info("Workflow graph rebuilt successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to rebuild workflow: {e}")
+            raise
     
     async def _setup_checkpointer(self):
-        """Setup checkpointer based on admin configuration"""
-        checkpointer_type = settings.LANGGRAPH_CHECKPOINTER_TYPE
+        """Setup checkpointer based on current configuration"""
+        checkpointer_type = self.settings.workflow.checkpointer_type
         
         if checkpointer_type == "redis":
             try:
                 import redis.asyncio as redis
-                redis_client = redis.from_url(settings.redis_url)
+                redis_client = redis.from_url(self.settings.cache.url)
                 self.checkpointer = RedisSaver(redis_client)
                 logger.info("Redis checkpointer configured")
             except Exception as e:
-                logger.warning(f"Redis checkpointer failed, falling back to memory: {e}")
+                logger.warning(f"Redis checkpointer failed: {e}, using memory")
                 self.checkpointer = MemorySaver()
-        
-        elif checkpointer_type == "postgres":
-            try:
-                from config.database import settings as db_settings
-                # Sử dụng sync connection cho checkpointer
-                conn_string = db_settings.DATABASE_URL
-                self.checkpointer = PostgresSaver.from_conn_string(conn_string)
-                logger.info("PostgreSQL checkpointer configured")
-            except Exception as e:
-                logger.warning(f"PostgreSQL checkpointer failed, falling back to memory: {e}")
-                self.checkpointer = MemorySaver()
-        
         else:
             self.checkpointer = MemorySaver()
-            logger.info("Memory checkpointer configured")
     
-    async def _load_admin_configuration(self):
-        """Load configuration từ admin interface (database/API)"""
-        try:
-            # Trong thực tế, đây sẽ load từ database admin settings
-            # Hiện tại sử dụng settings file
-            
-            self.config.router_model = settings.ROUTER_MODEL
-            self.config.retrieval_model = settings.RETRIEVAL_MODEL
-            self.config.synthesis_model = settings.SYNTHESIS_MODEL
-            self.config.reflection_model = settings.REFLECTION_MODEL
-            
-            self.config.enable_reflection = settings.ENABLE_REFLECTION_WORKFLOW
-            self.config.enable_semantic_routing = settings.ENABLE_SEMANTIC_ROUTING
-            self.config.enable_document_grading = settings.ENABLE_DOCUMENT_GRADING
-            self.config.enable_citation_generation = settings.ENABLE_CITATION_GENERATION
-            self.config.enable_query_expansion = settings.ENABLE_QUERY_EXPANSION
-            self.config.enable_hallucination_check = settings.ENABLE_ANSWER_HALLUCINATION_CHECK
-            
-            logger.info("Admin configuration loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load admin configuration: {e}")
-            # Use defaults if loading fails
-    
-    async def _build_workflow_graph(self):
-        """Build LangGraph workflow với dynamic configuration"""
+    async def _build_graph(self):
+        """Build LangGraph with current configuration"""
+        builder = StateGraph(RAGState)
         
-        # Create StateGraph
-        self.graph = StateGraph(WorkflowState)
+        # Add nodes based on current configuration
+        builder.add_node("initialize", self._initialize_processing)
+        builder.add_node("analyze_query", self._analyze_query)
         
-        # Add nodes based on admin configuration
+        # Conditional nodes based on configuration
+        if self.settings.orchestrator.get("enabled", True):
+            builder.add_node("orchestrate_agents", self._orchestrate_agents)
         
-        # Always add entry point
-        self.graph.add_node("initialize", self._initialize_state)
+        # Tools node if any tools are enabled
+        if self.settings.get_enabled_tools():
+            builder.add_node("execute_tools", self._execute_tools)
         
-        # Conditional nodes based on admin settings
-        if self.config.enable_semantic_routing:
-            self.graph.add_node("route_query", self._route_query)
+        builder.add_node("retrieve_documents", self._retrieve_documents)
+        builder.add_node("generate_response", self._generate_response)
         
-        self.graph.add_node("retrieve_documents", self._retrieve_documents)
+        # Quality control based on configuration
+        if self.settings.workflow.enable_hallucination_check:
+            builder.add_node("quality_check", self._quality_check)
         
-        if self.config.enable_document_grading:
-            self.graph.add_node("grade_documents", self._grade_documents)
+        builder.add_node("finalize_response", self._finalize_response)
         
-        if self.config.enable_query_expansion:
-            self.graph.add_node("expand_query", self._expand_query)
-        
-        # Tool execution node (dynamic based on enabled tools)
-        self.graph.add_node("execute_tools", self._execute_tools)
-        
-        # Response generation
-        self.graph.add_node("generate_response", self._generate_response)
-        
-        if self.config.enable_hallucination_check:
-            self.graph.add_node("check_hallucination", self._check_hallucination)
-        
-        if self.config.enable_reflection:
-            self.graph.add_node("reflect_response", self._reflect_response)
-        
-        if self.config.enable_citation_generation:
-            self.graph.add_node("generate_citations", self._generate_citations)
-        
-        self.graph.add_node("finalize", self._finalize_response)
-        
-        # Build edges based on configuration
-        await self._build_workflow_edges()
+        # Build edges based on current configuration
+        await self._build_workflow_edges(builder)
         
         # Set entry and exit points
-        self.graph.set_entry_point("initialize")
-        self.graph.set_finish_point("finalize")
+        builder.set_entry_point("initialize")
+        builder.set_finish_point("finalize_response")
         
-        logger.info("Workflow graph built successfully with admin configuration")
+        # Compile graph
+        self.graph = builder.compile(
+            checkpointer=self.checkpointer,
+            debug=self.settings.DEBUG
+        )
     
-    async def _build_workflow_edges(self):
-        """Build workflow edges based on admin configuration"""
+    async def _build_workflow_edges(self, builder):
+        """Build workflow edges based on current configuration"""
         
-        # Basic flow
-        self.graph.add_edge(START, "initialize")
+        builder.add_edge(START, "initialize")
+        builder.add_edge("initialize", "analyze_query")
         
-        if self.config.enable_semantic_routing:
-            self.graph.add_edge("initialize", "route_query")
-            self.graph.add_conditional_edges(
-                "route_query",
-                self._routing_condition,
+        # Routing after analysis
+        if self.settings.orchestrator.get("enabled", True):
+            builder.add_conditional_edges(
+                "analyze_query",
+                self._route_after_analysis,
                 {
-                    "retrieval": "retrieve_documents",
-                    "tools": "execute_tools",
-                    "direct": "generate_response"
+                    "orchestrate": "orchestrate_agents",
+                    "direct_tools": "execute_tools" if self.settings.get_enabled_tools() else "retrieve_documents",
+                    "direct_retrieval": "retrieve_documents"
+                }
+            )
+            builder.add_edge("orchestrate_agents", "execute_tools" if self.settings.get_enabled_tools() else "retrieve_documents")
+        else:
+            # Direct routing without orchestration
+            if self.settings.get_enabled_tools():
+                builder.add_edge("analyze_query", "execute_tools")
+                builder.add_edge("execute_tools", "retrieve_documents")
+            else:
+                builder.add_edge("analyze_query", "retrieve_documents")
+        
+        # Tools to retrieval
+        if self.settings.get_enabled_tools():
+            builder.add_edge("execute_tools", "retrieve_documents")
+        
+        # Retrieval to response generation
+        builder.add_edge("retrieve_documents", "generate_response")
+        
+        # Quality control flow
+        if self.settings.workflow.enable_hallucination_check:
+            builder.add_edge("generate_response", "quality_check")
+            builder.add_conditional_edges(
+                "quality_check",
+                self._route_after_quality_check,
+                {
+                    "pass": "finalize_response",
+                    "retry": "generate_response",
+                    "fail": "finalize_response"
                 }
             )
         else:
-            self.graph.add_edge("initialize", "retrieve_documents")
+            builder.add_edge("generate_response", "finalize_response")
         
-        # Document processing flow
-        if self.config.enable_document_grading:
-            self.graph.add_edge("retrieve_documents", "grade_documents")
-            
-            if self.config.enable_query_expansion:
-                self.graph.add_conditional_edges(
-                    "grade_documents",
-                    self._document_grading_condition,
-                    {
-                        "good": "generate_response",
-                        "expand": "expand_query",
-                        "tools": "execute_tools"
-                    }
-                )
-                self.graph.add_edge("expand_query", "retrieve_documents")
-            else:
-                self.graph.add_edge("grade_documents", "generate_response")
-        else:
-            self.graph.add_edge("retrieve_documents", "generate_response")
-        
-        # Tool execution flow
-        self.graph.add_edge("execute_tools", "generate_response")
-        
-        # Response processing flow
-        if self.config.enable_hallucination_check:
-            self.graph.add_edge("generate_response", "check_hallucination")
-            
-            if self.config.enable_reflection:
-                self.graph.add_conditional_edges(
-                    "check_hallucination",
-                    self._hallucination_condition,
-                    {
-                        "good": "reflect_response" if self.config.enable_reflection else "generate_citations",
-                        "bad": "generate_response"  # Retry
-                    }
-                )
-            else:
-                self.graph.add_edge("check_hallucination", "generate_citations" if self.config.enable_citation_generation else "finalize")
-        
-        if self.config.enable_reflection:
-            if self.config.enable_citation_generation:
-                self.graph.add_edge("reflect_response", "generate_citations")
-            else:
-                self.graph.add_edge("reflect_response", "finalize")
-        
-        if self.config.enable_citation_generation:
-            self.graph.add_edge("generate_citations", "finalize")
-        else:
-            # Direct to finalize if no citations
-            if not self.config.enable_reflection and not self.config.enable_hallucination_check:
-                self.graph.add_edge("generate_response", "finalize")
-        
-        self.graph.add_edge("finalize", END)
+        builder.add_edge("finalize_response", END)
     
-    # =================
-    # WORKFLOW NODES
-    # =================
+    # ========================================
+    # NODE IMPLEMENTATIONS (Updated paths)
+    # ========================================
     
-    async def _initialize_state(self, state: WorkflowState) -> WorkflowState:
-        """Initialize workflow state với admin configuration"""
-        logger.info(f"Initializing workflow for query: {state['query'][:100]}...")
+    async def _initialize_processing(self, state: RAGState) -> RAGState:
+        """Initialize processing state"""
+        workflow_id = f"rag_{datetime.now().isoformat()}_{state.get('user_id', 'anon')}"
         
-        state["current_step"] = "initialize"
-        state["workflow_id"] = f"wf_{datetime.now().isoformat()}_{state.get('user_id', 'anon')}"
-        state["processing_time"] = 0.0
-        state["tokens_used"] = 0
-        
-        # Load current admin configuration
-        state["enabled_tools"] = settings.enabled_tools
-        state["enabled_providers"] = settings.enabled_providers
-        state["workflow_config"] = settings.get_langgraph_config()
-        
-        logger.info(f"Workflow {state['workflow_id']} initialized with {len(state['enabled_providers'])} providers and {len([k for k, v in state['enabled_tools'].items() if v])} tools")
-        
-        return state
+        return {
+            **state,
+            "workflow_id": workflow_id,
+            "processing_time": 0.0,
+            "iteration_count": 0,
+            "language": state.get("language", "vi"),
+            "processed_query": state["original_query"],
+            "quality_checks": {},
+            "content_safety": {},
+            "agent_outputs": {},
+            "tool_outputs": [],
+            "retrieved_documents": [],
+            "document_sources": []
+        }
     
-    async def _route_query(self, state: WorkflowState) -> WorkflowState:
-        """Route query using semantic router (if enabled by admin)"""
-        state["current_step"] = "route_query"
+    async def _analyze_query(self, state: RAGState) -> RAGState:
+        """Analyze query using current configuration"""
+        query = state["processed_query"]
+        
+        # Use enabled providers only
+        enabled_providers = self.settings.get_enabled_providers()
+        if not enabled_providers:
+            logger.warning("No LLM providers enabled")
+            return {
+                **state,
+                "complexity_score": 0.5,
+                "analysis_result": {"error": "No providers enabled"}
+            }
         
         try:
-            # Get enabled router model from admin config
-            router_model = self.config.router_model
+            llm = await llm_provider_manager.get_provider(enabled_providers[0])
             
-            # Get LLM provider for routing
-            llm = await llm_provider_manager.get_llm(
-                provider=None,  # Auto-select based on admin config
-                model=router_model
+            analysis_prompt = f"""
+Phân tích query và xác định approach:
+
+Query: {query}
+Language: {state['language']}
+
+Available components:
+- Orchestrator: {'enabled' if self.settings.orchestrator.get('enabled') else 'disabled'}
+- Enabled tools: {self.settings.get_enabled_tools()}
+- Enabled agents: {self.settings.get_enabled_agents()}
+
+Trả về JSON:
+{{
+    "complexity_score": 0.7,
+    "needs_orchestration": true,
+    "needs_tools": false,
+    "needs_retrieval": true
+}}
+"""
+            
+            response = await llm.ainvoke(analysis_prompt)
+            
+            # Parse analysis
+            import json
+            json_start = response.content.find('{')
+            json_end = response.content.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                analysis = json.loads(response.content[json_start:json_end])
+            else:
+                analysis = {"complexity_score": 0.5, "needs_orchestration": True}
+            
+            return {
+                **state,
+                "complexity_score": analysis.get("complexity_score", 0.5),
+                "analysis_result": analysis
+            }
+            
+        except Exception as e:
+            logger.error(f"Query analysis failed: {e}")
+            return {
+                **state,
+                "complexity_score": 0.5,
+                "analysis_result": {"error": str(e)}
+            }
+    
+    async def _orchestrate_agents(self, state: RAGState) -> RAGState:
+        """Orchestrate agents with their configured providers"""
+        try:
+            result = await self.orchestrator.select_agents(
+                query=state["processed_query"],
+                language=state["language"],
+                complexity=state["complexity_score"]
             )
             
-            # Semantic routing logic
-            routing_prompt = f"""
-            Phân tích câu hỏi sau và quyết định hướng xử lý:
+            # Execute selected agents with their specific providers
+            agent_outputs = {}
+            for agent_name in result["selected_agents"]:
+                agent_result = await self.orchestrator.execute_agent_task(
+                    agent_name=agent_name,
+                    task=state["processed_query"],
+                    context={"language": state["language"]}
+                )
+                agent_outputs[agent_name] = agent_result
             
-            Câu hỏi: {state['query']}
-            
-            Các lựa chọn:
-            1. "retrieval" - Tìm kiếm trong tài liệu
-            2. "tools" - Sử dụng công cụ (tính toán, web search, etc.)
-            3. "direct" - Trả lời trực tiếp từ kiến thức
-            
-            Enabled tools: {[k for k, v in state['enabled_tools'].items() if v]}
-            
-            Trả về chỉ một từ: retrieval, tools, hoặc direct
-            """
-            
-            response = await llm.ainvoke(routing_prompt)
-            routing_decision = response.content.strip().lower()
-            
-            state["routing_decision"] = routing_decision
-            logger.info(f"Query routed to: {routing_decision}")
+            return {
+                **state,
+                "selected_agents": result["selected_agents"],
+                "orchestrator_reasoning": result["reasoning"],
+                "agent_outputs": agent_outputs
+            }
             
         except Exception as e:
-            logger.error(f"Routing failed: {e}")
-            state["routing_decision"] = "retrieval"  # Default fallback
-            state["error"] = f"Routing error: {e}"
-        
-        return state
+            logger.error(f"Agent orchestration failed: {e}")
+            return {
+                **state,
+                "selected_agents": ["general_assistant"],
+                "orchestrator_reasoning": f"Orchestration error: {e}",
+                "agent_outputs": {}
+            }
     
-    async def _retrieve_documents(self, state: WorkflowState) -> WorkflowState:
-        """Retrieve relevant documents from vector database"""
-        state["current_step"] = "retrieve_documents"
+    async def _execute_tools(self, state: RAGState) -> RAGState:
+        """Execute tools based on current configuration"""
+        enabled_tools = self.settings.get_enabled_tools()
+        
+        if not enabled_tools:
+            return {**state, "tool_outputs": []}
         
         try:
-            from services.vector.milvus_service import milvus_service
-            
-            # Retrieve documents
-            results = await milvus_service.search(
-                query=state["query"],
-                top_k=settings.DEFAULT_TOP_K,
-                threshold=settings.DEFAULT_THRESHOLD
+            relevant_tools = await self.tool_service.get_relevant_tools(
+                query=state["processed_query"],
+                available_tools=enabled_tools
             )
             
-            state["retrieved_documents"] = results
-            logger.info(f"Retrieved {len(results)} documents")
+            tool_outputs = []
+            for tool_name in relevant_tools:
+                result = await self.tool_service.execute_tool(
+                    tool_name=tool_name,
+                    query=state["processed_query"],
+                    context={"language": state["language"]}
+                )
+                tool_outputs.append({
+                    "tool": tool_name,
+                    "result": result.result if result.success else f"Error: {result.error}",
+                    "success": result.success,
+                    "timestamp": datetime.now().isoformat()
+                })
             
-        except Exception as e:
-            logger.error(f"Document retrieval failed: {e}")
-            state["retrieved_documents"] = []
-            state["error"] = f"Retrieval error: {e}"
-        
-        return state
-    
-    async def _grade_documents(self, state: WorkflowState) -> WorkflowState:
-        """Grade retrieved documents for relevance (if enabled by admin)"""
-        state["current_step"] = "grade_documents"
-        
-        try:
-            # Use admin-configured model for grading
-            llm = await llm_provider_manager.get_llm(model=self.config.retrieval_model)
-            
-            graded_docs = []
-            for doc in state["retrieved_documents"]:
-                grading_prompt = f"""
-                Đánh giá mức độ liên quan của tài liệu với câu hỏi:
-                
-                Câu hỏi: {state['query']}
-                Tài liệu: {doc.get('content', '')[:500]}...
-                
-                Trả về: relevant hoặc irrelevant
-                """
-                
-                response = await llm.ainvoke(grading_prompt)
-                relevance = response.content.strip().lower()
-                
-                if relevance == "relevant":
-                    graded_docs.append(doc)
-            
-            state["retrieved_documents"] = graded_docs
-            logger.info(f"Graded documents: {len(graded_docs)} relevant out of {len(state['retrieved_documents'])}")
-            
-        except Exception as e:
-            logger.error(f"Document grading failed: {e}")
-            state["error"] = f"Grading error: {e}"
-        
-        return state
-    
-    async def _expand_query(self, state: WorkflowState) -> WorkflowState:
-        """Expand query for better retrieval (if enabled by admin)"""
-        state["current_step"] = "expand_query"
-        
-        try:
-            llm = await llm_provider_manager.get_llm(model=self.config.retrieval_model)
-            
-            expansion_prompt = f"""
-            Mở rộng câu hỏi sau để tìm kiếm tốt hơn:
-            
-            Câu hỏi gốc: {state['query']}
-            
-            Tạo 2-3 cách diễn đạt khác nhau để tìm kiếm thông tin liên quan.
-            Trả về các từ khóa mở rộng, phân cách bởi dấu phẩy:
-            """
-            
-            response = await llm.ainvoke(expansion_prompt)
-            expanded_terms = response.content.strip()
-            
-            # Combine original query with expanded terms
-            state["query"] = f"{state['query']} {expanded_terms}"
-            logger.info(f"Query expanded: {expanded_terms}")
-            
-        except Exception as e:
-            logger.error(f"Query expansion failed: {e}")
-            state["error"] = f"Expansion error: {e}"
-        
-        return state
-    
-    async def _execute_tools(self, state: WorkflowState) -> WorkflowState:
-        """Execute enabled tools based on admin configuration"""
-        state["current_step"] = "execute_tools"
-        
-        try:
-            # Get enabled tools from admin config
-            enabled_tools = [k for k, v in state["enabled_tools"].items() if v]
-            
-            if not enabled_tools:
-                logger.warning("No tools enabled by admin")
-                state["tool_results"] = []
-                return state
-            
-            # Get available tools from tool manager
-            available_tools = await tool_manager.get_enabled_tools(enabled_tools)
-            
-            # Execute relevant tools based on query
-            tool_results = []
-            for tool_name, tool_instance in available_tools.items():
-                try:
-                    if await tool_manager.should_use_tool(tool_name, state["query"]):
-                        result = await tool_instance.execute(state["query"])
-                        tool_results.append({
-                            "tool": tool_name,
-                            "result": result,
-                            "success": True
-                        })
-                        logger.info(f"Tool {tool_name} executed successfully")
-                except Exception as tool_error:
-                    logger.error(f"Tool {tool_name} failed: {tool_error}")
-                    tool_results.append({
-                        "tool": tool_name,
-                        "result": str(tool_error),
-                        "success": False
-                    })
-            
-            state["tool_results"] = tool_results
-            logger.info(f"Executed {len(tool_results)} tools")
+            return {**state, "tool_outputs": tool_outputs}
             
         except Exception as e:
             logger.error(f"Tool execution failed: {e}")
-            state["tool_results"] = []
-            state["error"] = f"Tool execution error: {e}"
-        
-        return state
+            return {**state, "tool_outputs": [{"error": str(e)}]}
     
-    async def _generate_response(self, state: WorkflowState) -> WorkflowState:
-        """Generate response using admin-configured synthesis model"""
-        state["current_step"] = "generate_response"
-        
+    async def _retrieve_documents(self, state: RAGState) -> RAGState:
+        """Retrieve documents with current configuration"""
         try:
-            # Use admin-configured synthesis model
-            llm = await llm_provider_manager.get_llm(model=self.config.synthesis_model)
+            from services.vector.vector_service import VectorService
             
-            # Build context from retrieved documents and tool results
+            vector_service = VectorService()
+            
+            results = await vector_service.search(
+                query=state["processed_query"],
+                top_k=self.settings.rag["default_top_k"],
+                threshold=self.settings.rag["default_threshold"]
+            )
+            
+            return {
+                **state,
+                "retrieved_documents": results,
+                "document_sources": [doc.get("source", "Unknown") for doc in results]
+            }
+            
+        except Exception as e:
+            logger.error(f"Document retrieval failed: {e}")
+            return {
+                **state,
+                "retrieved_documents": [],
+                "document_sources": []
+            }
+    
+    async def _generate_response(self, state: RAGState) -> RAGState:
+        """Generate response using enabled providers"""
+        try:
+            enabled_providers = self.settings.get_enabled_providers()
+            if not enabled_providers:
+                raise ValueError("No LLM providers enabled")
+            
+            llm = await llm_provider_manager.get_provider(enabled_providers[0])
+            
+            # Build context
             context_parts = []
             
-            # Add document context
-            if state.get("retrieved_documents"):
-                doc_context = "\n".join([
-                    f"Tài liệu {i+1}: {doc.get('content', '')}"
-                    for i, doc in enumerate(state["retrieved_documents"][:5])
+            # Add agent outputs
+            if state["agent_outputs"]:
+                agent_context = "\n".join([
+                    f"Agent {agent}: {output.get('response', '')}"
+                    for agent, output in state["agent_outputs"].items()
+                    if output.get("success", True)
                 ])
-                context_parts.append(f"THÔNG TIN TỪ TÀI LIỆU:\n{doc_context}")
+                if agent_context:
+                    context_parts.append(f"AGENT ANALYSIS:\n{agent_context}")
             
-            # Add tool results
-            if state.get("tool_results"):
+            # Add tool outputs
+            if state["tool_outputs"]:
                 tool_context = "\n".join([
-                    f"Kết quả từ {result['tool']}: {result['result']}"
-                    for result in state["tool_results"] if result.get("success")
+                    f"Tool {output['tool']}: {output['result']}"
+                    for output in state["tool_outputs"]
+                    if output.get("success", True)
                 ])
                 if tool_context:
-                    context_parts.append(f"KẾT QUẢ TỪ CÔNG CỤ:\n{tool_context}")
+                    context_parts.append(f"TOOL RESULTS:\n{tool_context}")
             
-            # Add conversation history
-            if state.get("conversation_history"):
-                history_context = "\n".join([
-                    f"{msg['role']}: {msg['content']}"
-                    for msg in state["conversation_history"][-5:]  # Last 5 messages
+            # Add retrieved documents
+            if state["retrieved_documents"]:
+                doc_context = "\n".join([
+                    f"Document: {doc.get('content', '')}"
+                    for doc in state["retrieved_documents"][:3]
                 ])
-                context_parts.append(f"LỊCH SỬ HỘI THOẠI:\n{history_context}")
+                context_parts.append(f"RETRIEVED DOCUMENTS:\n{doc_context}")
             
-            context = "\n\n".join(context_parts)
+            context = "\n\n".join(context_parts) if context_parts else "Không có thông tin tham khảo cụ thể."
             
             response_prompt = f"""
-            Bạn là một AI assistant thông minh. Dựa vào thông tin được cung cấp, hãy trả lời câu hỏi một cách chính xác và hữu ích.
-            
-            CÂU HỎI: {state['query']}
-            
-            THÔNG TIN THAM KHẢO:
-            {context}
-            
-            YÊU CẦU:
-            - Trả lời bằng tiếng Việt
-            - Dựa vào thông tin được cung cấp
-            - Nếu không có thông tin phù hợp, hãy nói rõ
-            - Đưa ra câu trả lời chi tiết và có cấu trúc
-            
-            TRẢ LỜI:
-            """
+Bạn là AI Assistant. Trả lời câu hỏi dựa vào thông tin được cung cấp:
+
+Câu hỏi: {state['processed_query']}
+
+Thông tin tham khảo:
+{context}
+
+Trả lời bằng {state['language']}, chính xác và hữu ích:
+"""
             
             response = await llm.ainvoke(response_prompt)
-            state["response"] = response.content
             
-            # Extract sources
-            sources = []
-            if state.get("retrieved_documents"):
-                sources = [
-                    {
-                        "title": doc.get("title", "Unknown"),
-                        "url": doc.get("url", ""),
-                        "snippet": doc.get("content", "")[:200] + "..."
-                    }
-                    for doc in state["retrieved_documents"][:3]
-                ]
-            state["sources"] = sources
+            # Calculate confidence
+            confidence = 0.7
+            if state["retrieved_documents"]:
+                confidence += 0.2
+            if state["tool_outputs"]:
+                confidence += 0.1
+            if state["agent_outputs"]:
+                confidence += 0.1
+            confidence = min(confidence, 0.95)
             
-            logger.info("Response generated successfully")
+            return {
+                **state,
+                "draft_response": response.content,
+                "confidence_score": confidence
+            }
             
         except Exception as e:
             logger.error(f"Response generation failed: {e}")
-            state["response"] = "Xin lỗi, tôi không thể tạo câu trả lời lúc này. Vui lòng thử lại sau."
-            state["error"] = f"Response generation error: {e}"
-        
-        return state
+            return {
+                **state,
+                "draft_response": "Xin lỗi, tôi không thể tạo câu trả lời lúc này.",
+                "confidence_score": 0.1
+            }
     
-    async def _check_hallucination(self, state: WorkflowState) -> WorkflowState:
-        """Check response for hallucination (if enabled by admin)"""
-        state["current_step"] = "check_hallucination"
+    async def _quality_check(self, state: RAGState) -> RAGState:
+        """Quality check if enabled in configuration"""
+        if not self.settings.workflow.enable_hallucination_check:
+            return {**state, "quality_checks": {"skipped": True}}
         
         try:
-            llm = await llm_provider_manager.get_llm(model=self.config.reflection_model)
+            checks = {
+                "has_content": len(state["draft_response"].strip()) > 10,
+                "appropriate_length": 50 < len(state["draft_response"]) < 5000,
+                "not_error_message": "xin lỗi" not in state["draft_response"].lower()
+            }
             
-            hallucination_prompt = f"""
-            Kiểm tra xem câu trả lời có bị ảo giác (hallucination) không:
-            
-            Câu hỏi: {state['query']}
-            Câu trả lời: {state['response']}
-            Thông tin tham khảo: {state.get('retrieved_documents', [])}
-            
-            Trả về: good (nếu câu trả lời phù hợp) hoặc bad (nếu có ảo giác)
-            """
-            
-            response = await llm.ainvoke(hallucination_prompt)
-            check_result = response.content.strip().lower()
-            
-            state["hallucination_check"] = check_result
-            logger.info(f"Hallucination check: {check_result}")
+            return {**state, "quality_checks": checks}
             
         except Exception as e:
-            logger.error(f"Hallucination check failed: {e}")
-            state["hallucination_check"] = "good"  # Default to good
-            state["error"] = f"Hallucination check error: {e}"
-        
-        return state
+            logger.error(f"Quality check failed: {e}")
+            return {**state, "quality_checks": {"error": str(e)}}
     
-    async def _reflect_response(self, state: WorkflowState) -> WorkflowState:
-        """Reflect and improve response (if enabled by admin)"""
-        state["current_step"] = "reflect_response"
+    async def _finalize_response(self, state: RAGState) -> RAGState:
+        """Finalize response"""
+        final_response = state["draft_response"]
         
-        try:
-            llm = await llm_provider_manager.get_llm(model=self.config.reflection_model)
-            
-            reflection_prompt = f"""
-            Cải thiện câu trả lời sau để tốt hơn:
-            
-            Câu hỏi: {state['query']}
-            Câu trả lời hiện tại: {state['response']}
-            
-            Hãy cải thiện:
-            1. Độ chính xác
-            2. Tính đầy đủ
-            3. Cấu trúc rõ ràng
-            4. Tính hữu ích
-            
-            Câu trả lời được cải thiện:
-            """
-            
-            response = await llm.ainvoke(reflection_prompt)
-            state["response"] = response.content
-            
-            logger.info("Response reflected and improved")
-            
-        except Exception as e:
-            logger.error(f"Response reflection failed: {e}")
-            state["error"] = f"Reflection error: {e}"
+        # Add sources if available and enabled
+        if state["document_sources"] and self.settings.workflow.enable_citation_generation:
+            sources_text = "\n\nNguồn tham khảo: " + ", ".join(state["document_sources"][:3])
+            final_response += sources_text
         
-        return state
+        return {
+            **state,
+            "final_response": final_response,
+            "processing_time": (datetime.now().timestamp() - state.get("start_time", datetime.now().timestamp())),
+            "iteration_count": state.get("iteration_count", 0) + 1
+        }
     
-    async def _generate_citations(self, state: WorkflowState) -> WorkflowState:
-        """Generate citations for response (if enabled by admin)"""
-        state["current_step"] = "generate_citations"
-        
-        try:
-            if not state.get("sources"):
-                logger.info("No sources available for citation generation")
-                return state
-            
-            llm = await llm_provider_manager.get_llm(model=self.config.synthesis_model)
-            
-            citation_prompt = f"""
-            Tạo các câu hỏi tiếp theo phù hợp cho cuộc hội thoại:
-            
-            Câu hỏi gốc: {state['query']}
-            Câu trả lời: {state['response']}
-            
-            Tạo {settings.NUM_FOLLOW_UP_QUESTIONS} câu hỏi tiếp theo thú vị và liên quan.
-            Trả về danh sách các câu hỏi, mỗi câu một dòng:
-            """
-            
-            response = await llm.ainvoke(citation_prompt)
-            follow_up_questions = [
-                q.strip("- ").strip()
-                for q in response.content.split("\n")
-                if q.strip() and not q.strip().startswith("1.") and not q.strip().startswith("2.") and not q.strip().startswith("3.")
-            ][:settings.NUM_FOLLOW_UP_QUESTIONS]
-            
-            state["follow_up_questions"] = follow_up_questions
-            logger.info(f"Generated {len(follow_up_questions)} follow-up questions")
-            
-        except Exception as e:
-            logger.error(f"Citation generation failed: {e}")
-            state["follow_up_questions"] = []
-            state["error"] = f"Citation error: {e}"
-        
-        return state
+    # ========================================
+    # ROUTING FUNCTIONS
+    # ========================================
     
-    async def _finalize_response(self, state: WorkflowState) -> WorkflowState:
-        """Finalize workflow response"""
-        state["current_step"] = "finalize"
+    def _route_after_analysis(self, state: RAGState) -> Literal["orchestrate", "direct_tools", "direct_retrieval"]:
+        """Route based on analysis and current configuration"""
+        analysis = state.get("analysis_result", {})
         
-        # Calculate processing time
-        # (This would be calculated properly with start time tracking)
-        state["processing_time"] = 0.0
+        # Check if orchestration is enabled and needed
+        if (self.settings.orchestrator.get("enabled", True) and 
+            analysis.get("needs_orchestration", False)):
+            return "orchestrate"
         
-        # Ensure required fields exist
-        if not state.get("response"):
-            state["response"] = "Xin lỗi, tôi không thể tạo câu trả lời cho câu hỏi này."
+        # Check if tools are enabled and needed
+        elif (self.settings.get_enabled_tools() and 
+              analysis.get("needs_tools", False)):
+            return "direct_tools"
         
-        if not state.get("sources"):
-            state["sources"] = []
-        
-        if not state.get("follow_up_questions"):
-            state["follow_up_questions"] = []
-        
-        logger.info(f"Workflow {state['workflow_id']} completed successfully")
-        return state
-    
-    # =================
-    # CONDITIONAL FUNCTIONS
-    # =================
-    
-    def _routing_condition(self, state: WorkflowState) -> str:
-        """Determine routing based on semantic analysis"""
-        routing_decision = state.get("routing_decision", "retrieval")
-        return routing_decision
-    
-    def _document_grading_condition(self, state: WorkflowState) -> str:
-        """Determine next step based on document grading"""
-        if not state.get("retrieved_documents"):
-            return "tools"
-        elif len(state["retrieved_documents"]) < 2:
-            return "expand"
         else:
-            return "good"
+            return "direct_retrieval"
     
-    def _hallucination_condition(self, state: WorkflowState) -> str:
-        """Determine if response has hallucination"""
-        check_result = state.get("hallucination_check", "good")
-        return check_result
+    def _route_after_quality_check(self, state: RAGState) -> Literal["pass", "retry", "fail"]:
+        """Route based on quality check results"""
+        if not self.settings.workflow.enable_hallucination_check:
+            return "pass"
+        
+        checks = state.get("quality_checks", {})
+        
+        # If all checks pass
+        if all(checks.values()) and "error" not in checks:
+            return "pass"
+        
+        # Allow retry if under iteration limit
+        elif state.get("iteration_count", 0) < self.settings.workflow.max_iterations:
+            return "retry"
+        
+        else:
+            return "fail"
     
-    # =================
+    # ========================================
     # PUBLIC INTERFACE
-    # =================
+    # ========================================
     
-    @log_performance()
     async def process_query(
         self,
         query: str,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        language: str = "vi",
         conversation_history: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
-        """
-        Process RAG query through LangGraph workflow
-        """
-        if not self.initialized:
-            raise WorkflowError("Workflow not initialized")
+        """Process RAG query through config-aware workflow"""
+        
+        if not self._initialized:
+            await self.initialize()
+        
+        # Create initial state
+        initial_state = RAGState(
+            messages=[HumanMessage(content=query)],
+            original_query=query,
+            processed_query=query,
+            language=language,
+            user_id=user_id,
+            session_id=session_id or f"session_{datetime.now().isoformat()}",
+            conversation_history=conversation_history or [],
+            selected_agents=[],
+            agent_outputs={},
+            orchestrator_reasoning="",
+            complexity_score=0.0,
+            tool_calls=[],
+            tool_outputs=[],
+            retrieved_documents=[],
+            document_sources=[],
+            draft_response="",
+            final_response="",
+            confidence_score=0.0,
+            quality_checks={},
+            content_safety={},
+            workflow_id="",
+            processing_time=0.0,
+            iteration_count=0
+        )
+        
+        initial_state["start_time"] = datetime.now().timestamp()
         
         try:
-            # Prepare initial state
-            initial_state = WorkflowState(
-                query=query,
-                user_id=user_id,
-                session_id=session_id or f"session_{datetime.now().isoformat()}",
-                conversation_history=conversation_history or [],
-                current_step="",
-                routing_decision=None,
-                retrieved_documents=[],
-                tool_results=[],
-                response=None,
-                sources=[],
-                follow_up_questions=[],
-                processing_time=0.0,
-                tokens_used=0,
-                error=None,
-                workflow_id="",
-                enabled_tools={},
-                enabled_providers=[],
-                workflow_config={}
-            )
-            
-            # Execute workflow
             config = {"configurable": {"thread_id": initial_state["session_id"]}}
             
-            final_state = await self.compiled_graph.ainvoke(
-                initial_state,
-                config=config
-            )
+            final_state = await self.graph.ainvoke(initial_state, config=config)
             
-            # Return formatted response
             return {
-                "response": final_state["response"],
-                "sources": final_state["sources"],
-                "follow_up_questions": final_state["follow_up_questions"],
+                "response": final_state["final_response"],
+                "sources": final_state["document_sources"],
+                "confidence": final_state["confidence_score"],
                 "workflow_id": final_state["workflow_id"],
                 "processing_time": final_state["processing_time"],
-                "tokens_used": final_state["tokens_used"],
-                "error": final_state.get("error")
+                "metadata": {
+                    "selected_agents": final_state["selected_agents"],
+                    "orchestrator_reasoning": final_state["orchestrator_reasoning"],
+                    "complexity_score": final_state["complexity_score"],
+                    "tools_used": [output.get("tool") for output in final_state["tool_outputs"]],
+                    "quality_checks": final_state["quality_checks"],
+                    "iteration_count": final_state["iteration_count"],
+                    "configuration_version": datetime.now().isoformat(),
+                    "agent_outputs": final_state["agent_outputs"]
+                }
             }
             
         except Exception as e:
             logger.error(f"Workflow execution failed: {e}")
-            raise WorkflowError(f"Query processing failed: {e}")
+            return {
+                "response": "Xin lỗi, đã có lỗi xảy ra trong quá trình xử lý.",
+                "sources": [],
+                "confidence": 0.1,
+                "workflow_id": initial_state.get("workflow_id", "unknown"),
+                "processing_time": 0.0,
+                "metadata": {"error": str(e)}
+            }
     
     async def health_check(self) -> bool:
-        """Check if workflow is healthy"""
-        return self.initialized and self.compiled_graph is not None
+        """Check workflow health"""
+        try:
+            return self._initialized and self.graph is not None and not self._rebuilding
+        except Exception:
+            return False
+    
+    async def get_configuration_status(self) -> Dict[str, Any]:
+        """Get current configuration status"""
+        return {
+            "initialized": self._initialized,
+            "rebuilding": self._rebuilding,
+            "enabled_providers": self.settings.get_enabled_providers(),
+            "enabled_tools": self.settings.get_enabled_tools(),
+            "enabled_agents": self.settings.get_enabled_agents(),
+            "orchestrator_enabled": self.settings.orchestrator.get("enabled", True),
+            "workflow_features": {
+                "reflection": self.settings.workflow.enable_reflection,
+                "semantic_routing": self.settings.workflow.enable_semantic_routing,
+                "document_grading": self.settings.workflow.enable_document_grading,
+                "citation_generation": self.settings.workflow.enable_citation_generation,
+                "hallucination_check": self.settings.workflow.enable_hallucination_check
+            }
+        }
+
+# Global workflow instance  
+rag_workflow = ConfigAwareRAGWorkflow()
+
+from typing import Dict, Any, List, Optional, Literal, Annotated
+from typing_extensions import TypedDict
+from datetime import datetime
+import asyncio
+
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages  
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.redis import RedisSaver
+
+from config.settings import get_settings
+from services.config.config_manager import config_manager, ConfigSubscriber, ConfigChange, ConfigChangeType
+from services.llm.provider_manager import llm_provider_manager
+from services.tools.tool_service import ToolService
+from services.orchestrator.agent_orchestrator import AgentOrchestrator
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+class RAGState(TypedDict):
+    """RAG workflow state schema"""
+    
+    # Messages - Core LangGraph pattern
+    messages: Annotated[List[BaseMessage], add_messages]
+    
+    # Query processing
+    original_query: str
+    processed_query: str
+    language: str
+    
+    # User context
+    user_id: Optional[str]
+    session_id: str
+    conversation_history: List[Dict[str, Any]]
+    
+    # Agent orchestration
+    selected_agents: List[str]
+    agent_outputs: Dict[str, Dict[str, Any]]
+    orchestrator_reasoning: str
+    complexity_score: float
+    
+    # Tool execution
+    tool_calls: List[Dict[str, Any]]
+    tool_outputs: List[Dict[str, Any]]
+    
+    # Document retrieval
+    retrieved_documents: List[Dict[str, Any]]
+    document_sources: List[str]
+    
+    # Response generation
+    draft_response: str
+    final_response: str
+    confidence_score: float
+    
+    # Quality control
+    quality_checks: Dict[str, bool]
+    content_safety: Dict[str, Any]
+    
+    # Metadata
+    workflow_id: str
+    processing_time: float
+    iteration_count: int
+
+class ConfigAwareRAGWorkflow(ConfigSubscriber):
+    """
+    Configuration-aware RAG Workflow
+    Automatically reloads when admin changes settings
+    """
+    
+    def __init__(self):
+        self.settings = get_settings()
+        self.tool_service = ToolService()
+        self.orchestrator = AgentOrchestrator()
+        self.graph = None
+        self.checkpointer = None
+        self._initialized = False
+        self._rebuilding = False
+        
+    async def initialize(self):
+        """Initialize workflow với config subscription"""
+        try:
+            await self._setup_checkpointer()
+            await self._build_graph()
+            
+            # Subscribe to configuration changes
+            config_manager.subscribe("workflow", self)
+            
+            self._initialized = True
+            logger.info("Config-aware RAG Workflow initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG Workflow: {e}")
+            raise
+    
+    async def on_config_change(self, change: ConfigChange) -> bool:
+        """
+        Handle configuration changes from admin
+        Automatically reload affected components
+        """
+        try:
+            logger.info(f"Workflow received config change: {change.change_type} for {change.component_name}")
+            
+            # Prevent concurrent rebuilds
+            if self._rebuilding:
+                logger.info("Workflow rebuild already in progress, skipping")
+                return True
+            
+            self._rebuilding = True
+            
+            # Reload settings first
+            from config.settings import reload_settings
+            self.settings = reload_settings()
+            
+            # Handle different types of changes
+            if change.change_type in [
+                ConfigChangeType.PROVIDER_ENABLED,
+                ConfigChangeType.PROVIDER_DISABLED,
+                ConfigChangeType.PROVIDER_CONFIG_CHANGED
+            ]:
+                await self._handle_provider_change(change)
+                
+            elif change.change_type in [
+                ConfigChangeType.TOOL_ENABLED,
+                ConfigChangeType.TOOL_DISABLED,
+                ConfigChangeType.TOOL_CONFIG_CHANGED
+            ]:
+                await self._handle_tool_change(change)
+                
+            elif change.change_type in [
+                ConfigChangeType.AGENT_ENABLED,
+                ConfigChangeType.AGENT_DISABLED,
+                ConfigChangeType.AGENT_CONFIG_CHANGED
+            ]:
+                await self._handle_agent_change(change)
+                
+            elif change.change_type == ConfigChangeType.WORKFLOW_CONFIG_CHANGED:
+                await self._handle_workflow_change(change)
+            
+            # Rebuild workflow graph with new configuration
+            await self._rebuild_workflow()
+            
+            self._rebuilding = False
+            
+            logger.info(f"Workflow successfully adapted to config change: {change.component_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to handle config change: {e}")
+            self._rebuilding = False
+            return False
+    
+    async def _handle_provider_change(self, change: ConfigChange):
+        """Handle LLM provider configuration changes"""
+        logger.info(f"Handling provider change: {change.component_name}")
+        
+        # Reinitialize LLM provider manager
+        if llm_provider_manager._initialized:
+            llm_provider_manager._initialized = False
+            await llm_provider_manager.initialize()
+    
+    async def _handle_tool_change(self, change: ConfigChange):
+        """Handle tool configuration changes"""
+        logger.info(f"Handling tool change: {change.component_name}")
+        
+        # Reinitialize tool service
+        if self.tool_service._initialized:
+            self.tool_service._initialized = False
+            await self.tool_service.initialize()
+    
+    async def _handle_agent_change(self, change: ConfigChange):
+        """Handle agent configuration changes"""
+        logger.info(f"Handling agent change: {change.component_name}")
+        
+        # Agent orchestrator doesn't need reinitialization
+        # It reads from settings dynamically
+        pass
+    
+    async def _handle_workflow_change(self, change: ConfigChange):
+        """Handle workflow configuration changes"""
+        logger.info("Handling workflow configuration change")
+        
+        # Workflow will be rebuilt with new settings
+        # No additional actions needed
+        pass
+    
+    async def _rebuild_workflow(self):
+        """Rebuild workflow graph with updated configuration"""
+        try:
+            logger.info("Rebuilding workflow graph with updated configuration...")
+            
+            # Setup checkpointer if type changed
+            await self._setup_checkpointer()
+            
+            # Rebuild graph
+            await self._build_graph()
+            
+            logger.info("Workflow graph rebuilt successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to rebuild workflow: {e}")
+            raise
+    
+    async def _setup_checkpointer(self):
+        """Setup checkpointer based on current configuration"""
+        checkpointer_type = self.settings.workflow.checkpointer_type
+        
+        if checkpointer_type == "redis":
+            try:
+                import redis.asyncio as redis
+                redis_client = redis.from_url(self.settings.cache.url)
+                self.checkpointer = RedisSaver(redis_client)
+                logger.info("Redis checkpointer configured")
+            except Exception as e:
+                logger.warning(f"Redis checkpointer failed: {e}, using memory")
+                self.checkpointer = MemorySaver()
+        else:
+            self.checkpointer = MemorySaver()
+    
+    async def _build_graph(self):
+        """Build LangGraph with current configuration"""
+        builder = StateGraph(RAGState)
+        
+        # Add nodes based on current configuration
+        builder.add_node("initialize", self._initialize_processing)
+        builder.add_node("analyze_query", self._analyze_query)
+        
+        # Conditional nodes based on configuration
+        if self.settings.orchestrator.get("enabled", True):
+            builder.add_node("orchestrate_agents", self._orchestrate_agents)
+        
+        # Tools node if any tools are enabled
+        if self.settings.get_enabled_tools():
+            builder.add_node("execute_tools", self._execute_tools)
+        
+        builder.add_node("retrieve_documents", self._retrieve_documents)
+        builder.add_node("generate_response", self._generate_response)
+        
+        # Quality control based on configuration
+        if self.settings.workflow.enable_hallucination_check:
+            builder.add_node("quality_check", self._quality_check)
+        
+        builder.add_node("finalize_response", self._finalize_response)
+        
+        # Build edges based on current configuration
+        await self._build_workflow_edges(builder)
+        
+        # Set entry and exit points
+        builder.set_entry_point("initialize")
+        builder.set_finish_point("finalize_response")
+        
+        # Compile graph
+        self.graph = builder.compile(
+            checkpointer=self.checkpointer,
+            debug=self.settings.DEBUG
+        )
+    
+    async def _build_workflow_edges(self, builder):
+        """Build workflow edges based on current configuration"""
+        
+        builder.add_edge(START, "initialize")
+        builder.add_edge("initialize", "analyze_query")
+        
+        # Routing after analysis
+        if self.settings.orchestrator.get("enabled", True):
+            builder.add_conditional_edges(
+                "analyze_query",
+                self._route_after_analysis,
+                {
+                    "orchestrate": "orchestrate_agents",
+                    "direct_tools": "execute_tools" if self.settings.get_enabled_tools() else "retrieve_documents",
+                    "direct_retrieval": "retrieve_documents"
+                }
+            )
+            builder.add_edge("orchestrate_agents", "execute_tools" if self.settings.get_enabled_tools() else "retrieve_documents")
+        else:
+            # Direct routing without orchestration
+            if self.settings.get_enabled_tools():
+                builder.add_edge("analyze_query", "execute_tools")
+                builder.add_edge("execute_tools", "retrieve_documents")
+            else:
+                builder.add_edge("analyze_query", "retrieve_documents")
+        
+        # Tools to retrieval
+        if self.settings.get_enabled_tools():
+            builder.add_edge("execute_tools", "retrieve_documents")
+        
+        # Retrieval to response generation
+        builder.add_edge("retrieve_documents", "generate_response")
+        
+        # Quality control flow
+        if self.settings.workflow.enable_hallucination_check:
+            builder.add_edge("generate_response", "quality_check")
+            builder.add_conditional_edges(
+                "quality_check",
+                self._route_after_quality_check,
+                {
+                    "pass": "finalize_response",
+                    "retry": "generate_response",
+                    "fail": "finalize_response"
+                }
+            )
+        else:
+            builder.add_edge("generate_response", "finalize_response")
+        
+        builder.add_edge("finalize_response", END)
+    
+    # ========================================
+    # NODE IMPLEMENTATIONS
+    # ========================================
+    
+    async def _initialize_processing(self, state: RAGState) -> RAGState:
+        """Initialize processing state"""
+        workflow_id = f"rag_{datetime.now().isoformat()}_{state.get('user_id', 'anon')}"
+        
+        return {
+            **state,
+            "workflow_id": workflow_id,
+            "processing_time": 0.0,
+            "iteration_count": 0,
+            "language": state.get("language", "vi"),
+            "processed_query": state["original_query"],
+            "quality_checks": {},
+            "content_safety": {},
+            "agent_outputs": {},
+            "tool_outputs": [],
+            "retrieved_documents": [],
+            "document_sources": []
+        }
+    
+    async def _analyze_query(self, state: RAGState) -> RAGState:
+        """Analyze query using current configuration"""
+        query = state["processed_query"]
+        
+        # Use enabled providers only
+        enabled_providers = self.settings.get_enabled_providers()
+        if not enabled_providers:
+            logger.warning("No LLM providers enabled")
+            return {
+                **state,
+                "complexity_score": 0.5,
+                "analysis_result": {"error": "No providers enabled"}
+            }
+        
+        try:
+            llm = await llm_provider_manager.get_provider(enabled_providers[0])
+            
+            analysis_prompt = f"""
+Phân tích query và xác định approach:
+
+Query: {query}
+Language: {state['language']}
+
+Available components:
+- Orchestrator: {'enabled' if self.settings.orchestrator.get('enabled') else 'disabled'}
+- Enabled tools: {self.settings.get_enabled_tools()}
+- Enabled agents: {self.settings.get_enabled_agents()}
+
+Trả về JSON:
+{{
+    "complexity_score": 0.7,
+    "needs_orchestration": true,
+    "needs_tools": false,
+    "needs_retrieval": true
+}}
+"""
+            
+            response = await llm.ainvoke(analysis_prompt)
+            
+            # Parse analysis
+            import json
+            json_start = response.content.find('{')
+            json_end = response.content.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                analysis = json.loads(response.content[json_start:json_end])
+            else:
+                analysis = {"complexity_score": 0.5, "needs_orchestration": True}
+            
+            return {
+                **state,
+                "complexity_score": analysis.get("complexity_score", 0.5),
+                "analysis_result": analysis
+            }
+            
+        except Exception as e:
+            logger.error(f"Query analysis failed: {e}")
+            return {
+                **state,
+                "complexity_score": 0.5,
+                "analysis_result": {"error": str(e)}
+            }
+    
+    async def _orchestrate_agents(self, state: RAGState) -> RAGState:
+        """Orchestrate agents if enabled"""
+        try:
+            result = await self.orchestrator.select_agents(
+                query=state["processed_query"],
+                language=state["language"],
+                complexity=state["complexity_score"]
+            )
+            
+            return {
+                **state,
+                "selected_agents": result["selected_agents"],
+                "orchestrator_reasoning": result["reasoning"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Agent orchestration failed: {e}")
+            return {
+                **state,
+                "selected_agents": ["general_assistant"],
+                "orchestrator_reasoning": f"Orchestration error: {e}"
+            }
+    
+    async def _execute_tools(self, state: RAGState) -> RAGState:
+        """Execute tools based on current configuration"""
+        enabled_tools = self.settings.get_enabled_tools()
+        
+        if not enabled_tools:
+            return {**state, "tool_outputs": []}
+        
+        try:
+            relevant_tools = await self.tool_service.get_relevant_tools(
+                query=state["processed_query"],
+                available_tools=enabled_tools
+            )
+            
+            tool_outputs = []
+            for tool_name in relevant_tools:
+                result = await self.tool_service.execute_tool(
+                    tool_name=tool_name,
+                    query=state["processed_query"],
+                    context={"language": state["language"]}
+                )
+                tool_outputs.append({
+                    "tool": tool_name,
+                    "result": result.result if result.success else f"Error: {result.error}",
+                    "success": result.success,
+                    "timestamp": datetime.now().isoformat()
+                })
+            
+            return {**state, "tool_outputs": tool_outputs}
+            
+        except Exception as e:
+            logger.error(f"Tool execution failed: {e}")
+            return {**state, "tool_outputs": [{"error": str(e)}]}
+    
+    async def _retrieve_documents(self, state: RAGState) -> RAGState:
+        """Retrieve documents with current configuration"""
+        try:
+            from services.vector.vector_service import VectorService
+            
+            vector_service = VectorService()
+            
+            results = await vector_service.search(
+                query=state["processed_query"],
+                top_k=self.settings.rag["default_top_k"],
+                threshold=self.settings.rag["default_threshold"]
+            )
+            
+            return {
+                **state,
+                "retrieved_documents": results,
+                "document_sources": [doc.get("source", "Unknown") for doc in results]
+            }
+            
+        except Exception as e:
+            logger.error(f"Document retrieval failed: {e}")
+            return {
+                **state,
+                "retrieved_documents": [],
+                "document_sources": []
+            }
+    
+    async def _generate_response(self, state: RAGState) -> RAGState:
+        """Generate response using enabled providers"""
+        try:
+            enabled_providers = self.settings.get_enabled_providers()
+            if not enabled_providers:
+                raise ValueError("No LLM providers enabled")
+            
+            llm = await llm_provider_manager.get_provider(enabled_providers[0])
+            
+            # Build context
+            context_parts = []
+            
+            if state["tool_outputs"]:
+                tool_context = "\n".join([
+                    f"Tool {output['tool']}: {output['result']}"
+                    for output in state["tool_outputs"]
+                    if output.get("success", True)
+                ])
+                if tool_context:
+                    context_parts.append(f"TOOL RESULTS:\n{tool_context}")
+            
+            if state["retrieved_documents"]:
+                doc_context = "\n".join([
+                    f"Document: {doc.get('content', '')}"
+                    for doc in state["retrieved_documents"][:3]
+                ])
+                context_parts.append(f"RETRIEVED DOCUMENTS:\n{doc_context}")
+            
+            context = "\n\n".join(context_parts) if context_parts else "Không có thông tin tham khảo cụ thể."
+            
+            response_prompt = f"""
+Bạn là AI Assistant. Trả lời câu hỏi dựa vào thông tin được cung cấp:
+
+Câu hỏi: {state['processed_query']}
+
+Thông tin tham khảo:
+{context}
+
+Trả lời bằng {state['language']}, chính xác và hữu ích:
+"""
+            
+            response = await llm.ainvoke(response_prompt)
+            
+            # Calculate confidence
+            confidence = 0.7
+            if state["retrieved_documents"]:
+                confidence += 0.2
+            if state["tool_outputs"]:
+                confidence += 0.1
+            confidence = min(confidence, 0.95)
+            
+            return {
+                **state,
+                "draft_response": response.content,
+                "confidence_score": confidence
+            }
+            
+        except Exception as e:
+            logger.error(f"Response generation failed: {e}")
+            return {
+                **state,
+                "draft_response": "Xin lỗi, tôi không thể tạo câu trả lời lúc này.",
+                "confidence_score": 0.1
+            }
+    
+    async def _quality_check(self, state: RAGState) -> RAGState:
+        """Quality check if enabled in configuration"""
+        if not self.settings.workflow.enable_hallucination_check:
+            return {**state, "quality_checks": {"skipped": True}}
+        
+        try:
+            checks = {
+                "has_content": len(state["draft_response"].strip()) > 10,
+                "appropriate_length": 50 < len(state["draft_response"]) < 5000,
+                "not_error_message": "xin lỗi" not in state["draft_response"].lower()
+            }
+            
+            return {**state, "quality_checks": checks}
+            
+        except Exception as e:
+            logger.error(f"Quality check failed: {e}")
+            return {**state, "quality_checks": {"error": str(e)}}
+    
+    async def _finalize_response(self, state: RAGState) -> RAGState:
+        """Finalize response"""
+        final_response = state["draft_response"]
+        
+        # Add sources if available and enabled
+        if state["document_sources"] and self.settings.workflow.enable_citation_generation:
+            sources_text = "\n\nNguồn tham khảo: " + ", ".join(state["document_sources"][:3])
+            final_response += sources_text
+        
+        return {
+            **state,
+            "final_response": final_response,
+            "processing_time": (datetime.now().timestamp() - state.get("start_time", datetime.now().timestamp())),
+            "iteration_count": state.get("iteration_count", 0) + 1
+        }
+    
+    # ========================================
+    # ROUTING FUNCTIONS
+    # ========================================
+    
+    def _route_after_analysis(self, state: RAGState) -> Literal["orchestrate", "direct_tools", "direct_retrieval"]:
+        """Route based on analysis and current configuration"""
+        analysis = state.get("analysis_result", {})
+        
+        # Check if orchestration is enabled and needed
+        if (self.settings.orchestrator.get("enabled", True) and 
+            analysis.get("needs_orchestration", False)):
+            return "orchestrate"
+        
+        # Check if tools are enabled and needed
+        elif (self.settings.get_enabled_tools() and 
+              analysis.get("needs_tools", False)):
+            return "direct_tools"
+        
+        else:
+            return "direct_retrieval"
+    
+    def _route_after_quality_check(self, state: RAGState) -> Literal["pass", "retry", "fail"]:
+        """Route based on quality check results"""
+        if not self.settings.workflow.enable_hallucination_check:
+            return "pass"
+        
+        checks = state.get("quality_checks", {})
+        
+        # If all checks pass
+        if all(checks.values()) and "error" not in checks:
+            return "pass"
+        
+        # Allow retry if under iteration limit
+        elif state.get("iteration_count", 0) < self.settings.workflow.max_iterations:
+            return "retry"
+        
+        else:
+            return "fail"
+    
+    # ========================================
+    # PUBLIC INTERFACE
+    # ========================================
+    
+    async def process_query(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        language: str = "vi",
+        conversation_history: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
+        """Process RAG query through config-aware workflow"""
+        
+        if not self._initialized:
+            await self.initialize()
+        
+        # Create initial state
+        initial_state = RAGState(
+            messages=[HumanMessage(content=query)],
+            original_query=query,
+            processed_query=query,
+            language=language,
+            user_id=user_id,
+            session_id=session_id or f"session_{datetime.now().isoformat()}",
+            conversation_history=conversation_history or [],
+            selected_agents=[],
+            agent_outputs={},
+            orchestrator_reasoning="",
+            complexity_score=0.0,
+            tool_calls=[],
+            tool_outputs=[],
+            retrieved_documents=[],
+            document_sources=[],
+            draft_response="",
+            final_response="",
+            confidence_score=0.0,
+            quality_checks={},
+            content_safety={},
+            workflow_id="",
+            processing_time=0.0,
+            iteration_count=0
+        )
+        
+        initial_state["start_time"] = datetime.now().timestamp()
+        
+        try:
+            config = {"configurable": {"thread_id": initial_state["session_id"]}}
+            
+            final_state = await self.graph.ainvoke(initial_state, config=config)
+            
+            return {
+                "response": final_state["final_response"],
+                "sources": final_state["document_sources"],
+                "confidence": final_state["confidence_score"],
+                "workflow_id": final_state["workflow_id"],
+                "processing_time": final_state["processing_time"],
+                "metadata": {
+                    "selected_agents": final_state["selected_agents"],
+                    "orchestrator_reasoning": final_state["orchestrator_reasoning"],
+                    "complexity_score": final_state["complexity_score"],
+                    "tools_used": [output.get("tool") for output in final_state["tool_outputs"]],
+                    "quality_checks": final_state["quality_checks"],
+                    "iteration_count": final_state["iteration_count"],
+                    "configuration_version": datetime.now().isoformat()
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Workflow execution failed: {e}")
+            return {
+                "response": "Xin lỗi, đã có lỗi xảy ra trong quá trình xử lý.",
+                "sources": [],
+                "confidence": 0.1,
+                "workflow_id": initial_state.get("workflow_id", "unknown"),
+                "processing_time": 0.0,
+                "metadata": {"error": str(e)}
+            }
+    
+    async def health_check(self) -> bool:
+        """Check workflow health"""
+        try:
+            return self._initialized and self.graph is not None and not self._rebuilding
+        except Exception:
+            return False
+    
+    async def get_configuration_status(self) -> Dict[str, Any]:
+        """Get current configuration status"""
+        return {
+            "initialized": self._initialized,
+            "rebuilding": self._rebuilding,
+            "enabled_providers": self.settings.get_enabled_providers(),
+            "enabled_tools": self.settings.get_enabled_tools(),
+            "enabled_agents": self.settings.get_enabled_agents(),
+            "orchestrator_enabled": self.settings.orchestrator.get("enabled", True),
+            "workflow_features": {
+                "reflection": self.settings.workflow.enable_reflection,
+                "semantic_routing": self.settings.workflow.enable_semantic_routing,
+                "document_grading": self.settings.workflow.enable_document_grading,
+                "citation_generation": self.settings.workflow.enable_citation_generation,
+                "hallucination_check": self.settings.workflow.enable_hallucination_check
+            }
+        }
 
 # Global workflow instance
-rag_workflow = RAGWorkflow()
+rag_workflow = ConfigAwareRAGWorkflow()
