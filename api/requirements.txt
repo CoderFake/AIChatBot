@@ -1,0 +1,56 @@
+# Core Framework
+fastapi==0.115.0
+uvicorn[standard]==0.24.0
+pydantic==2.9.2
+python-multipart==0.0.6
+
+# Database
+asyncpg==0.29.0
+pymilvus==2.3.1
+
+# ML/AI Libraries
+sentence-transformers==2.6.0
+google-generativeai==0.8.4
+langchain==0.3.19
+langchain-community==0.3.18
+langchain-huggingface==0.1.2
+
+# Text Processing
+pypdf==5.1.0
+pymupdf==1.24.13
+python-docx==1.1.2
+python-pptx==0.6.23
+docx2txt==0.9
+pdfplumber==0.11.6
+pandas==2.2.3
+rank-bm25==0.2.2
+unstructured==0.17.2
+
+# HTTP Client
+aiohttp==3.9.1
+httpx==0.25.2
+requests==2.31.0
+
+# Authentication & Security
+PyJWT==2.9.0
+passlib[bcrypt]==1.7.4
+
+# Storage
+minio==7.2.0
+
+# Configuration
+python-dotenv==1.0.1
+
+# Language Detection
+langdetect==1.0.9
+
+# Web Scraping & Content Extraction
+beautifulsoup4==4.12.2
+lxml==5.4.0
+duckduckgo-search==8.0.2
+
+# Development Dependencies (Optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.12.0
+isort==5.13.2
