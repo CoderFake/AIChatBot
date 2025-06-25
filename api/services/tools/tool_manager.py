@@ -1,517 +1,365 @@
-from typing import Dict, List, Any, Optional, Type, Callable
+from typing import Dict, List, Any, Optional, Union, Annotated
 from datetime import datetime
 import asyncio
-import importlib
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+import json
+import math
+import re
+from dataclasses import dataclass
 
-from models.database.tool_config import ToolConfig as DBToolConfig
-from workflows.state.workflow_state import ToolConfig, UserContext, AccessLevel
-from services.auth.permission_service import PermissionService
-from core.exceptions import ToolNotFoundError, ToolDisabledError, PermissionDeniedError
+# LangGraph core imports
+from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage, AIMessage
+from langgraph.prebuilt import ToolNode
 
+# Local imports
+from config.settings import get_settings
+from utils.logging import get_logger
+from core.exceptions import ToolNotFoundError, ToolDisabledError, ServiceError
+
+logger = get_logger(__name__)
+settings = get_settings()
+
+@dataclass
+class ToolUsageStats:
+    """Statistics cho tool usage"""
+    tool_name: str
+    usage_count: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    avg_execution_time: float = 0.0
+    last_used: Optional[str] = None
+
+# ================================
+# LANGGRAPH TOOLS IMPLEMENTATION
+# ================================
+
+@tool
+async def web_search_tool(query: str) -> str:
+    """
+    Search the web for current information using DuckDuckGo.
+    
+    Args:
+        query: The search query to look up on the web
+        
+    Returns:
+        String containing search results
+    """
+    try:
+        from duckduckgo_search import DDGS
+        
+        ddgs = DDGS()
+        max_results = getattr(settings, 'WEB_SEARCH_MAX_RESULTS', 5)
+        region = getattr(settings, 'WEB_SEARCH_REGION', 'vn-vi')
+        safesearch = getattr(settings, 'WEB_SEARCH_SAFESEARCH', 'moderate')
+        
+        search_results = ddgs.text(
+            keywords=query,
+            max_results=max_results,
+            region=region,
+            safesearch=safesearch
+        )
+        
+        results = []
+        for result in search_results:
+            results.append({
+                "title": result.get("title", ""),
+                "url": result.get("href", ""),
+                "snippet": result.get("body", "")
+            })
+        
+        if not results:
+            return "Không tìm thấy kết quả tìm kiếm nào."
+            
+        formatted_results = []
+        for i, result in enumerate(results, 1):
+            formatted_results.append(
+                f"{i}. **{result['title']}**\n"
+                f"   URL: {result['url']}\n"
+                f"   Tóm tắt: {result['snippet']}\n"
+            )
+        
+        return "\n".join(formatted_results)
+        
+    except Exception as e:
+        logger.error(f"Web search error: {str(e)}")
+        return f"Lỗi khi tìm kiếm web: {str(e)}"
+
+@tool
+async def document_search_tool(
+    query: str, 
+    top_k: Annotated[int, "Number of documents to return"] = 5,
+    threshold: Annotated[float, "Similarity threshold"] = 0.7
+) -> str:
+    """
+    Search documents in the vector database.
+    
+    Args:
+        query: The search query
+        top_k: Number of top documents to return
+        threshold: Minimum similarity threshold
+        
+    Returns:
+        String containing document search results
+    """
+    try:
+        # TODO: Implement actual vector database search
+        # This is a placeholder implementation
+        
+        results = [
+            {
+                "title": f"Document {i}",
+                "content": f"Relevant content for query: {query}",
+                "score": 0.85,
+                "metadata": {"source": f"doc_{i}.pdf"}
+            }
+            for i in range(1, min(top_k + 1, 4))
+        ]
+        
+        filtered_results = [r for r in results if r["score"] >= threshold]
+        
+        if not filtered_results:
+            return f"Không tìm thấy tài liệu phù hợp với truy vấn '{query}'"
+            
+        formatted_results = []
+        for i, result in enumerate(filtered_results, 1):
+            formatted_results.append(
+                f"{i}. **{result['title']}** (Score: {result['score']:.2f})\n"
+                f"   Nguồn: {result['metadata'].get('source', 'Unknown')}\n"
+                f"   Nội dung: {result['content']}\n"
+            )
+        
+        return "\n".join(formatted_results)
+        
+    except Exception as e:
+        logger.error(f"Document search error: {str(e)}")
+        return f"Lỗi khi tìm kiếm tài liệu: {str(e)}"
+
+@tool
+async def calculation_tool(expression: str) -> str:
+    """
+    Perform safe mathematical calculations.
+    
+    Args:
+        expression: Mathematical expression to evaluate
+        
+    Returns:
+        String containing calculation result
+    """
+    try:
+        # Kiểm tra expression có an toàn không
+        safe_chars = set('0123456789+-*/().e ')
+        if not all(c in safe_chars for c in expression.replace(' ', '')):
+            return "Biểu thức chứa ký tự không được phép"
+        
+        # Kiểm tra các từ khóa nguy hiểm
+        dangerous_keywords = ['import', 'exec', 'eval', '__', 'open', 'file']
+        if any(keyword in expression.lower() for keyword in dangerous_keywords):
+            return "Biểu thức chứa từ khóa không được phép"
+        
+        # Thực hiện tính toán
+        result = eval(expression)
+        
+        # Kiểm tra kết quả hợp lệ
+        if isinstance(result, (int, float)):
+            if math.isnan(result) or math.isinf(result):
+                return "Kết quả tính toán không hợp lệ (NaN hoặc Infinity)"
+            return f"Kết quả: {result}"
+        else:
+            return f"Kết quả: {str(result)}"
+            
+    except ZeroDivisionError:
+        return "Lỗi: Không thể chia cho 0"
+    except SyntaxError:
+        return "Lỗi: Cú pháp biểu thức không đúng"
+    except Exception as e:
+        logger.error(f"Calculation error: {str(e)}")
+        return f"Lỗi khi tính toán: {str(e)}"
+
+@tool
+async def datetime_tool(format_type: str = "current") -> str:
+    """
+    Get current date and time information in Vietnamese.
+    
+    Args:
+        format_type: Type of datetime format ("current", "date", "time", "detailed")
+        
+    Returns:
+        String containing datetime information
+    """
+    try:
+        now = datetime.now()
+        
+        # Get weekday names from settings
+        weekday_names = getattr(settings, 'WEEKDAY_NAMES', {
+            0: "Thứ Hai", 1: "Thứ Ba", 2: "Thứ Tư", 3: "Thứ Năm",
+            4: "Thứ Sáu", 5: "Thứ Bảy", 6: "Chủ Nhật"
+        })
+        
+        weekday = weekday_names.get(now.weekday(), "Không xác định")
+        
+        if format_type == "current":
+            return f"Hiện tại là {now.strftime('%H:%M')} ngày {now.strftime('%d/%m/%Y')} ({weekday})"
+        elif format_type == "date":
+            return f"Ngày {now.strftime('%d/%m/%Y')} ({weekday})"
+        elif format_type == "time":
+            return f"Bây giờ là {now.strftime('%H:%M:%S')}"
+        elif format_type == "detailed":
+            return (
+                f"Thời gian chi tiết:\n"
+                f"- Ngày: {now.strftime('%d/%m/%Y')}\n"
+                f"- Thứ: {weekday}\n"
+                f"- Giờ: {now.strftime('%H:%M:%S')}\n"
+                f"- Múi giờ: UTC+7 (Việt Nam)"
+            )
+        else:
+            return f"Định dạng không hỗ trợ. Sử dụng: current, date, time, detailed"
+            
+    except Exception as e:
+        logger.error(f"DateTime error: {str(e)}")
+        return f"Lỗi khi lấy thông tin thời gian: {str(e)}"
+
+# ================================
+# TOOL MANAGEMENT CLASS
+# ================================
 
 class ToolManager:
     """
-    Core tool management service
-    Xử lý enable/disable tools, permission checking và dynamic loading
+    Manager class cho LangGraph tools với usage tracking
     """
     
-    def __init__(self, db_session: AsyncSession, permission_service: PermissionService):
-        self.db = db_session
-        self.permission_service = permission_service
-        self._tool_registry: Dict[str, Type] = {}
-        self._tool_cache: Dict[str, ToolConfig] = {}
-        self._loaded_tools: Dict[str, Any] = {}
-        self._cache_ttl = 300  # 5 minutes
+    def __init__(self):
+        self.usage_stats: Dict[str, ToolUsageStats] = {}
+        
+        # Khởi tạo available tools từ settings
+        self._available_tools = {
+            "web_search": web_search_tool,
+            "document_search": document_search_tool, 
+            "calculation": calculation_tool,
+            "datetime": datetime_tool
+        }
+        
+        # Khởi tạo tool node cho LangGraph
+        self._initialize_tool_node()
     
-    async def initialize_tools(self):
-        """
-        Initialize tool registry với all available tools
-        """
-        # Register built-in tools
-        await self._register_search_tools()
-        await self._register_document_tools()
-        await self._register_hr_tools()
-        await self._register_it_tools()
-        await self._register_finance_tools()
-        await self._register_external_tools()
+    def _initialize_tool_node(self):
+        """Initialize LangGraph ToolNode với enabled tools"""
+        enabled_tools = []
         
-        # Load tool configurations from database
-        await self._load_tool_configurations()
+        for tool_name, tool_func in self._available_tools.items():
+            if self._is_tool_enabled(tool_name):
+                enabled_tools.append(tool_func)
+                
+                # Initialize usage stats
+                if tool_name not in self.usage_stats:
+                    self.usage_stats[tool_name] = ToolUsageStats(tool_name=tool_name)
+        
+        self.tool_node = ToolNode(enabled_tools) if enabled_tools else None
     
-    async def enable_tool(
-        self, 
-        tool_id: str, 
-        admin_user_id: str,
-        configuration: Dict[str, Any] = None
-    ) -> bool:
-        """
-        Enable một tool trong hệ thống
-        """
-        # Validate admin permissions
-        if not await self._validate_admin_permission(admin_user_id):
-            raise PermissionDeniedError("Only administrators can manage tools")
+    def _is_tool_enabled(self, tool_name: str) -> bool:
+        """Check if tool is enabled trong settings"""
+        tool_settings_map = {
+            "web_search": "ENABLE_WEB_SEARCH_TOOL",
+            "document_search": "ENABLE_DOCUMENT_SEARCH_TOOL",
+            "calculation": "ENABLE_CALCULATION_TOOL", 
+            "datetime": "ENABLE_DATETIME_TOOL"
+        }
         
-        # Check if tool exists in registry
-        if tool_id not in self._tool_registry:
-            raise ToolNotFoundError(f"Tool {tool_id} not found in registry")
+        setting_name = tool_settings_map.get(tool_name)
+        if not setting_name:
+            return False
         
-        # Update database
-        await self._update_tool_status(tool_id, True, configuration)
-        
-        # Clear cache
-        self._clear_tool_cache(tool_id)
-        
-        # Log action
-        await self.permission_service.create_access_audit_entry(
-            user_id=admin_user_id,
-            action="TOOL_ENABLED",
-            resource_type="tool",
-            resource_id=tool_id,
-            access_granted=True,
-            additional_data={"configuration": configuration}
-        )
-        
-        return True
+        return getattr(settings, setting_name, False)
     
-    async def disable_tool(self, tool_id: str, admin_user_id: str) -> bool:
+    async def invoke_tools(self, messages: List[AIMessage]) -> List[ToolMessage]:
         """
-        Disable một tool trong hệ thống
+        Invoke tools using LangGraph ToolNode
+        
+        Args:
+            messages: List of AI messages with tool calls
+            
+        Returns:
+            List of tool messages with results
         """
-        # Validate admin permissions
-        if not await self._validate_admin_permission(admin_user_id):
-            raise PermissionDeniedError("Only administrators can manage tools")
-        
-        # Update database
-        await self._update_tool_status(tool_id, False)
-        
-        # Clear cache và unload tool
-        self._clear_tool_cache(tool_id)
-        if tool_id in self._loaded_tools:
-            del self._loaded_tools[tool_id]
-        
-        # Log action
-        await self.permission_service.create_access_audit_entry(
-            user_id=admin_user_id,
-            action="TOOL_DISABLED",
-            resource_type="tool",
-            resource_id=tool_id,
-            access_granted=True
-        )
-        
-        return True
-    
-    async def get_available_tools_for_user(self, user_id: str) -> List[ToolConfig]:
-        """
-        Lấy danh sách tools available cho user cụ thể
-        """
-        user_context = await self.permission_service.get_user_context(user_id)
-        if not user_context:
-            return []
-        
-        available_tools = []
-        
-        # Get all enabled tools
-        enabled_tools = await self._get_enabled_tools()
-        
-        for tool_config in enabled_tools:
-            if await self._user_can_access_tool(user_context, tool_config):
-                available_tools.append(tool_config)
-        
-        return available_tools
-    
-    async def load_tool_for_execution(
-        self, 
-        tool_id: str, 
-        user_id: str,
-        context: Dict[str, Any] = None
-    ) -> Optional[Any]:
-        """
-        Load và return tool instance cho execution
-        """
-        # Check if tool is enabled
-        tool_config = await self._get_tool_config(tool_id)
-        if not tool_config or not tool_config['is_enabled']:
-            raise ToolDisabledError(f"Tool {tool_id} is not enabled")
-        
-        # Check user permissions
-        user_context = await self.permission_service.get_user_context(user_id)
-        if not await self._user_can_access_tool(user_context, tool_config):
-            raise PermissionDeniedError(f"User {user_id} cannot access tool {tool_id}")
-        
-        # Load tool if not already loaded
-        if tool_id not in self._loaded_tools:
-            tool_instance = await self._instantiate_tool(tool_id, tool_config)
-            self._loaded_tools[tool_id] = tool_instance
-        
-        # Log tool usage
-        await self.permission_service.create_access_audit_entry(
-            user_id=user_id,
-            action="TOOL_LOADED",
-            resource_type="tool",
-            resource_id=tool_id,
-            access_granted=True,
-            additional_data={"context": context}
-        )
-        
-        return self._loaded_tools[tool_id]
-    
-    async def execute_tool(
-        self,
-        tool_id: str,
-        user_id: str,
-        method_name: str,
-        parameters: Dict[str, Any],
-        context: Dict[str, Any] = None
-    ) -> Any:
-        """
-        Execute tool method với permission checking
-        """
-        # Load tool
-        tool_instance = await self.load_tool_for_execution(tool_id, user_id, context)
-        
-        # Validate method exists
-        if not hasattr(tool_instance, method_name):
-            raise ToolNotFoundError(f"Method {method_name} not found in tool {tool_id}")
-        
-        # Execute method
-        method = getattr(tool_instance, method_name)
+        if not self.tool_node:
+            raise ToolDisabledError("No tools are enabled")
         
         try:
-            if asyncio.iscoroutinefunction(method):
-                result = await method(**parameters)
-            else:
-                result = method(**parameters)
+            # Track usage
+            for message in messages:
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    for tool_call in message.tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        self._update_usage_stats(tool_name, success=True)
             
-            # Log successful execution
-            await self.permission_service.create_access_audit_entry(
-                user_id=user_id,
-                action="TOOL_EXECUTED",
-                resource_type="tool",
-                resource_id=f"{tool_id}.{method_name}",
-                access_granted=True,
-                additional_data={
-                    "parameters": parameters,
-                    "context": context
-                }
-            )
-            
-            return result
+            # Use LangGraph ToolNode to execute tools
+            result = await self.tool_node.ainvoke({"messages": messages})
+            return result.get("messages", [])
             
         except Exception as e:
-            # Log execution error
-            await self.permission_service.create_access_audit_entry(
-                user_id=user_id,
-                action="TOOL_EXECUTION_ERROR",
-                resource_type="tool",
-                resource_id=f"{tool_id}.{method_name}",
-                access_granted=False,
-                additional_data={
-                    "error": str(e),
-                    "parameters": parameters
-                }
-            )
-            raise
+            # Track failed usage
+            for message in messages:
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    for tool_call in message.tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        self._update_usage_stats(tool_name, success=False)
+            
+            logger.error(f"Tool invocation error: {str(e)}")
+            raise ServiceError(f"Error executing tools: {str(e)}")
     
-    async def get_tool_status(self, tool_id: str) -> Dict[str, Any]:
-        """
-        Get current status của tool
-        """
-        tool_config = await self._get_tool_config(tool_id)
-        if not tool_config:
-            return {"status": "not_found"}
+    def _update_usage_stats(self, tool_name: str, success: bool = True):
+        """Update usage statistics for a tool"""
+        if tool_name not in self.usage_stats:
+            self.usage_stats[tool_name] = ToolUsageStats(tool_name=tool_name)
         
+        stats = self.usage_stats[tool_name]
+        stats.usage_count += 1
+        
+        if success:
+            stats.success_count += 1
+        else:
+            stats.error_count += 1
+            
+        stats.last_used = datetime.now().isoformat()
+    
+    def get_enabled_tools(self) -> List[str]:
+        """Get list of enabled tool names"""
+        return [
+            tool_name for tool_name in self._available_tools.keys()
+            if self._is_tool_enabled(tool_name)
+        ]
+    
+    def get_tool_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Get usage statistics for all tools"""
         return {
-            "tool_id": tool_id,
-            "is_enabled": tool_config['is_enabled'],
-            "tool_type": tool_config['tool_type'],
-            "required_permissions": tool_config['required_permissions'],
-            "allowed_departments": tool_config['allowed_departments'],
-            "is_loaded": tool_id in self._loaded_tools,
-            "configuration": tool_config['configuration']
+            tool_name: {
+                "usage_count": stats.usage_count,
+                "success_count": stats.success_count,
+                "error_count": stats.error_count,
+                "success_rate": stats.success_count / max(stats.usage_count, 1) * 100,
+                "last_used": stats.last_used
+            }
+            for tool_name, stats in self.usage_stats.items()
         }
     
-    async def get_all_tools_status(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get status của tất cả tools
-        """
-        all_tools = {}
-        
-        # Get from registry
-        for tool_id in self._tool_registry.keys():
-            all_tools[tool_id] = await self.get_tool_status(tool_id)
-        
-        return all_tools
-    
-    # Private helper methods
-    
-    async def _register_search_tools(self):
-        """Register search-related tools"""
-        from app.agents.tools.search_tools import (
-            BasicSearchTool,
-            SemanticSearchTool,
-            CrossDepartmentSearchTool
-        )
-        
-        self._tool_registry.update({
-            "basic_search": BasicSearchTool,
-            "semantic_search": SemanticSearchTool,
-            "cross_dept_search": CrossDepartmentSearchTool
-        })
-    
-    async def _register_document_tools(self):
-        """Register document-related tools"""
-        from app.agents.tools.document_tools import (
-            DocumentRetrievalTool,
-            DocumentSummaryTool,
-            DocumentVersionTool
-        )
-        
-        self._tool_registry.update({
-            "document_retrieval": DocumentRetrievalTool,
-            "document_summary": DocumentSummaryTool,
-            "document_version": DocumentVersionTool
-        })
-    
-    async def _register_hr_tools(self):
-        """Register HR-specific tools"""
-        from app.agents.tools.hr_tools import (
-            EmployeeSearchTool,
-            PolicyLookupTool,
-            BenefitsCalculatorTool
-        )
-        
-        self._tool_registry.update({
-            "employee_search": EmployeeSearchTool,
-            "policy_lookup": PolicyLookupTool,
-            "benefits_calculator": BenefitsCalculatorTool
-        })
-    
-    async def _register_it_tools(self):
-        """Register IT-specific tools"""
-        from app.agents.tools.it_tools import (
-            CodeSearchTool,
-            DocumentationLookupTool,
-            APISearchTool,
-            TechnicalSupportTool
-        )
-        
-        self._tool_registry.update({
-            "code_search": CodeSearchTool,
-            "documentation_lookup": DocumentationLookupTool,
-            "api_search": APISearchTool,
-            "technical_support": TechnicalSupportTool
-        })
-    
-    async def _register_finance_tools(self):
-        """Register Finance-specific tools"""
-        from app.agents.tools.finance_tools import (
-            FinancialReportTool,
-            BudgetAnalysisTool,
-            ExpenseTrackingTool,
-            ComplianceCheckTool
-        )
-        
-        self._tool_registry.update({
-            "financial_reports": FinancialReportTool,
-            "budget_analysis": BudgetAnalysisTool,
-            "expense_tracking": ExpenseTrackingTool,
-            "compliance_check": ComplianceCheckTool
-        })
-    
-    async def _register_external_tools(self):
-        """Register external API tools"""
-        from app.agents.tools.external_tools import (
-            WebSearchTool,
-            ExternalIntegrationTool,
-            EmailNotificationTool
-        )
-        
-        self._tool_registry.update({
-            "web_search": WebSearchTool,
-            "external_integration": ExternalIntegrationTool,
-            "email_notification": EmailNotificationTool
-        })
-    
-    async def _load_tool_configurations(self):
-        """Load tool configurations from database"""
-        query = select(DBToolConfig)
-        result = await self.db.execute(query)
-        db_configs = result.scalars().all()
-        
-        for db_config in db_configs:
-            tool_config = ToolConfig(
-                tool_id=db_config.tool_id,
-                tool_name=db_config.tool_name,
-                tool_type=db_config.tool_type,
-                is_enabled=db_config.is_enabled,
-                required_permissions=db_config.required_permissions or [],
-                allowed_departments=db_config.allowed_departments or [],
-                max_access_level=AccessLevel(db_config.max_access_level),
-                rate_limit=db_config.rate_limit,
-                timeout_seconds=db_config.timeout_seconds,
-                configuration=db_config.configuration or {}
-            )
-            
-            self._tool_cache[db_config.tool_id] = tool_config
-    
-    async def _validate_admin_permission(self, user_id: str) -> bool:
-        """Validate user có admin permission để manage tools"""
-        user_context = await self.permission_service.get_user_context(user_id)
-        if not user_context:
-            return False
-        
-        return (
-            user_context['role'] in ['ADMIN', 'SYSTEM_ADMIN'] or
-            'TOOL_MANAGEMENT' in user_context['permissions']
-        )
-    
-    async def _update_tool_status(
-        self, 
-        tool_id: str, 
-        is_enabled: bool, 
-        configuration: Dict[str, Any] = None
-    ):
-        """Update tool status trong database"""
-        # Check if tool config exists
-        query = select(DBToolConfig).where(DBToolConfig.tool_id == tool_id)
-        result = await self.db.execute(query)
-        existing_config = result.scalar_one_or_none()
-        
-        if existing_config:
-            # Update existing
-            update_data = {"is_enabled": is_enabled}
-            if configuration:
-                update_data["configuration"] = configuration
-            
-            update_query = update(DBToolConfig).where(
-                DBToolConfig.tool_id == tool_id
-            ).values(**update_data)
-            
-            await self.db.execute(update_query)
-        else:
-            # Create new
-            tool_class = self._tool_registry.get(tool_id)
-            if not tool_class:
-                raise ToolNotFoundError(f"Tool {tool_id} not in registry")
-            
-            new_config = DBToolConfig(
-                tool_id=tool_id,
-                tool_name=getattr(tool_class, 'name', tool_id),
-                tool_type=getattr(tool_class, 'tool_type', 'general'),
-                is_enabled=is_enabled,
-                required_permissions=getattr(tool_class, 'required_permissions', []),
-                allowed_departments=getattr(tool_class, 'allowed_departments', []),
-                max_access_level=getattr(tool_class, 'max_access_level', AccessLevel.PUBLIC.value),
-                rate_limit=getattr(tool_class, 'rate_limit', None),
-                timeout_seconds=getattr(tool_class, 'timeout_seconds', 30),
-                configuration=configuration or {}
-            )
-            
-            self.db.add(new_config)
-        
-        await self.db.commit()
-    
-    async def _get_enabled_tools(self) -> List[ToolConfig]:
-        """Get all enabled tools"""
-        query = select(DBToolConfig).where(DBToolConfig.is_enabled == True)
-        result = await self.db.execute(query)
-        db_configs = result.scalars().all()
-        
-        enabled_tools = []
-        for db_config in db_configs:
-            tool_config = ToolConfig(
-                tool_id=db_config.tool_id,
-                tool_name=db_config.tool_name,
-                tool_type=db_config.tool_type,
-                is_enabled=db_config.is_enabled,
-                required_permissions=db_config.required_permissions or [],
-                allowed_departments=db_config.allowed_departments or [],
-                max_access_level=AccessLevel(db_config.max_access_level),
-                rate_limit=db_config.rate_limit,
-                timeout_seconds=db_config.timeout_seconds,
-                configuration=db_config.configuration or {}
-            )
-            enabled_tools.append(tool_config)
-        
-        return enabled_tools
-    
-    async def _get_tool_config(self, tool_id: str) -> Optional[ToolConfig]:
-        """Get tool configuration"""
-        cache_key = f"tool_config:{tool_id}"
-        
-        # Check cache
-        if cache_key in self._tool_cache:
-            return self._tool_cache[cache_key]
-        
-        # Query database
-        query = select(DBToolConfig).where(DBToolConfig.tool_id == tool_id)
-        result = await self.db.execute(query)
-        db_config = result.scalar_one_or_none()
-        
-        if not db_config:
-            return None
-        
-        tool_config = ToolConfig(
-            tool_id=db_config.tool_id,
-            tool_name=db_config.tool_name,
-            tool_type=db_config.tool_type,
-            is_enabled=db_config.is_enabled,
-            required_permissions=db_config.required_permissions or [],
-            allowed_departments=db_config.allowed_departments or [],
-            max_access_level=AccessLevel(db_config.max_access_level),
-            rate_limit=db_config.rate_limit,
-            timeout_seconds=db_config.timeout_seconds,
-            configuration=db_config.configuration or {}
-        )
-        
-        # Cache result
-        self._tool_cache[cache_key] = tool_config
-        
-        return tool_config
-    
-    async def _user_can_access_tool(
-        self, 
-        user_context: UserContext, 
-        tool_config: ToolConfig
-    ) -> bool:
-        """Check if user can access specific tool"""
-        # Check access level
-        if tool_config['max_access_level'] not in user_context['access_levels']:
-            return False
-        
-        # Check department restrictions
-        if tool_config['allowed_departments']:
-            if user_context['department'] not in tool_config['allowed_departments']:
-                return False
-        
-        # Check required permissions
-        for req_perm in tool_config['required_permissions']:
-            if req_perm not in user_context['permissions']:
-                return False
-        
-        return True
-    
-    async def _instantiate_tool(self, tool_id: str, tool_config: ToolConfig) -> Any:
-        """Instantiate tool class"""
-        tool_class = self._tool_registry.get(tool_id)
-        if not tool_class:
-            raise ToolNotFoundError(f"Tool {tool_id} not found in registry")
-        
-        tool_instance = tool_class(
-            config=tool_config['configuration'],
-            db_session=self.db,
-            permission_service=self.permission_service
-        )
-        
-        if hasattr(tool_instance, 'initialize') and asyncio.iscoroutinefunction(tool_instance.initialize):
-            await tool_instance.initialize()
-        
-        return tool_instance
-    
-    def _clear_tool_cache(self, tool_id: str):
-        """Clear tool from cache"""
-        cache_key = f"tool_config:{tool_id}"
-        if cache_key in self._tool_cache:
-            del self._tool_cache[cache_key]
+    def reset_stats(self):
+        """Reset all usage statistics"""
+        self.usage_stats.clear()
+        logger.info("Tool usage statistics reset")
+
+# ================================
+# GLOBAL TOOL MANAGER INSTANCE  
+# ================================
+
+# Singleton instance
+tool_manager = ToolManager()
+
+# Export tools for use in other modules
+__all__ = [
+    "tool_manager",
+    "web_search_tool", 
+    "document_search_tool",
+    "calculation_tool",
+    "datetime_tool",
+    "ToolManager",
+    "ToolUsageStats"
+]

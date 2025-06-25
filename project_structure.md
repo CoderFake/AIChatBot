@@ -324,7 +324,7 @@ AIChatBot/
 - **Index Optimization**: HNSW/IVF indexes cho performance
 
 ### BAAI/bge-M3 Features
-- **Multilingual**: Vietnamese, English, Chinese support
+- **Multilingual**: Vietnamese, English, Japanese, Korea support
 - **Dense Retrieval**: High-quality semantic embeddings
 - **Cross-lingual**: Query trong một ngôn ngữ, retrieve documents ở ngôn ngữ khác
 - **Instruction Following**: Better understanding của complex queries

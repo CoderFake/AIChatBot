@@ -6,6 +6,9 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool, QueuePool
 import asyncio
 from contextlib import asynccontextmanager
+import asyncpg
+from asyncpg import Pool
+from sqlalchemy import MetaData
 
 from config.settings import get_settings
 from utils.logging import get_logger
@@ -13,7 +16,22 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 settings = get_settings()
 
-Base = declarative_base()
+# SQLAlchemy Base Class
+class Base(declarative_base()):
+    metadata = MetaData(
+        naming_convention={
+            "ix": "ix_%(column_0_label)s",
+            "uq": "uq_%(table_name)s_%(column_0_name)s",
+            "ck": "ck_%(table_name)s_%(constraint_name)s",
+            "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+            "pk": "pk_%(table_name)s"
+        }
+    )
+
+# Global variables
+engine: Optional[object] = None
+async_session_factory: Optional[async_sessionmaker] = None
+pg_pool: Optional[Pool] = None
 
 class DatabaseManager:
     """
@@ -68,10 +86,12 @@ class DatabaseManager:
         }
         
         self._async_engine = create_async_engine(
-            settings.async_database_url,
-            **pool_config,
-            **echo_config,
-            future=True
+            settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://"),
+            echo=settings.DEBUG,
+            pool_size=10,
+            max_overflow=20,
+            pool_pre_ping=True,
+            pool_recycle=3600,
         )
         
         logger.info(f"Async database engine đã được tạo: {settings.DATABASE_HOST}:{settings.DATABASE_PORT}")
@@ -329,4 +349,146 @@ class DatabaseHealthCheck:
                 "status": "unhealthy",
                 "error": str(e),
                 "timestamp": settings.TIMEZONE
+            }
+
+async def init_db():
+    """Initialize database connections"""
+    global engine, async_session_factory, pg_pool
+    
+    try:
+        # SQLAlchemy Async Engine
+        engine = create_async_engine(
+            settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://"),
+            echo=settings.DEBUG,
+            pool_size=10,
+            max_overflow=20,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+        
+        # Async Session Factory
+        async_session_factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False
+        )
+        
+        # Raw AsyncPG Connection Pool
+        pg_pool = await asyncpg.create_pool(
+            settings.DATABASE_URL,
+            min_size=5,
+            max_size=20,
+            command_timeout=60,
+            server_settings={
+                'jit': 'off'
+            }
+        )
+        
+        logger.info("Database connections initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
+
+async def close_db():
+    """Close database connections"""
+    global engine, pg_pool
+    
+    try:
+        if engine:
+            await engine.dispose()
+            logger.info("SQLAlchemy engine closed")
+        
+        if pg_pool:
+            await pg_pool.close()
+            logger.info("AsyncPG pool closed")
+            
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+
+async def get_db_session() -> AsyncSession:
+    """Get database session"""
+    if not async_session_factory:
+        raise RuntimeError("Database not initialized")
+    
+    async with async_session_factory() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+async def get_pg_connection():
+    """Get raw PostgreSQL connection from pool"""
+    if not pg_pool:
+        raise RuntimeError("PostgreSQL pool not initialized")
+    
+    async with pg_pool.acquire() as connection:
+        yield connection
+
+async def test_connection() -> bool:
+    """Test database connectivity"""
+    try:
+        if pg_pool:
+            async with pg_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
+        return False
+
+async def create_tables():
+    """Create database tables"""
+    try:
+        if engine:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create tables: {e}")
+        raise
+
+async def drop_tables():
+    """Drop all database tables (development only)"""
+    if settings.is_production():
+        raise RuntimeError("Cannot drop tables in production")
+    
+    try:
+        if engine:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+            logger.info("Database tables dropped successfully")
+    except Exception as e:
+        logger.error(f"Failed to drop tables: {e}")
+        raise
+
+class DatabaseHealthCheck:
+    """Database health check utility"""
+    
+    @staticmethod
+    async def check_connectivity() -> dict:
+        """Check database connectivity and performance"""
+        try:
+            start_time = asyncio.get_event_loop().time()
+            is_connected = await test_connection()
+            response_time = (asyncio.get_event_loop().time() - start_time) * 1000
+            
+            return {
+                "status": "healthy" if is_connected else "unhealthy",
+                "connected": is_connected,
+                "response_time_ms": round(response_time, 2),
+                "pool_size": pg_pool.get_size() if pg_pool else 0,
+                "pool_free": pg_pool.get_idle_size() if pg_pool else 0
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "connected": False,
+                "error": str(e),
+                "response_time_ms": 0,
+                "pool_size": 0,
+                "pool_free": 0
             }

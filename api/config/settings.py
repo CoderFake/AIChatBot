@@ -1,417 +1,581 @@
-from typing import Optional, List, Dict, Any
-from pydantic import BaseSettings, validator
-from enum import Enum
+from typing import Dict, Any, Optional, List, Union
 import os
+from functools import lru_cache
+from pydantic import BaseModel, Field, field_validator
+from dotenv import load_dotenv
 
+load_dotenv()
 
-class Environment(str, Enum):
-    DEV = "dev"
-    STG = "stg"
-    PROD = "prod"
-
-
-class LLMProvider(str, Enum):
-    OLLAMA = "ollama"
-    GEMINI = "gemini"
-    MISTRAL = "mistral"
-    META = "meta"
-
-
-class Settings(BaseSettings):
+class Settings(BaseModel):
     """
-    Cấu hình ứng dụng với hỗ trợ multi-environment và multi-LLM providers
-    Sử dụng SQLAlchemy cho database operations
+    Extended Application configuration với LangGraph integration.
+    Supports multi-provider LLM, tool management, và admin controls.
     """
     
-    APP_NAME: str = "Agentic RAG System"
-    APP_VERSION: str = "1.0.0"
-    ENVIRONMENT: Environment = Environment.DEV
-    DEBUG: bool = False
+    # Basic App Configuration
+    ENV: str = Field(default="dev")
+    DEBUG: bool = Field(default=True)
     
-    API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
-    API_PREFIX: str = "/api/v1"
+    APP_NAME: str = Field(default="Agentic RAG API")
+    APP_HOST: str = Field(default="0.0.0.0")
+    APP_PORT: int = Field(default=8000)
+    BOT_NAME: str = Field(default="NewwaveBot")
+    TIMEZONE: str = Field(default="Asia/Ho_Chi_Minh")
     
-    SECRET_KEY: str
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    # Production worker configuration
+    WORKERS: int = Field(default=4)
+    WORKER_CLASS: str = Field(default="uvicorn.workers.UvicornWorker")
+    WORKER_CONNECTIONS: int = Field(default=1000)
+    MAX_REQUESTS: int = Field(default=1000)
+    MAX_REQUESTS_JITTER: int = Field(default=100)
+    KEEPALIVE: int = Field(default=2)
     
-    TIMEZONE: str = "Asia/Ho_Chi_Minh"
+    # Security settings
+    SECRET_KEY: str = Field(default="secret_key_development_only")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
+    ALLOWED_HOSTS: List[str] = Field(default=["*"])
+    CORS_ORIGINS: List[str] = Field(default=["*"])
+    ENABLE_DOCS: bool = Field(default=True)
     
-    DATABASE_HOST: str = "postgres"
-    DATABASE_PORT: int = 5432
-    DATABASE_NAME: str = "agentic_rag"
-    DATABASE_USER: str = "postgres"
-    DATABASE_PASSWORD: str
-    DATABASE_POOL_SIZE: int = 10
-    DATABASE_MAX_OVERFLOW: int = 20
-    DATABASE_POOL_TIMEOUT: int = 30
-    DATABASE_POOL_RECYCLE: int = 3600
-    DATABASE_ECHO: bool = False
-    DATABASE_ECHO_POOL: bool = False
-    DATABASE_POOL_PRE_PING: bool = True
+    # Database configurations
+    DATABASE_URL: str = Field(default="postgresql://postgres:postgres@db-postgres:5432/newwave_chatbot")
     
-    REDIS_HOST: str = "redis"
-    REDIS_PORT: int = 6379
-    REDIS_PASSWORD: Optional[str] = None
-    REDIS_DB: int = 0
-    REDIS_MAX_CONNECTIONS: int = 10
-    REDIS_SOCKET_TIMEOUT: int = 5
-    REDIS_SOCKET_CONNECT_TIMEOUT: int = 5
-    REDIS_RETRY_ON_TIMEOUT: bool = True
+    # Milvus Vector Database
+    MILVUS_HOST: str = Field(default="db-milvus")
+    MILVUS_PORT: Union[str, int] = Field(default="19530")
+    MILVUS_USER: str = Field(default="milvus")
+    MILVUS_PASSWORD: str = Field(default="milvus")
+    MILVUS_COLLECTION: str = Field(default="chatbot")
     
-    MILVUS_HOST: str = "milvus-standalone"
-    MILVUS_PORT: int = 19530
-    MILVUS_USER: Optional[str] = None
-    MILVUS_PASSWORD: Optional[str] = None
-    MILVUS_DB_NAME: str = "default"
-    MILVUS_SECURE: bool = False
-    MILVUS_TIMEOUT: int = 30
+    # Redis Configuration (for caching and state management)
+    REDIS_HOST: str = Field(default="redis")
+    REDIS_PORT: int = Field(default=6379)
+    REDIS_PASSWORD: Optional[str] = Field(default=None)
+    REDIS_DB: int = Field(default=0)
+    CACHE_TTL: int = Field(default=3600)  # 1 hour
     
-    MINIO_HOST: str = "minio"
-    MINIO_PORT: int = 9000
-    MINIO_ACCESS_KEY: str
-    MINIO_SECRET_KEY: str
-    MINIO_SECURE: bool = False
-    MINIO_BUCKET_PREFIX: str = "agentic-rag"
-    MINIO_REGION: str = "us-east-1"
+    # MinIO Object Storage
+    MINIO_ENDPOINT: str = Field(default="minio:9000")
+    MINIO_EXTERNAL_ENDPOINT: str = Field(default="localhost:9000")  
+    MINIO_ACCESS_KEY: str = Field(default="minioadmin")
+    MINIO_SECRET_KEY: str = Field(default="minioadmin")
+    MINIO_SECURE: bool = Field(default=False)
+    MINIO_EXTERNAL_SECURE: bool = Field(default=False)
+    MINIO_BUCKET_NAME: str = Field(default="newwave-documents")
+    MINIO_REGION: Optional[str] = Field(default=None)
     
-    EMBEDDING_MODEL_PATH: str = "BAAI/bge-M3"
-    EMBEDDING_MODEL_DEVICE: str = "cpu"
-    EMBEDDING_BATCH_SIZE: int = 32
-    EMBEDDING_MAX_LENGTH: int = 8192
-    EMBEDDING_DIMENSION: int = 1024
-    EMBEDDING_CACHE_SIZE: int = 10000
+    # File Upload Settings
+    UPLOAD_DIR: str = Field(default="/app/uploads")
+    VERSIONS_DIR: str = Field(default="/app/versions")
+    MAX_FILE_SIZE: int = Field(default=100 * 1024 * 1024)
+    ALLOWED_FILE_TYPES: List[str] = Field(default=[
+        "application/pdf", 
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+        "text/plain",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.ms-powerpoint"
+    ])
     
-    DEFAULT_LLM_PROVIDER: LLMProvider = LLMProvider.OLLAMA
+    # ================================
+    # MULTI-PROVIDER LLM CONFIGURATION
+    # ================================
     
-    OLLAMA_HOST: str = "ollama"
-    OLLAMA_PORT: int = 11434
-    OLLAMA_DEFAULT_MODEL: str = "llama3.1:8b"
-    OLLAMA_TIMEOUT: int = 120
+    # Default Provider Settings (Admin configurable)
+    DEFAULT_LLM_PROVIDER: str = Field(default="gemini")
+    FALLBACK_LLM_PROVIDER: str = Field(default="gemini")
+    FUNCTION_CALLING_PROVIDER: str = Field(default="gemini")
     
-    GEMINI_API_KEY: Optional[str] = None
-    GEMINI_DEFAULT_MODEL: str = "gemini-1.5-pro"
-    GEMINI_TIMEOUT: int = 60
+    # Provider Enable/Disable Controls (Admin managed)
+    ENABLE_GEMINI_PROVIDER: bool = Field(default=True)
+    ENABLE_OLLAMA_PROVIDER: bool = Field(default=True)
+    ENABLE_MISTRAL_PROVIDER: bool = Field(default=False)
+    ENABLE_META_PROVIDER: bool = Field(default=False)
+    ENABLE_ANTHROPIC_PROVIDER: bool = Field(default=False)
     
-    MISTRAL_API_KEY: Optional[str] = None
-    MISTRAL_DEFAULT_MODEL: str = "mistral-large-latest"
-    MISTRAL_TIMEOUT: int = 60
+    # Gemini Configuration
+    GEMINI_API_KEY: str = Field(default="AIzaSyCm-NmIFZZusArL44jibAPi3VOAUuEEjxk,AIzaSyBZ3smYn1uK94IJ32GKblcK3dThdJddY5U,AIzaSyBZ8_6FCP42G5quv7M-TdS3--ezjDvu2H0,AIzaSyBZMvDpFfJ1lHZp8yN0-ZKSN55egI2mcT0,AIzaSyD5pSaoA88TV58XM0_acLd-R1zIb7zy6mE")
+    GEMINI_DEFAULT_MODEL: str = Field(default="gemini-2.0-flash")
+    GEMINI_DEFAULT_MAX_TOKENS: int = Field(default=8192)
+    GEMINI_TIMEOUT: int = Field(default=60)
     
-    META_API_KEY: Optional[str] = None
-    META_DEFAULT_MODEL: str = "llama-3.1-405b"
-    META_TIMEOUT: int = 60
+    # Ollama Configuration
+    OLLAMA_API_URL: str = Field(default="http://192.168.200.57:11434")
+    OLLAMA_DEFAULT_MODEL: str = Field(default="llama3.1:8b")
+    OLLAMA_KEEP_ALIVE: int = Field(default=-1)
+    OLLAMA_MAX_LOADED_MODELS: int = Field(default=2)
+    OLLAMA_NUM_PARALLEL: int = Field(default=2)
+    OLLAMA_FLASH_ATTENTION: bool = Field(default=True)
+    OLLAMA_TIMEOUT: int = Field(default=120)
     
-    RATE_LIMIT_PER_MINUTE: int = 60
-    RATE_LIMIT_PER_HOUR: int = 1000
-    RATE_LIMIT_PER_DAY: int = 10000
+    # Mistral Configuration
+    MISTRAL_API_KEY: Optional[str] = Field(default=None)
+    MISTRAL_DEFAULT_MODEL: str = Field(default="mistral-large-latest")
+    MISTRAL_TIMEOUT: int = Field(default=60)
     
-    LOG_LEVEL: str = "INFO"
-    LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    LOG_ROTATION_SIZE: str = "10MB"
-    LOG_RETENTION_COUNT: int = 5
-    LOG_FILE_PATH: str = "/app/logs"
+    # Meta Configuration
+    META_API_KEY: Optional[str] = Field(default=None)
+    META_DEFAULT_MODEL: str = Field(default="llama-3.1-405b")
+    META_TIMEOUT: int = Field(default=60)
     
-    CORS_ORIGINS: List[str] = ["*"]
-    CORS_ALLOW_CREDENTIALS: bool = True
-    CORS_ALLOW_METHODS: List[str] = ["*"]
-    CORS_ALLOW_HEADERS: List[str] = ["*"]
+    # Anthropic Configuration
+    ANTHROPIC_API_KEY: Optional[str] = Field(default=None)
+    ANTHROPIC_DEFAULT_MODEL: str = Field(default="claude-3-5-sonnet-20241022")
+    ANTHROPIC_TIMEOUT: int = Field(default=60)
     
-    WEBHOOK_SECRET: Optional[str] = None
-    WEBHOOK_TIMEOUT: int = 30
-    WEBHOOK_RETRY_ATTEMPTS: int = 3
+    # ================================
+    # TOOL MANAGEMENT CONFIGURATION
+    # ================================
     
-    DOCUMENT_MAX_SIZE_MB: int = 50
-    DOCUMENT_ALLOWED_EXTENSIONS: List[str] = [
-        ".pdf", ".docx", ".doc", ".txt", ".md", ".html", 
-        ".xlsx", ".xls", ".pptx", ".ppt", ".csv", ".json"
-    ]
-    DOCUMENT_PROCESSING_TIMEOUT: int = 300
+    # Tool Enable/Disable Controls (Admin managed)
+    ENABLE_WEB_SEARCH_TOOL: bool = Field(default=True)
+    ENABLE_DOCUMENT_SEARCH_TOOL: bool = Field(default=True)
+    ENABLE_CALCULATION_TOOL: bool = Field(default=True)
+    ENABLE_DATE_TIME_TOOL: bool = Field(default=True)
+    ENABLE_FILE_ANALYSIS_TOOL: bool = Field(default=True)
+    ENABLE_SUMMARIZATION_TOOL: bool = Field(default=True)
+    ENABLE_TRANSLATION_TOOL: bool = Field(default=True)
+    ENABLE_CODE_GENERATION_TOOL: bool = Field(default=False)
+    ENABLE_IMAGE_ANALYSIS_TOOL: bool = Field(default=False)
+    ENABLE_EMAIL_TOOL: bool = Field(default=False)
     
-    CACHE_TTL_SECONDS: int = 300
-    CACHE_MAX_SIZE: int = 1000
-    CACHE_CLEANUP_INTERVAL: int = 3600
+    # Web Search Tool Configuration
+    WEB_SEARCH_ENGINE: str = Field(default="duckduckgo")  # duckduckgo, google, bing
+    WEB_SEARCH_MAX_RESULTS: int = Field(default=5)
+    WEB_SEARCH_TIMEOUT: int = Field(default=10)
     
-    HEALTH_CHECK_INTERVAL: int = 60
-    PERFORMANCE_MONITORING: bool = True
-    METRICS_COLLECTION: bool = True
+    # ================================
+    # EMBEDDING MODEL CONFIGURATION
+    # ================================
     
-    MULTI_TENANT_ENABLED: bool = True
-    DEFAULT_TENANT_ID: str = "default"
-    TENANT_ISOLATION_LEVEL: str = "strict"
+    EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")
+    EMBEDDING_MODEL_DEVICE: str = Field(default="cpu")
+    EMBEDDING_MODEL_MAX_LENGTH: int = Field(default=512)
+    EMBEDDING_DIMENSIONS: int = Field(default=1024)  # BGE-M3 dimensions
+    EMBEDDING_BATCH_SIZE: int = Field(default=32)
     
-    SECURITY_PASSWORD_MIN_LENGTH: int = 8
-    SECURITY_PASSWORD_REQUIRE_UPPER: bool = True
-    SECURITY_PASSWORD_REQUIRE_LOWER: bool = True
-    SECURITY_PASSWORD_REQUIRE_DIGIT: bool = True
-    SECURITY_PASSWORD_REQUIRE_SPECIAL: bool = True
-    SECURITY_MAX_LOGIN_ATTEMPTS: int = 5
-    SECURITY_LOCKOUT_DURATION: int = 900
+    # Document Processing
+    DEFAULT_CHUNK_SIZE: int = Field(default=512)
+    DEFAULT_CHUNK_OVERLAP: int = Field(default=128)
     
-    WORKFLOW_MAX_EXECUTION_TIME: int = 600
-    WORKFLOW_MAX_RETRIES: int = 3
-    WORKFLOW_CHECKPOINT_INTERVAL: int = 30
+    # ================================
+    # RAG CONFIGURATION
+    # ================================
     
-    @validator("ENVIRONMENT")
-    def validate_environment(cls, v):
-        if v not in [Environment.DEV, Environment.STG, Environment.PROD]:
-            raise ValueError("ENVIRONMENT phải là dev, stg hoặc prod")
-        return v
+    DEFAULT_TOP_K: int = Field(default=5)
+    DEFAULT_THRESHOLD: float = Field(default=0.2)
+    DEFAULT_MAX_TOKENS: int = Field(default=8192)
+    DEFAULT_RAG_MAX_TOKENS: int = Field(default=8192)
+    NUM_FOLLOW_UP_QUESTIONS: int = Field(default=3)
+    CHAT_SESSION_TITLE_MAX_WORDS: int = Field(default=10)
+    CHAT_SESSION_TITLE_MAX_CHARS: int = Field(default=100)
     
-    @validator("DATABASE_PASSWORD")
-    def validate_database_password(cls, v):
-        if not v:
-            raise ValueError("DATABASE_PASSWORD là bắt buộc")
-        return v
+    # ================================
+    # LANGGRAPH CONFIGURATION
+    # ================================
     
-    @validator("SECRET_KEY")
-    def validate_secret_key(cls, v):
-        if not v or len(v) < 32:
-            raise ValueError("SECRET_KEY phải có ít nhất 32 ký tự")
-        return v
+    LANGGRAPH_MEMORY_SIZE: int = Field(default=100)  # Max memory items
+    LANGGRAPH_MAX_ITERATIONS: int = Field(default=10)  # Max workflow iterations
+    LANGGRAPH_TIMEOUT: int = Field(default=300)  # 5 minutes timeout
+    ENABLE_LANGGRAPH_DEBUG: bool = Field(default=False)
+    LANGGRAPH_CHECKPOINTER_TYPE: str = Field(default="redis")  # redis, postgres, memory
     
-    @validator("MINIO_ACCESS_KEY", "MINIO_SECRET_KEY")
-    def validate_minio_credentials(cls, v):
-        if not v:
-            raise ValueError("MinIO credentials là bắt buộc")
-        return v
+    # Agent Configuration (Admin configurable models per agent)
+    ROUTER_MODEL: str = Field(default="gemini-2.0-flash")
+    RETRIEVAL_MODEL: str = Field(default="gemini-2.0-flash")
+    SYNTHESIS_MODEL: str = Field(default="gemini-2.0-flash")
+    REFLECTION_MODEL: str = Field(default="gemini-2.0-flash")
+    SEMANTIC_ROUTER_MODEL: str = Field(default="gemini-2.0-flash")
+    RESPONSE_GENERATION_MODEL: str = Field(default="gemini-2.0-flash")
+    FUNCTION_CALLING_MODEL: str = Field(default="gemini-2.0-flash")
+    DEFAULT_CHAT_MODEL: str = Field(default="gemini-2.0-flash")
+    
+    # ================================
+    # INTELLIGENT ORCHESTRATOR CONFIGURATION
+    # ================================
+    
+    # Orchestrator LLM (Admin configurable - thay thế hardcode keywords)
+    ORCHESTRATOR_MODEL: str = Field(default="gemini-2.0-flash")
+    ENABLE_INTELLIGENT_ORCHESTRATOR: bool = Field(default=True)
+    ORCHESTRATOR_CONFIDENCE_THRESHOLD: float = Field(default=0.7)
+    ORCHESTRATOR_TIMEOUT: int = Field(default=30)  # seconds
+    
+    # Agent selection strategy (Admin configurable)
+    AGENT_SELECTION_STRATEGY: str = Field(default="llm_orchestrator")  # llm_orchestrator, keyword_matching, hybrid
+    ENABLE_CROSS_DOMAIN_ANALYSIS: bool = Field(default=True)
+    MAX_AGENTS_PER_QUERY: int = Field(default=3)
+    
+    # Agent capabilities (Admin configurable thay vì hardcode)
+    ENABLE_DOMAIN_EXPERTISE_ANALYSIS: bool = Field(default=True)
+    ENABLE_COMPLEXITY_SCORING: bool = Field(default=True)
+    ENABLE_EXECUTION_TIME_ESTIMATION: bool = Field(default=True)
+    
+    # ================================
+    # WORKFLOW CONFIGURATION
+    # ================================
+    
+    # Workflow Enable/Disable (Admin managed)
+    ENABLE_REFLECTION_WORKFLOW: bool = Field(default=True)
+    ENABLE_SEMANTIC_ROUTING: bool = Field(default=True)
+    ENABLE_DOCUMENT_GRADING: bool = Field(default=True)
+    ENABLE_CITATION_GENERATION: bool = Field(default=True)
+    ENABLE_QUERY_EXPANSION: bool = Field(default=True)
+    ENABLE_ANSWER_HALLUCINATION_CHECK: bool = Field(default=True)
+    
+    # ================================
+    # DEPRECATED: KEYWORD-BASED SELECTION (Kept for fallback only)
+    # ================================
+    
+    # Note: Replaced by Intelligent Orchestrator LLM
+    # These are kept for backward compatibility and fallback scenarios
+    
+    # Default language for keywords (Admin configurable) 
+    DEFAULT_KEYWORDS_LANGUAGE: str = Field(default="vi")
+    
+    # Agent specialist keywords (DEPRECATED - Admin configurable, multi-language support)
+    # Now only used as fallback when LLM orchestrator fails
+    HR_KEYWORDS: Dict[str, List[str]] = Field(default={
+        "vi": ["nhân sự", "chính sách", "quy định", "lương", "thưởng", "phúc lợi", "bảo hiểm", "làm việc từ xa", "đào tạo", "phát triển", "đánh giá", "nghỉ phép"],
+        "en": ["hr", "human resource", "policy", "salary", "compensation", "bonus", "benefit", "insurance", "remote", "work from home", "training", "development", "performance", "kpi", "leave", "vacation"],
+        "ja": ["人事", "ポリシー", "給与", "報酬", "福利厚生", "保険", "リモートワーク", "在宅勤務", "研修", "開発", "評価", "休暇"],
+        "ko": ["인사", "정책", "급여", "보상", "복리후생", "보험", "원격근무", "재택근무", "교육", "개발", "평가", "휴가"]
+    })
+    
+    FINANCE_KEYWORDS: Dict[str, List[str]] = Field(default={
+        "vi": ["tài chính", "kế toán", "ngân sách", "chi phí", "doanh thu", "lợi nhuận", "đầu tư", "thuế", "báo cáo tài chính", "kiểm toán"],
+        "en": ["finance", "accounting", "budget", "cost", "revenue", "profit", "investment", "tax", "financial report", "audit"],
+        "ja": ["財務", "会計", "予算", "コスト", "収益", "利益", "投資", "税金", "財務報告", "監査"],
+        "ko": ["재무", "회계", "예산", "비용", "수익", "이익", "투자", "세금", "재무보고", "감사"]
+    })
+    
+    IT_KEYWORDS: Dict[str, List[str]] = Field(default={
+        "vi": ["công nghệ", "hệ thống", "phần mềm", "phần cứng", "mạng", "bảo mật", "dữ liệu", "server", "database", "api"],
+        "en": ["technology", "system", "software", "hardware", "network", "security", "data", "server", "database", "api"],
+        "ja": ["技術", "システム", "ソフトウェア", "ハードウェア", "ネットワーク", "セキュリティ", "データ", "サーバー", "データベース"],
+        "ko": ["기술", "시스템", "소프트웨어", "하드웨어", "네트워크", "보안", "데이터", "서버", "데이터베이스"]
+    })
+    
+    # Tool indicators (DEPRECATED - Admin configurable, multi-language support)
+    # Now handled by LLM orchestrator semantic analysis
+    WEB_SEARCH_INDICATORS: Dict[str, List[str]] = Field(default={
+        "vi": ["tin tức", "thời sự", "mới nhất", "hiện tại", "giá", "thị trường", "cổ phiếu", "thời tiết", "dự báo", "kết quả", "bảng xếp hạng", "tìm kiếm"],
+        "en": ["news", "current", "latest", "now", "price", "market", "stock", "weather", "forecast", "result", "ranking", "search", "google"],
+        "ja": ["ニュース", "最新", "現在", "価格", "市場", "株式", "天気", "予報", "結果", "ランキング", "検索"],
+        "ko": ["뉴스", "최신", "현재", "가격", "시장", "주식", "날씨", "예보", "결과", "순위", "검색"]
+    })
+    
+    DOCUMENT_SEARCH_INDICATORS: Dict[str, List[str]] = Field(default={
+        "vi": ["tài liệu", "file", "pdf", "báo cáo", "quy định", "hướng dẫn", "sổ tay", "chính sách"],
+        "en": ["document", "file", "pdf", "report", "policy", "instruction", "manual", "handbook", "guideline"],
+        "ja": ["文書", "ファイル", "レポート", "ポリシー", "指示", "マニュアル", "ハンドブック"],
+        "ko": ["문서", "파일", "보고서", "정책", "지침", "매뉴얼", "핸드북"]
+    })
+    
+    CALCULATION_INDICATORS: Dict[str, List[str]] = Field(default={
+        "vi": ["tính", "toán", "phép", "chia", "nhân", "cộng", "trừ", "kết quả", "bằng"],
+        "en": ["calculate", "math", "compute", "plus", "minus", "multiply", "divide", "equals", "result"],
+        "ja": ["計算", "数学", "足し算", "引き算", "掛け算", "割り算", "結果", "等しい"],
+        "ko": ["계산", "수학", "더하기", "빼기", "곱하기", "나누기", "결과", "같다"]
+    })
+    
+    DATETIME_INDICATORS: Dict[str, List[str]] = Field(default={
+        "vi": ["thời gian", "ngày", "tháng", "năm", "giờ", "phút", "hôm nay", "ngày mai", "hôm qua", "tuần", "thứ"],
+        "en": ["time", "date", "day", "month", "year", "hour", "minute", "today", "tomorrow", "yesterday", "week", "monday", "tuesday"],
+        "ja": ["時間", "日付", "日", "月", "年", "時", "分", "今日", "明日", "昨日", "週", "月曜日"],
+        "ko": ["시간", "날짜", "일", "월", "년", "시", "분", "오늘", "내일", "어제", "주", "월요일"]
+    })
+    
+    # Weekday names (Admin configurable, multi-language support)
+    WEEKDAY_NAMES: Dict[str, Dict[int, str]] = Field(default={
+        "vi": {0: "Thứ Hai", 1: "Thứ Ba", 2: "Thứ Tư", 3: "Thứ Năm", 4: "Thứ Sáu", 5: "Thứ Bảy", 6: "Chủ Nhật"},
+        "en": {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday", 5: "Saturday", 6: "Sunday"},
+        "ja": {0: "月曜日", 1: "火曜日", 2: "水曜日", 3: "木曜日", 4: "金曜日", 5: "土曜日", 6: "日曜日"},
+        "ko": {0: "월요일", 1: "화요일", 2: "수요일", 3: "목요일", 4: "금요일", 5: "토요일", 6: "일요일"}
+    })
+    
+    # Unknown/fallback text (Admin configurable, multi-language support)
+    UNKNOWN_WEEKDAY_TEXT: Dict[str, str] = Field(default={
+        "vi": "Không xác định",
+        "en": "Unknown", 
+        "ja": "不明",
+        "ko": "알 수 없음"
+    })
+    
+    # Web search configuration (Admin configurable)
+    WEB_SEARCH_REGION: str = Field(default="vn-vi")
+    WEB_SEARCH_SAFESEARCH: str = Field(default="moderate")
+    
+    # Agent configuration (Admin configurable)
+    ENABLED_AGENTS: Dict[str, bool] = Field(default={
+        "hr_specialist": True,
+        "finance_specialist": True, 
+        "it_specialist": True,
+        "general_assistant": True,
+        "coordinator": True,
+        "conflict_resolver": True,
+        "synthesizer": True
+    })
+    
+    # Performance Settings
+    MAX_CONCURRENT_REQUESTS: int = Field(default=100)
+    REQUEST_TIMEOUT: int = Field(default=60)
+    
+    # ================================
+    # MULTI-TENANT SUPPORT
+    # ================================
+    
+    ENABLE_MULTI_TENANT: bool = Field(default=False)
+    DEFAULT_TENANT_ID: str = Field(default="default")
+    
+    # ================================
+    # AUTHENTICATION & AUTHORIZATION
+    # ================================
+    
+    # GitLab OAuth (Optional)
+    GITLAB_CLIENT_ID: str = Field(default="")
+    GITLAB_CLIENT_SECRET: str = Field(default="")
+    GITLAB_REDIRECT_URI: str = Field(default="http://localhost:8000/auth/gitlab/callback")
+    GITLAB_BASE_URL: str = Field(default="https://gitlab.com")
+    
+    # OTP Configuration
+    OTP_SECRET_KEY: str = Field(default="JBSWY3DPEHPK3PXP")
+    OTP_VALIDITY_SECONDS: int = Field(default=30)
+    OTP_TOLERANCE_WINDOWS: int = Field(default=2)
+    
+    # ================================
+    # ADMIN INTERFACE CONFIGURATION
+    # ================================
+    
+    ENABLE_ADMIN_INTERFACE: bool = Field(default=True)
+    ADMIN_SECRET_KEY: str = Field(default="admin_secret_development_only")
+    
+    # ================================
+    # PROPERTIES & COMPUTED VALUES
+    # ================================
     
     @property
-    def is_development(self) -> bool:
-        return self.ENVIRONMENT == Environment.DEV
-    
-    @property
-    def is_staging(self) -> bool:
-        return self.ENVIRONMENT == Environment.STG
-    
-    @property
-    def is_production(self) -> bool:
-        return self.ENVIRONMENT == Environment.PROD
-    
-    @property
-    def database_url(self) -> str:
-        """SQLAlchemy database URL cho sync operations"""
-        return f"postgresql://{self.DATABASE_USER}:{self.DATABASE_PASSWORD}@{self.DATABASE_HOST}:{self.DATABASE_PORT}/{self.DATABASE_NAME}"
-    
-    @property
-    def async_database_url(self) -> str:
-        """SQLAlchemy async database URL cho async operations"""
-        return f"postgresql+asyncpg://{self.DATABASE_USER}:{self.DATABASE_PASSWORD}@{self.DATABASE_HOST}:{self.DATABASE_PORT}/{self.DATABASE_NAME}"
+    def gemini_api_keys(self) -> List[str]:
+        """Get list of Gemini API keys from comma-separated string"""
+        if not self.GEMINI_API_KEY:
+            return []
+        return [key.strip() for key in self.GEMINI_API_KEY.split(",") if key.strip()]
     
     @property
     def redis_url(self) -> str:
-        """Redis connection URL"""
-        if self.REDIS_PASSWORD:
-            return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+        """Build Redis URL from components"""
+        auth_part = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
+        return f"redis://{auth_part}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
     
     @property
-    def minio_endpoint(self) -> str:
-        """MinIO endpoint URL"""
-        return f"{self.MINIO_HOST}:{self.MINIO_PORT}"
+    def enabled_providers(self) -> List[str]:
+        """Get list of enabled LLM providers"""
+        providers = []
+        if self.ENABLE_GEMINI_PROVIDER:
+            providers.append("gemini")
+        if self.ENABLE_OLLAMA_PROVIDER:
+            providers.append("ollama")
+        if self.ENABLE_MISTRAL_PROVIDER:
+            providers.append("mistral")
+        if self.ENABLE_META_PROVIDER:
+            providers.append("meta")
+        if self.ENABLE_ANTHROPIC_PROVIDER:
+            providers.append("anthropic")
+        return providers
     
     @property
-    def ollama_base_url(self) -> str:
-        """Ollama base URL"""
-        return f"http://{self.OLLAMA_HOST}:{self.OLLAMA_PORT}"
-    
-    def get_sqlalchemy_config(self) -> Dict[str, Any]:
-        """Lấy cấu hình SQLAlchemy"""
-        config = {
-            "pool_size": self.DATABASE_POOL_SIZE,
-            "max_overflow": self.DATABASE_MAX_OVERFLOW,
-            "pool_timeout": self.DATABASE_POOL_TIMEOUT,
-            "pool_recycle": self.DATABASE_POOL_RECYCLE,
-            "pool_pre_ping": self.DATABASE_POOL_PRE_PING,
-            "echo": self.DATABASE_ECHO,
-            "echo_pool": self.DATABASE_ECHO_POOL,
-        }
-        
-        if self.is_development:
-            config.update({
-                "echo": True,
-                "echo_pool": True,
-            })
-        elif self.is_production:
-            config.update({
-                "pool_size": self.DATABASE_POOL_SIZE * 2,
-                "max_overflow": self.DATABASE_MAX_OVERFLOW * 2,
-                "echo": False,
-                "echo_pool": False,
-            })
-        
-        return config
-    
-    def get_redis_config(self) -> Dict[str, Any]:
-        """Lấy cấu hình Redis"""
+    def enabled_tools(self) -> Dict[str, bool]:
+        """Get mapping of tool names to enabled status"""
         return {
-            "host": self.REDIS_HOST,
-            "port": self.REDIS_PORT,
-            "password": self.REDIS_PASSWORD,
-            "db": self.REDIS_DB,
-            "max_connections": self.REDIS_MAX_CONNECTIONS,
-            "socket_timeout": self.REDIS_SOCKET_TIMEOUT,
-            "socket_connect_timeout": self.REDIS_SOCKET_CONNECT_TIMEOUT,
-            "retry_on_timeout": self.REDIS_RETRY_ON_TIMEOUT,
-            "decode_responses": True,
-            "encoding": "utf-8"
+            "web_search": self.ENABLE_WEB_SEARCH_TOOL,
+            "document_search": self.ENABLE_DOCUMENT_SEARCH_TOOL,
+            "calculation": self.ENABLE_CALCULATION_TOOL,
+            "date_time": self.ENABLE_DATE_TIME_TOOL,
+            "file_analysis": self.ENABLE_FILE_ANALYSIS_TOOL,
+            "summarization": self.ENABLE_SUMMARIZATION_TOOL,
+            "translation": self.ENABLE_TRANSLATION_TOOL,
+            "code_generation": self.ENABLE_CODE_GENERATION_TOOL,
+            "image_analysis": self.ENABLE_IMAGE_ANALYSIS_TOOL,
+            "email": self.ENABLE_EMAIL_TOOL,
         }
     
-    def get_milvus_config(self) -> Dict[str, Any]:
-        """Lấy cấu hình Milvus"""
-        config = {
-            "host": self.MILVUS_HOST,
-            "port": self.MILVUS_PORT,
-            "db_name": self.MILVUS_DB_NAME,
-            "secure": self.MILVUS_SECURE,
-            "timeout": self.MILVUS_TIMEOUT
+    @property
+    def enabled_workflows(self) -> Dict[str, bool]:
+        """Get mapping of workflow names to enabled status"""
+        return {
+            "reflection": self.ENABLE_REFLECTION_WORKFLOW,
+            "semantic_routing": self.ENABLE_SEMANTIC_ROUTING,
+            "document_grading": self.ENABLE_DOCUMENT_GRADING,
+            "citation_generation": self.ENABLE_CITATION_GENERATION,
+            "query_expansion": self.ENABLE_QUERY_EXPANSION,
+            "hallucination_check": self.ENABLE_ANSWER_HALLUCINATION_CHECK,
         }
-        
-        if self.MILVUS_USER and self.MILVUS_PASSWORD:
-            config.update({
-                "user": self.MILVUS_USER,
-                "password": self.MILVUS_PASSWORD
-            })
-        
-        return config
     
-    def get_llm_config(self, provider: Optional[LLMProvider] = None) -> Dict[str, Any]:
-        """Lấy cấu hình LLM provider"""
-        provider = provider or self.DEFAULT_LLM_PROVIDER
-        
-        configs = {
-            LLMProvider.OLLAMA: {
-                "provider": "ollama",
-                "base_url": self.ollama_base_url,
-                "model": self.OLLAMA_DEFAULT_MODEL,
-                "timeout": self.OLLAMA_TIMEOUT,
-                "api_key": None
-            },
-            LLMProvider.GEMINI: {
+    @property 
+    def MAX_FILE_SIZE_MB(self) -> int:
+        """Get max file size in MB"""
+        return self.MAX_FILE_SIZE // (1024 * 1024)
+    
+    # ================================
+    # VALIDATION METHODS
+    # ================================
+    
+    @field_validator("ENV")
+    @classmethod
+    def validate_env(cls, v: str) -> str:
+        allowed_envs = ["dev", "stg", "prod"]
+        if v not in allowed_envs:
+            raise ValueError(f"ENV must be one of {allowed_envs}")
+        return v
+    
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        if not v.startswith(("postgresql://", "postgres://")):
+            raise ValueError("DATABASE_URL must be a valid PostgreSQL connection string")
+        return v
+    
+    @field_validator("MAX_FILE_SIZE")
+    @classmethod
+    def validate_max_file_size(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("MAX_FILE_SIZE must be positive")
+        if v > 1024 * 1024 * 1024:
+            raise ValueError("MAX_FILE_SIZE cannot exceed 1GB")
+        return v
+    
+    @field_validator("DEFAULT_TOP_K")
+    @classmethod
+    def validate_top_k(cls, v: int) -> int:
+        if v <= 0 or v > 100:
+            raise ValueError("DEFAULT_TOP_K must be between 1 and 100")
+        return v
+    
+    @field_validator("DEFAULT_THRESHOLD")
+    @classmethod
+    def validate_threshold(cls, v: float) -> float:
+        if v < 0 or v > 1:
+            raise ValueError("DEFAULT_THRESHOLD must be between 0 and 1")
+        return v
+    
+    # ================================
+    # HELPER METHODS
+    # ================================
+    
+    def is_production(self) -> bool:
+        """Check if running in production environment"""
+        return self.ENV == "prod"
+    
+    def is_development(self) -> bool:
+        """Check if running in development environment"""
+        return self.ENV == "dev"
+    
+    def get_provider_config(self, provider: str) -> Dict[str, Any]:
+        """Get configuration for specific LLM provider"""
+        provider_configs = {
+            "gemini": {
                 "provider": "gemini",
-                "base_url": "https://generativelanguage.googleapis.com/v1beta",
-                "model": self.GEMINI_DEFAULT_MODEL,
+                "enabled": self.ENABLE_GEMINI_PROVIDER,
+                "api_keys": self.gemini_api_keys,
+                "default_model": self.GEMINI_DEFAULT_MODEL,
+                "max_tokens": self.GEMINI_DEFAULT_MAX_TOKENS,
                 "timeout": self.GEMINI_TIMEOUT,
-                "api_key": self.GEMINI_API_KEY
             },
-            LLMProvider.MISTRAL: {
+            "ollama": {
+                "provider": "ollama",
+                "enabled": self.ENABLE_OLLAMA_PROVIDER,
+                "base_url": self.OLLAMA_API_URL,
+                "default_model": self.OLLAMA_DEFAULT_MODEL,
+                "keep_alive": self.OLLAMA_KEEP_ALIVE,
+                "timeout": self.OLLAMA_TIMEOUT,
+            },
+            "mistral": {
                 "provider": "mistral",
-                "base_url": "https://api.mistral.ai/v1",
-                "model": self.MISTRAL_DEFAULT_MODEL,
+                "enabled": self.ENABLE_MISTRAL_PROVIDER,
+                "api_key": self.MISTRAL_API_KEY,
+                "default_model": self.MISTRAL_DEFAULT_MODEL,
                 "timeout": self.MISTRAL_TIMEOUT,
-                "api_key": self.MISTRAL_API_KEY
             },
-            LLMProvider.META: {
+            "meta": {
                 "provider": "meta",
-                "base_url": "https://api.llama-api.com",
-                "model": self.META_DEFAULT_MODEL,
+                "enabled": self.ENABLE_META_PROVIDER,
+                "api_key": self.META_API_KEY,
+                "default_model": self.META_DEFAULT_MODEL,
                 "timeout": self.META_TIMEOUT,
-                "api_key": self.META_API_KEY
-            }
-        }
-        
-        if provider not in configs:
-            raise ValueError(f"Provider {provider} không được hỗ trợ")
-        
-        return configs[provider]
-    
-    def get_environment_config(self) -> Dict[str, Any]:
-        """Lấy cấu hình theo environment"""
-        base_config = {
-            "log_level": self.LOG_LEVEL,
-            "debug": self.DEBUG,
-            "cache_ttl": self.CACHE_TTL_SECONDS,
-            "performance_monitoring": self.PERFORMANCE_MONITORING,
-            "metrics_collection": self.METRICS_COLLECTION,
-            "rate_limits": {
-                "per_minute": self.RATE_LIMIT_PER_MINUTE,
-                "per_hour": self.RATE_LIMIT_PER_HOUR,
-                "per_day": self.RATE_LIMIT_PER_DAY
-            }
-        }
-        
-        environment_configs = {
-            Environment.DEV: {
-                "log_level": "DEBUG",
-                "debug": True,
-                "cache_ttl": 60,
-                "rate_limits": {
-                    "per_minute": 120,
-                    "per_hour": 2000,
-                    "per_day": 20000
-                }
             },
-            Environment.STG: {
-                "log_level": "INFO",
-                "debug": False,
-                "cache_ttl": 300,
-                "rate_limits": {
-                    "per_minute": 100,
-                    "per_hour": 1500,
-                    "per_day": 15000
-                }
-            },
-            Environment.PROD: {
-                "log_level": "WARNING",
-                "debug": False,
-                "cache_ttl": 600,
-                "rate_limits": {
-                    "per_minute": 80,
-                    "per_hour": 1000,
-                    "per_day": 10000
-                }
+            "anthropic": {
+                "provider": "anthropic",
+                "enabled": self.ENABLE_ANTHROPIC_PROVIDER,
+                "api_key": self.ANTHROPIC_API_KEY,
+                "default_model": self.ANTHROPIC_DEFAULT_MODEL,
+                "timeout": self.ANTHROPIC_TIMEOUT,
             }
         }
         
-        env_config = environment_configs.get(self.ENVIRONMENT, {})
-        base_config.update(env_config)
-        
-        return base_config
+        return provider_configs.get(provider, {})
     
-    def get_security_config(self) -> Dict[str, Any]:
-        """Lấy cấu hình bảo mật"""
+    def get_minio_config(self) -> Dict[str, Any]:
+        """Get MinIO configuration dict"""
         return {
-            "password_policy": {
-                "min_length": self.SECURITY_PASSWORD_MIN_LENGTH,
-                "require_upper": self.SECURITY_PASSWORD_REQUIRE_UPPER,
-                "require_lower": self.SECURITY_PASSWORD_REQUIRE_LOWER,
-                "require_digit": self.SECURITY_PASSWORD_REQUIRE_DIGIT,
-                "require_special": self.SECURITY_PASSWORD_REQUIRE_SPECIAL
-            },
-            "login_security": {
-                "max_attempts": self.SECURITY_MAX_LOGIN_ATTEMPTS,
-                "lockout_duration": self.SECURITY_LOCKOUT_DURATION
-            },
-            "token_security": {
-                "access_token_expire": self.ACCESS_TOKEN_EXPIRE_MINUTES,
-                "refresh_token_expire": self.REFRESH_TOKEN_EXPIRE_DAYS
-            }
+            "endpoint": self.MINIO_ENDPOINT,
+            "access_key": self.MINIO_ACCESS_KEY,
+            "secret_key": self.MINIO_SECRET_KEY,
+            "secure": self.MINIO_SECURE,
+            "region": self.MINIO_REGION,
+            "bucket_name": self.MINIO_BUCKET_NAME
+        }
+    
+    def get_langgraph_config(self) -> Dict[str, Any]:
+        """Get LangGraph configuration dict"""
+        return {
+            "memory_size": self.LANGGRAPH_MEMORY_SIZE,
+            "max_iterations": self.LANGGRAPH_MAX_ITERATIONS,
+            "timeout": self.LANGGRAPH_TIMEOUT,
+            "debug": self.ENABLE_LANGGRAPH_DEBUG,
+            "checkpointer_type": self.LANGGRAPH_CHECKPOINTER_TYPE,
+            "enabled_workflows": self.enabled_workflows
+        }
+    
+    def get_agent_configs(self) -> Dict[str, str]:
+        """Get model assignments for each agent"""
+        return {
+            "router": self.ROUTER_MODEL,
+            "retrieval": self.RETRIEVAL_MODEL,
+            "synthesis": self.SYNTHESIS_MODEL,
+            "reflection": self.REFLECTION_MODEL,
+            "semantic_router": self.SEMANTIC_ROUTER_MODEL,
+            "response_generation": self.RESPONSE_GENERATION_MODEL,
+            "function_calling": self.FUNCTION_CALLING_MODEL,
+            "chat": self.DEFAULT_CHAT_MODEL
         }
     
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
-        use_enum_values = True
+        extra = "ignore"
 
-
-_settings: Optional[Settings] = None
-
-
+@lru_cache()
 def get_settings() -> Settings:
-    """
-    Singleton pattern để lấy settings instance
-    """
-    global _settings
-    if _settings is None:
-        _settings = Settings()
-    return _settings
+    """Get cached settings instance"""
+    return Settings()
 
-
-def reload_settings() -> Settings:
-    """
-    Reload settings từ environment variables
-    """
-    global _settings
-    _settings = Settings()
-    return _settings
+def get_environment_info() -> Dict[str, Any]:
+    """Get environment information for debugging"""
+    settings = get_settings()
+    return {
+        "environment": settings.ENV,
+        "debug": settings.DEBUG,
+        "app_name": settings.APP_NAME,
+        "database_configured": bool(settings.DATABASE_URL),
+        "milvus_configured": bool(settings.MILVUS_HOST),
+        "redis_configured": bool(settings.REDIS_HOST),
+        "gemini_keys_count": len(settings.gemini_api_keys),
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "langgraph_enabled": True,
+        "enabled_providers": settings.enabled_providers,
+        "enabled_tools": len([k for k, v in settings.enabled_tools.items() if v]),
+        "enabled_workflows": len([k for k, v in settings.enabled_workflows.items() if v]),
+        "MAX_FILE_SIZE_MB": settings.MAX_FILE_SIZE_MB
+    }
