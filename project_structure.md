@@ -11,14 +11,13 @@
 ```
 AIChatBot/
 ├── README.md
-├── requirements.txt
 ├── docker-compose.yml
-├── .env.example
-├── pyproject.toml
 │
 ├── api/
 │   ├── __init__.py
 │   ├── main.py                    # FastAPI application entry point
+│   ├── requirements.txt
+│   │
 │   ├── config/
 │   │   ├── __init__.py
 │   │   ├── settings.py            # Cấu hình ứng dụng
@@ -32,35 +31,33 @@ AIChatBot/
 │   │   ├── __init__.py
 │   │   ├── security.py            # JWT, password hashing, authorization
 │   │   ├── permissions.py         # Permission management logic
-│   │   ├── tenant_manager.py      # Multi-tenant support
 │   │   └── exceptions.py          # Custom exception classes
 │   │
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── deps.py               # API dependencies
-│   │   ├── v1/
-│   │   │   ├── __init__.py
-│   │   │   ├── router.py         # Main API router
-│   │   │   ├── endpoints/
-│   │   │   │   ├── __init__.py
-│   │   │   │   ├── auth.py       # Authentication endpoints
-│   │   │   │   ├── query.py      # RAG query endpoints
-│   │   │   │   ├── documents.py  # Document management
-│   │   │   │   ├── tools.py      # Tool management endpoints (enable/disable tools)
-│   │   │   │   └── health.py     # Health check endpoints
-│   │   │   └── middleware/
-│   │   │       ├── __init__.py
-│   │   │       ├── auth_middleware.py
-│   │   │       ├── tenant_middleware.py
-│   │   │       └── logging_middleware.py
-│   │   └── gateway/
+│   │   └── v1/
 │   │       ├── __init__.py
-│   │       └── api_gateway.py    # API Gateway implementation
+│   │       ├── router.py         # Main API router
+│   │       ├── endpoints/
+│   │       │   ├── __init__.py
+│   │       │   ├── auth.py       # Authentication endpoints
+│   │       │   ├── query.py      # RAG query endpoints
+│   │       │   ├── documents.py  # Document management
+│   │       │   ├── tools.py      # Tool management endpoints (enable/disable tools)
+│   │       │   └── health.py     # Health check endpoints
+│   │       └── middleware/
+│   │           ├── __init__.py
+│   │           ├── auth.py       # Authentication endpoints
+│   │           ├── query.py      # RAG query endpoints
+│   │           ├── documents.py  # Document management
+│   │           └── health.py     # Health check endpoints
 │   │
 │   ├── models/
 │   │   ├── __init__.py
 │   │   ├── database/
 │   │   │   ├── __init__.py
+│   │   │   ├── base.py           # Base database model
 │   │   │   ├── user.py           # User database model
 │   │   │   ├── tenant.py         # Tenant database model
 │   │   │   ├── permission.py     # Permission database model
@@ -81,12 +78,10 @@ AIChatBot/
 │   │   ├── __init__.py
 │   │   ├── auth/
 │   │   │   ├── __init__.py
-│   │   │   ├── auth_service.py    # Authentication service
-│   │   │   └── permission_service.py # Permission management
+│   │   │   └── auth_service.py    # Authentication service
 │   │   ├── embedding/
 │   │   │   ├── __init__.py
-│   │   │   ├── embedding_service.py # BAAI/bge-M3 embedding service
-│   │   │   └── model_manager.py     # BGE-M3 model management
+│   │   │   └── embedding_service.py # BAAI/bge-M3 embedding service
 │   │   ├── vector/
 │   │   │   ├── __init__.py
 │   │   │   ├── milvus_service.py    # Milvus operations
@@ -141,29 +136,17 @@ AIChatBot/
 │   │
 │   ├── workflows/
 │   │   ├── __init__.py
-│   │   ├── langgraph/
-│   │   │   ├── __init__.py
-│   │   │   ├── workflow_graph.py   # Main LangGraph workflow
-│   │   │   ├── nodes/
-│   │   │   │   ├── __init__.py
-│   │   │   │   ├── analysis_nodes.py    # Query analysis nodes
-│   │   │   │   ├── permission_nodes.py  # Permission check nodes
-│   │   │   │   ├── retrieval_nodes.py   # Retrieval nodes
-│   │   │   │   ├── synthesis_nodes.py   # Response synthesis nodes
-│   │   │   │   └── security_nodes.py    # Security gate nodes
-│   │   │   ├── edges/
-│   │   │   │   ├── __init__.py
-│   │   │   │   ├── routing_edges.py     # Routing logic
-│   │   │   │   └── condition_edges.py   # Conditional routing
-│   │   │   └── state/
-│   │   │       ├── __init__.py
-│   │   │       ├── workflow_state.py    # Workflow state schema
-│   │   │       └── state_manager.py     # State management
-│   │   └── monitoring/
+│   │   └── langgraph/
 │   │       ├── __init__.py
-│   │       ├── change_detector.py  # Document change detection
-│   │       ├── freshness_monitor.py # Document freshness monitoring
-│   │       └── update_pipeline.py  # Document update pipeline
+│   │       ├── workflow_graph.py   # Main LangGraph workflow
+│   │       ├── nodes/
+│   │       │   ├── __init__.py
+│   │       │   ├── analysis_nodes.py    # Query analysis nodes
+│   │       │   ├── retrieval_nodes.py   # Retrieval nodes
+│   │       │   └── synthesis_nodes.py   # Response synthesis nodes
+│   │       └── state/
+│   │           ├── __init__.py
+│   │           └── workflow_state.py    # Workflow state schema
 │   │
 │   └── utils/
 │       ├── __init__.py
@@ -225,7 +208,7 @@ AIChatBot/
 ├── deployment/
 │   ├── docker/
 │   │   ├── Dockerfile           # Application Dockerfile
-│   │   ├── docker-compose.yml   # Development compose
+│   │   ├── Dockerfile.admin     # Admin Dockerfile
 │   │   ├── docker-compose.prod.yml # Production compose
 │   │   └── services/
 │   │       ├── postgres.yml     # PostgreSQL service
@@ -252,6 +235,7 @@ AIChatBot/
 │   │   ├── it/                  # IT documents
 │   │   ├── finance/             # Finance documents
 │   │   └── shared/              # Shared documents
+│   ├── embeddings/              # Cached embeddings
 │   └── backups/                 # Data backups
 │
 └── monitoring/
@@ -261,10 +245,7 @@ AIChatBot/
     ├── grafana/
     │   ├── dashboards/          # Grafana dashboards
     │   └── provisioning/        # Grafana provisioning
-    └── logs/
-        ├── access.log           # Access logs
-        ├── error.log            # Error logs
-        └── audit.log            # Audit logs
+    └── logs/                    # Log files
 ```
 
 ## Các Module Chính
@@ -306,8 +287,7 @@ AIChatBot/
 - **Multi-tenant Support**: Tenant isolation với database schemas
 
 ### Redis  
-- **L1 Cache**: Agent memory và frequent queries
-- **L2 Cache**: Document embeddings và search results
+- **Cache**: Agent memory và frequent queries
 - **Session Management**: User sessions và workflow state
 - **Rate Limiting**: API rate limiting và usage tracking
 
