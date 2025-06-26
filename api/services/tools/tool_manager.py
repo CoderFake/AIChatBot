@@ -15,19 +15,11 @@ from langgraph.prebuilt import ToolNode
 from config.settings import get_settings
 from utils.logging import get_logger
 from core.exceptions import ToolNotFoundError, ToolDisabledError, ServiceError
+from services.dataclasses.tools import ToolUsageStats
 
 logger = get_logger(__name__)
 settings = get_settings()
 
-@dataclass
-class ToolUsageStats:
-    """Statistics cho tool usage"""
-    tool_name: str
-    usage_count: int = 0
-    success_count: int = 0
-    error_count: int = 0
-    avg_execution_time: float = 0.0
-    last_used: Optional[str] = None
 
 # ================================
 # LANGGRAPH TOOLS IMPLEMENTATION

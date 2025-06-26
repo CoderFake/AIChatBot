@@ -1,29 +1,10 @@
 from typing import Dict, List, Any, Optional, TypedDict, Annotated
 from datetime import datetime
-from enum import Enum
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
-class QueryDomain(Enum):
-    HR = "hr"
-    IT = "it" 
-    FINANCE = "finance"
-    GENERAL = "general"
-    CROSS_DEPARTMENT = "cross_department"
-
-class AccessLevel(Enum):
-    PUBLIC = "public"
-    INTERNAL = "internal"
-    CONFIDENTIAL = "confidential"
-    RESTRICTED = "restricted"
-
-class ProcessingStatus(Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    PERMISSION_DENIED = "permission_denied"
+from services.types import AccessLevel, ProcessingStatus, QueryDomain
 
 class UnifiedRAGState(TypedDict):
     """

@@ -4,7 +4,7 @@ from utils.datetime_utils import CustomDateTime as datetime
 
 
 from workflows.langgraph.workflow_graph import rag_workflow
-from schemas import QueryRequest, QueryResponse, HealthResponse
+from schemas import HealthResponse
 from services.llm.provider_manager import llm_provider_manager
 from services.tools.tool_service import ToolService
 from services.vector.vector_service import VectorService
@@ -14,58 +14,6 @@ from utils.logging import get_logger, log_performance
 router = APIRouter()
 logger = get_logger(__name__)
 settings = get_settings()
-
-@router.post("/rag", response_model=QueryResponse)
-@log_performance()
-async def process_rag_query(
-    request: QueryRequest,
-    background_tasks: BackgroundTasks
-) -> QueryResponse:
-    """
-    Main RAG query endpoint
-    Business logic delegated to workflow service
-    """
-    try:
-        logger.info(f"Processing RAG query: {request.query[:100]}...")
-        
-        # Validate workflow is ready
-        if not await rag_workflow.health_check():
-            logger.info("Initializing RAG workflow...")
-            await rag_workflow.initialize()
-        
-        # Process through workflow
-        result = await rag_workflow.process_query(
-            query=request.query,
-            user_id=request.user_id,
-            session_id=request.session_id,
-            language=request.language,
-            conversation_history=request.conversation_history
-        )
-        
-        # Log successful query in background
-        background_tasks.add_task(
-            _log_query_completion,
-            request.query,
-            request.user_id,
-            result["workflow_id"],
-            result["processing_time"]
-        )
-        
-        return QueryResponse(
-            response=result["response"],
-            sources=result["sources"],
-            confidence=result["confidence"],
-            workflow_id=result["workflow_id"],
-            processing_time=result["processing_time"],
-            metadata=result["metadata"]
-        )
-        
-    except Exception as e:
-        logger.error(f"RAG query failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query processing failed: {str(e)}"
-        )
 
 @router.get("/health", response_model=HealthResponse)
 async def get_system_health() -> HealthResponse:
@@ -224,24 +172,3 @@ async def reload_system_configuration() -> Dict[str, Any]:
             status_code=500,
             detail=f"Configuration reload failed: {str(e)}"
         )
-
-async def _log_query_completion(
-    query: str,
-    user_id: Optional[str],
-    workflow_id: str,
-    processing_time: float
-):
-    """Background task to log query completion"""
-    try:
-        logger.info(
-            "Query completed successfully",
-            extra={
-                "query_preview": query[:100],
-                "user_id": user_id,
-                "workflow_id": workflow_id,
-                "processing_time": processing_time,
-                "event_type": "query_completion"
-            }
-        )
-    except Exception as e:
-        logger.error(f"Failed to log query completion: {e}")

@@ -1,20 +1,13 @@
-"""
-Main FastAPI application với integrated configuration management
-Real-time config changes và auto-reload components
-"""
-
 import time
 import uvicorn
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import get_settings
-from services.config.config_manager import config_manager
 from api.v1.router import api_router
-from api.v1.endpoints.admin import router as admin_router
+from api.v1.endpoints.streaming import router as streaming_router
 from core.exceptions import setup_exception_handlers
 from utils.logging import get_logger
 
@@ -24,78 +17,140 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Application lifespan manager
-    Handles startup và shutdown với config management
+    Application lifespan manager với complete system initialization
     """
-    # Startup
-    logger.info("Starting Agentic RAG API with real-time configuration...")
+    logger.info("🚀 Starting Complete Agentic RAG System...")
     
     try:
-        # Initialize configuration manager first
-        await config_manager.initialize()
-        logger.info("Configuration manager initialized")
-        
-        # Initialize database connections
+        # 1. Initialize database connections
+        logger.info("📊 Initializing database connections...")
         from config.database import init_db
         await init_db()
-        logger.info("Database initialized")
         
-        # Initialize vector database
-        from services.vector.vector_service import VectorService
-        vector_service = VectorService()
-        await vector_service.initialize()
-        logger.info("Vector database initialized")
+        # 2. Initialize Milvus service (đã có)
+        logger.info("🔍 Initializing Milvus service...")
+        from services.vector.milvus_service import milvus_service
+        await milvus_service.initialize()
         
-        # Initialize LLM provider manager
+        # 3. Initialize LLM provider manager
+        logger.info("🧠 Initializing LLM providers...")
         from services.llm.provider_manager import llm_provider_manager
         await llm_provider_manager.initialize()
-        logger.info("LLM providers initialized")
         
-        # Initialize tool service
-        from services.tools.tool_service import ToolService
-        tool_service = ToolService()
-        await tool_service.initialize()
-        logger.info("Tool service initialized")
+        # 4. Initialize tool manager
+        logger.info("🛠️ Initializing tool manager...")
+        from services.tools.tool_manager import tool_manager
+        await tool_manager.initialize()
         
-        # Initialize RAG workflow (will auto-subscribe to config changes)
-        from workflows.langgraph.workflow_graph import rag_workflow
-        await rag_workflow.initialize()
-        logger.info("RAG workflow initialized with config management")
+        # 5. Initialize intelligent orchestrator
+        logger.info("🎯 Initializing intelligent orchestrator...")
+        from services.orchestrator.intelligent_orchestrator import IntelligentOrchestrator
+        orchestrator = IntelligentOrchestrator()
+        # No explicit initialization needed - initialized on first use
         
-        logger.info(f"Agentic RAG API started successfully! Environment: {settings.ENV}")
-        logger.info(f"Configuration: {len(settings.get_enabled_providers())} providers, "
-                   f"{len(settings.get_enabled_tools())} tools, "
-                   f"{len(settings.get_enabled_agents())} agents")
+        # 6. Initialize complete LangGraph workflow
+        logger.info("🔄 Initializing complete LangGraph workflow...")
+        from workflows.langgraph.complete_workflow import complete_rag_workflow
+        await complete_rag_workflow.initialize()
+        
+        # 7. Initialize streaming services
+        logger.info("🌊 Initializing streaming services...")
+        from services.streaming.streaming_service import (
+            streaming_orchestration_service,
+            websocket_streaming_service
+        )
+        # Streaming services are initialized on demand
+        
+        # 8. System health check
+        logger.info("⚕️ Performing system health check...")
+        workflow_healthy = await complete_rag_workflow.health_check()
+        milvus_healthy = await optimized_milvus_service.health_check()
+        
+        if not workflow_healthy:
+            logger.warning("⚠️ Workflow health check failed")
+        if not milvus_healthy:
+            logger.warning("⚠️ Milvus health check failed")
+        
+        # 9. Log system configuration
+        logger.info("📋 System configuration:")
+        logger.info(f"  • Environment: {settings.ENV}")
+        logger.info(f"  • Enabled LLM providers: {settings.get_enabled_providers()}")
+        logger.info(f"  • Enabled agents: {settings.get_enabled_agents()}")
+        logger.info(f"  • Enabled tools: {settings.get_enabled_tools()}")
+        logger.info(f"  • Vector collections: {list(optimized_milvus_service.collection_configs.keys())}")
+        logger.info(f"  • Orchestrator: {'Enabled' if settings.orchestrator.get('enabled', True) else 'Disabled'}")
+        logger.info(f"  • Streaming: Enabled")
+        logger.info(f"  • Multi-language support: vi, en, ja, ko")
+        
+        logger.info("✅ Complete Agentic RAG System started successfully!")
         
         yield
         
     except Exception as e:
-        logger.error(f"Failed to start application: {e}")
+        logger.error(f"❌ Failed to start application: {e}")
         raise
     
     # Shutdown
-    logger.info("Shutting down Agentic RAG API...")
+    logger.info("🔄 Shutting down Complete Agentic RAG System...")
     
     try:
-        # Stop configuration monitoring
-        await config_manager.stop_monitoring()
-        logger.info("Configuration monitoring stopped")
-        
         # Close database connections
         from config.database import close_db
         await close_db()
-        logger.info("Database connections closed")
         
-        logger.info("Application shutdown complete")
+        logger.info("✅ Application shutdown complete")
         
     except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+        logger.error(f"❌ Error during shutdown: {e}")
 
-# Create FastAPI app với lifespan management
+# Create FastAPI app
 app = FastAPI(
-    title=settings.APP_NAME,
-    description="Agentic RAG System với Real-time Configuration Management",
-    version="2.0.0",
+    title="Complete Agentic RAG System",
+    description="""
+    🚀 **Complete Agentic RAG System với Intelligent Orchestration**
+    
+    ## Tính năng chính:
+    
+    ### 🧠 Intelligent Orchestration
+    - LLM-driven agent selection (không hardcode)
+    - Dynamic task distribution
+    - Smart tool selection
+    - Conflict resolution giữa agents
+    
+    ### 🔍 Optimized Vector Search  
+    - Collection riêng cho từng agent
+    - Hybrid BM25 + Vector search
+    - Chunking tự động theo file size
+    - Reindexing tự động
+    
+    ### 🌊 Real-time Streaming
+    - Server-Sent Events (SSE)
+    - WebSocket support
+    - Progress tracking
+    - Batch processing
+    
+    ### 🌍 Multi-language Support
+    - Vietnamese (default)
+    - English, Japanese, Korean
+    - Language-specific response formatting
+    
+    ### 🔐 Permission System
+    - Department-level isolation
+    - Document access control
+    - Tool permissions
+    - Audit trail
+    
+    ## Workflow Steps:
+    1. **Query Analysis**: Phân tích và tinh chỉnh query
+    2. **Task Distribution**: Phân phối nhiệm vụ cho agents  
+    3. **Tool Selection**: Chọn tools phù hợp
+    4. **RAG Retrieval**: Tìm kiếm documents với permission check
+    5. **Document Evaluation**: Đánh giá và xếp hạng documents
+    6. **Agent Execution**: Thực hiện agents song song
+    7. **Conflict Resolution**: Giải quyết xung đột
+    8. **Response Assembly**: Tạo response cuối với evidence
+    """,
+    version="3.0.0",
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
     openapi_url="/openapi.json" if settings.DEBUG else None,
@@ -114,161 +169,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all requests với performance tracking"""
+    """Log all requests với detailed performance tracking"""
     start_time = time.time()
+    
+    # Log request start
+    logger.info(f"📥 {request.method} {request.url.path} - Started")
     
     response = await call_next(request)
     
     process_time = time.time() - start_time
     
+    # Log request completion với details
+    status_emoji = "✅" if response.status_code < 400 else "❌"
     logger.info(
-        f"{request.method} {request.url.path} - "
+        f"{status_emoji} {request.method} {request.url.path} - "
         f"Status: {response.status_code} - "
         f"Time: {process_time:.4f}s"
     )
     
-    # Add processing time header
+    # Add performance headers
     response.headers["X-Process-Time"] = str(process_time)
+    response.headers["X-System-Version"] = "3.0.0"
     
     return response
 
+# Include routers
 app.include_router(api_router, prefix="/api/v1")
-
-app.include_router(admin_router, prefix="/api/v1/admin", tags=["Admin Configuration"])
-
+app.include_router(streaming_router, prefix="/api/v1/chat", tags=["Streaming"])
 
 @app.get("/", tags=["System"])
 async def root():
-    """System information endpoint"""
+    """System information và capabilities"""
     try:
-        await config_manager.get_current_config()
+        from workflows.langgraph.workflow_graph import rag_workflow
+        from services.vector.milvus_service import milvus_service
+        
+        # Get system status
+        workflow_status = await rag_workflow.get_workflow_status()
+        milvus_stats = milvus_service.get_collection_stats()
         
         return {
-            "name": settings.APP_NAME,
+            "name": "Complete Agentic RAG System",
             "version": "2.0.0",
-            "status": "running",
+            "status": "operational",
             "framework": "FastAPI + LangGraph",
-            "features": [
-                "Real-time Configuration Management",
-                "Multi-Provider LLM Support", 
-                "Dynamic Tool Loading",
-                "Intelligent Agent Orchestration",
-                "Auto-Reload Components"
-            ],
-            "environment": settings.ENV,
-            "configuration": {
-                "providers": len(settings.get_enabled_providers()),
-                "tools": len(settings.get_enabled_tools()),
-                "agents": len(settings.get_enabled_agents()),
-                "orchestrator": settings.orchestrator.get("enabled", True)
+            
+            "capabilities": {
+                "intelligent_orchestration": "LLM-driven decision making",
+                "multi_agent_system": "Specialized domain agents",
+                "streaming_responses": "Real-time SSE và WebSocket",
+                "hybrid_search": "BM25 + Vector search", 
+                "multi_language": "vi, en, ja, ko support",
+                "permission_system": "Department-level access control",
+                "auto_optimization": "Self-tuning performance"
+            },
+            
+            "system_config": {
+                "environment": settings.ENV,
+                "providers": settings.get_enabled_providers(),
+                "agents": settings.get_enabled_agents(),
+                "tools": settings.get_enabled_tools(),
+                "collections": list(milvus_stats.keys()),
+                "orchestrator_enabled": settings.orchestrator.get("enabled", True),
+                "workflow_initialized": workflow_status["initialized"]
+            },
+            
+            "api_endpoints": {
+                "streaming": "/api/v1/chat/stream",
+                "document": "/api/v1/documents/",
+                "health_check": "/api/v1/health",
+                "system_status": "/api/v1/health/detailed"
+            },
+            
+            "architecture": {
+                "orchestration": "Intelligent LLM-based routing",
+                "agents": "Domain-specific specialists",
+                "vector_db": "Milvus với per-agent collections",
+                "embedding": "BAAI/bge-m3 multilingual",
+                "streaming": "SSE + WebSocket real-time",
+                "workflow": "LangGraph state management"
             }
         }
         
     except Exception as e:
         logger.error(f"Root endpoint error: {e}")
         return {
-            "name": settings.APP_NAME,
+            "name": "Complete Agentic RAG System",
             "version": "2.0.0",
             "status": "running",
-            "error": "Could not load configuration details"
-        }
-
-@app.get("/health", tags=["System"])
-async def health_check():
-    """Comprehensive health check endpoint"""
-    try:
-        from workflows.langgraph.workflow_graph import rag_workflow
-        from services.llm.provider_manager import llm_provider_manager
-        from services.tools.tool_service import ToolService
-        from config.database import test_connection
-        
-        workflow_healthy = await rag_workflow.health_check()
-        db_healthy = await test_connection()
-        
-        llm_health = {}
-        try:
-            llm_health = await llm_provider_manager.health_check_all()
-        except Exception as e:
-            llm_health = {"error": str(e)}
-        
-        # Tool service health
-        tool_health = True
-        try:
-            tool_service = ToolService()
-            tool_health = tool_service._initialized
-        except Exception:
-            tool_health = False
-        
-        # Overall health
-        component_health = [
-            workflow_healthy,
-            db_healthy,
-            any(llm_health.values()) if isinstance(llm_health, dict) else False,
-            tool_health
-        ]
-        
-        overall_status = "healthy" if all(component_health) else "degraded"
-        
-        return {
-            "status": overall_status,
-            "timestamp": time.time(),
-            "components": {
-                "workflow": "healthy" if workflow_healthy else "unhealthy",
-                "database": "healthy" if db_healthy else "unhealthy", 
-                "llm_providers": llm_health,
-                "tools": "healthy" if tool_health else "unhealthy",
-                "config_manager": "healthy" 
-            },
-            "configuration": {
-                "auto_reload": True,
-                "real_time_config": True,
-                "enabled_providers": settings.get_enabled_providers(),
-                "enabled_tools": settings.get_enabled_tools(),
-                "enabled_agents": settings.get_enabled_agents()
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {
-            "status": "error",
-            "timestamp": time.time(),
-            "error": str(e)
-        }
-
-@app.get("/config/live", tags=["Configuration"])
-async def get_live_configuration():
-    """
-    Get live configuration status
-    Shows real-time state of all components
-    """
-    try:
-        from workflows.langgraph.workflow_graph import rag_workflow
-        
-        workflow_config = await rag_workflow.get_configuration_status()
-        system_config = await config_manager.get_current_config()
-        
-        return {
-            "status": "live",
-            "timestamp": time.time(),
-            "workflow_status": workflow_config,
-            "system_config": system_config,
-            "config_manager": {
-                "monitoring": True,
-                "subscribers": len(config_manager._subscribers),
-                "change_queue_size": config_manager._change_queue.qsize()
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Live configuration check failed: {e}")
-        return {
-            "status": "error",
-            "timestamp": time.time(),
-            "error": str(e)
+            "error": "Could not load full system status"
         }
 
 if __name__ == "__main__":
@@ -277,5 +268,6 @@ if __name__ == "__main__":
         host=settings.APP_HOST,
         port=settings.APP_PORT,
         reload=settings.DEBUG,
-        log_level="debug" if settings.DEBUG else "info"
+        log_level="debug" if settings.DEBUG else "info",
+        access_log=True
     )

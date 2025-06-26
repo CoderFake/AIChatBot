@@ -1,4 +1,4 @@
-from typing import Dict, List, Any, Optional, Union, Literal, Annotated
+from typing import Dict, List, Any, Optional, TypedDict, Union, Literal, Annotated
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
@@ -12,56 +12,14 @@ from pydantic import BaseModel, Field
 from config.settings import get_settings
 from services.llm.provider_manager import llm_provider_manager
 from services.tools.tool_manager import tool_manager
-from services.orchestrator.agent_orchestrator import IntelligentAgentOrchestrator, AgentDomain
+from services.orchestrator import IntelligentAgentOrchestrator
+
+from services.types import AgentDomain, AgentRole, ConflictLevel, ConsensusStatus
+from services.dataclasses.multi_agent_workflow import AgentResponse, ConflictResolution
 from utils.logging import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger(__name__) 
 settings = get_settings()
-
-class AgentRole(Enum):
-    """Vai trò của các agents trong hệ thống"""
-    COORDINATOR = "coordinator"
-    HR_SPECIALIST = "hr_specialist" 
-    FINANCE_SPECIALIST = "finance_specialist"
-    IT_SPECIALIST = "it_specialist"
-    GENERAL_ASSISTANT = "general_assistant"
-    CONFLICT_RESOLVER = "conflict_resolver"
-    SYNTHESIZER = "synthesizer"
-
-class ConflictLevel(Enum):
-    """Mức độ xung đột giữa các agents"""
-    NONE = "none"
-    LOW = "low"      # Confidence gap < 0.3
-    MEDIUM = "medium" # Confidence gap 0.3-0.6
-    HIGH = "high"    # Confidence gap > 0.6
-
-class ConsensusStatus(Enum):
-    """Trạng thái đồng thuận"""
-    PENDING = "pending"
-    ACHIEVED = "achieved" 
-    FAILED = "failed"
-    ESCALATED = "escalated"
-
-@dataclass
-class AgentResponse:
-    """Response từ một agent"""
-    agent_role: AgentRole
-    content: str
-    confidence: float  # 0.0 - 1.0
-    evidence: List[str]
-    tools_used: List[str]
-    execution_time: float
-    timestamp: datetime
-
-@dataclass 
-class ConflictResolution:
-    """Kết quả giải quyết xung đột"""
-    conflict_level: ConflictLevel
-    resolution_method: str  # "evidence_based", "synthesis", "voting", "escalation"
-    winner_agent: Optional[AgentRole] = None
-    synthesized_result: Optional[str] = None
-    consensus_score: float = 0.0
-    resolution_explanation: str = ""
 
 class MultiAgentState(TypedDict):
     """State cho multi-agent workflow"""
