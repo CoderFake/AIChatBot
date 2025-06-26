@@ -557,7 +557,6 @@ class LLMProviderManager:
                 logger.info(f"Provider {provider_name} disabled")
                 return
             
-            # Create provider instance
             if provider_name == "gemini":
                 provider = GeminiProvider(provider_config)
             elif provider_name == "ollama":

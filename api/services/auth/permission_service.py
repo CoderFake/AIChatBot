@@ -1,20 +1,22 @@
 from typing import List, Dict, Any, Optional, Set
-from datetime import datetime
+from utils.datetime_utils import CustomDateTime as datetime
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_
+from sqlalchemy.orm import joinedload
 
 from models.database.user import User
-from models.database.permission import Permission, UserPermission
+from models.database.permission import Permission, UserPermission, Group, GroupPermission, UserGroupMembership, ToolPermission
+from models.database.tool import Tool
+from models.database.document import Document
 from models.database.audit_log import AuditLog
-from workflows.state.workflow_state import (
-    UserContext, 
-    AccessLevel, 
-    AuditLogEntry,
-    DocumentMetadata
-)
-from core.exceptions import PermissionDeniedError, InvalidAccessError
+from common.types import UserRole, Department
+from config.settings import get_settings
+from utils.logging import get_logger
+from core.exceptions import PermissionDeniedError, NotFoundError
 
+logger = get_logger(__name__)
+settings = get_settings()
 
 class PermissionService:
     """
@@ -32,33 +34,35 @@ class PermissionService:
         user_id: str, 
         resource_type: str, 
         resource_id: str,
-        required_access_level: AccessLevel = AccessLevel.PUBLIC
+        action: str = "read",
+        additional_context: Dict[str, Any] = None
     ) -> bool:
         """
         Validate user có quyền truy cập resource hay không
+        
+        Args:
+            user_id: ID của user
+            resource_type: Loại resource (document, tool, collection, etc.)
+            resource_id: ID của resource
+            action: Action cần check (read, write, delete, execute)
+            additional_context: Context bổ sung
+            
+        Returns:
+            bool: True nếu có quyền, False nếu không
         """
         try:
-            user_context = await self.get_user_context(user_id)
+            user_permissions = await self.get_user_all_permissions(user_id)
             
-            # Check basic user validity
-            if not user_context:
+            if not user_permissions:
                 await self._log_access_attempt(
                     user_id, resource_type, resource_id, False, 
-                    reason="User not found"
+                    reason="User has no permissions"
                 )
                 return False
             
-            # Check user access level
-            if not self._check_access_level(user_context, required_access_level):
-                await self._log_access_attempt(
-                    user_id, resource_type, resource_id, False,
-                    reason=f"Insufficient access level. Required: {required_access_level}"
-                )
-                return False
-            
-            # Check specific permissions
+            # Check specific resource permission
             has_permission = await self._check_resource_permission(
-                user_context, resource_type, resource_id
+                user_id, user_permissions, resource_type, resource_id, action, additional_context
             )
             
             await self._log_access_attempt(
@@ -68,98 +72,151 @@ class PermissionService:
             return has_permission
             
         except Exception as e:
+            logger.error(f"Permission validation error: {e}")
             await self._log_access_attempt(
                 user_id, resource_type, resource_id, False,
                 reason=f"Error during validation: {str(e)}"
             )
             return False
     
-    async def get_user_context(self, user_id: str) -> Optional[UserContext]:
+    async def get_user_all_permissions(self, user_id: str) -> Dict[str, Any]:
         """
-        Lấy user context với full permission information
-        """
-        cache_key = f"user_context:{user_id}"
+        Lấy tất cả permissions của user (direct + từ groups)
         
-        # Check cache
+        Returns:
+            Dict chứa permissions, groups, department, role
+        """
+        cache_key = f"user_permissions:{user_id}"
+        
         if cache_key in self._permission_cache:
             cached_data = self._permission_cache[cache_key]
             if (datetime.now() - cached_data['timestamp']).seconds < self._cache_ttl:
                 return cached_data['data']
         
-        # Query database
-        query = select(User).where(User.id == user_id)
-        result = await self.db.execute(query)
-        user = result.scalar_one_or_none()
-        
-        if not user:
-            return None
-        
-        # Get user permissions
-        permissions = await self._get_user_permissions(user_id)
-        access_levels = await self._get_user_access_levels(user_id)
-        
-        user_context = UserContext(
-            user_id=user.id,
-            username=user.username,
-            email=user.email,
-            department=user.department,
-            role=user.role,
-            permissions=permissions,
-            access_levels=access_levels,
-            tenant_id=user.tenant_id,
-            last_login=user.last_login,
-            session_expires=user.session_expires
-        )
-        
-        # Cache result
-        self._permission_cache[cache_key] = {
-            'data': user_context,
-            'timestamp': datetime.now()
-        }
-        
-        return user_context
+        try:
+            query = select(User).options(
+                joinedload(User.permissions).joinedload(UserPermission.permission),
+                joinedload(User.group_memberships).joinedload(UserGroupMembership.group)
+            ).where(User.id == user_id, User.is_active == True)
+            
+            result = await self.db.execute(query)
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                return {}
+            
+            direct_permissions = set()
+            for user_perm in user.permissions:
+                if not user_perm.expires_at or user_perm.expires_at > datetime.now():
+                    direct_permissions.add(user_perm.permission.permission_name)
+            
+            group_permissions = set()
+            user_groups = []
+            for membership in user.group_memberships:
+                if not membership.expires_at or membership.expires_at > datetime.now():
+                    user_groups.append(membership.group.group_name)
+                    
+                    group_perms_query = select(GroupPermission).options(
+                        joinedload(GroupPermission.permission)
+                    ).where(GroupPermission.group_id == membership.group.id)
+                    
+                    group_perms_result = await self.db.execute(group_perms_query)
+                    for group_perm in group_perms_result.scalars():
+                        group_permissions.add(group_perm.permission.permission_name)
+            
+            all_permissions = direct_permissions | group_permissions
+            
+            user_context = {
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "department": user.department,
+                "role": user.role,
+                "permissions": list(all_permissions),
+                "direct_permissions": list(direct_permissions),
+                "group_permissions": list(group_permissions),
+                "groups": user_groups,
+                "is_active": user.is_active,
+                "is_staff": user.is_staff,
+                "is_superuser": user.is_superuser,
+                "last_login": user.last_login
+            }
+            
+            # Cache result
+            self._permission_cache[cache_key] = {
+                'data': user_context,
+                'timestamp': datetime.now()
+            }
+            
+            return user_context
+            
+        except Exception as e:
+            logger.error(f"Failed to get user permissions: {e}")
+            return {}
     
     async def get_accessible_collections(self, user_id: str) -> List[str]:
         """
         Lấy danh sách collections user có thể truy cập
+        
+        Returns:
+            List of collection names
         """
-        user_context = await self.get_user_context(user_id)
+        user_context = await self.get_user_all_permissions(user_id)
         if not user_context:
             return []
         
         accessible_collections = []
+        permissions = user_context.get('permissions', [])
+        department = user_context.get('department', '').lower()
+        role = user_context.get('role', '')
         
         # Public collections - everyone can access
-        accessible_collections.append("public_knowledge")
+        accessible_collections.append("general_documents")
         
         # Department-specific collections
-        dept_collection = f"{user_context['department'].lower()}_department"
-        accessible_collections.append(dept_collection)
+        if "hr_access" in permissions or department == Department.HR.value:
+            accessible_collections.append("hr_documents")
+            accessible_collections.append("hr_policies")
+            
+        if "finance_access" in permissions or department == Department.FINANCE.value:
+            accessible_collections.append("finance_documents")
+            accessible_collections.append("finance_reports")
+            
+        if "it_access" in permissions or department == Department.IT.value:
+            accessible_collections.append("it_documents")
+            accessible_collections.append("it_procedures")
         
-        # Cross-department collections based on permissions
-        if "CROSS_DEPT_ACCESS" in user_context['permissions']:
-            accessible_collections.append("cross_department_shared")
+        # Cross-department access
+        if "cross_department_access" in permissions:
+            accessible_collections.extend([
+                "hr_documents", "hr_policies",
+                "finance_documents", "finance_reports", 
+                "it_documents", "it_procedures"
+            ])
         
-        # Manager/Executive access to multiple departments
-        if user_context['role'] in ['MANAGER', 'DIRECTOR', 'CEO']:
-            if "HR_ACCESS" in user_context['permissions']:
-                accessible_collections.append("hr_department")
-            if "IT_ACCESS" in user_context['permissions']:
-                accessible_collections.append("it_department")
-            if "FINANCE_ACCESS" in user_context['permissions']:
-                accessible_collections.append("finance_department")
+        if role in [UserRole.MANAGER.value, UserRole.DIRECTOR.value, UserRole.CEO.value, UserRole.ADMIN.value]:
+            accessible_collections.extend([
+                "hr_documents", "finance_documents", "it_documents"
+            ])
         
         return list(set(accessible_collections))
     
     async def filter_documents_by_permission(
         self, 
         user_id: str, 
-        documents: List[DocumentMetadata]
-    ) -> List[DocumentMetadata]:
+        documents: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """
         Filter documents dựa trên user permissions
+        
+        Args:
+            user_id: ID của user
+            documents: List documents cần filter
+            
+        Returns:
+            List documents user được phép truy cập
         """
-        user_context = await self.get_user_context(user_id)
+        user_context = await self.get_user_all_permissions(user_id)
         if not user_context:
             return []
         
@@ -173,176 +230,345 @@ class PermissionService:
         
         return filtered_docs
     
-    async def get_user_tool_permissions(self, user_id: str) -> Dict[str, List[str]]:
+    async def get_user_tool_permissions(self, user_id: str) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Lấy danh sách tools user có thể sử dụng
+        Lấy danh sách tools user có thể sử dụng - database-driven approach
+        
+        Returns:
+            Dict mapping tool categories to tool details lists
         """
-        user_context = await self.get_user_context(user_id)
+        user_context = await self.get_user_all_permissions(user_id)
         if not user_context:
             return {}
         
-        tool_permissions = {}
+        user_permissions = user_context.get('permissions', [])
+        user_department = user_context.get('department', '')
         
-        # Basic tools for all users
-        tool_permissions["search_tools"] = ["basic_search", "semantic_search"]
+        # Query tools với permissions từ database
+        tools_query = select(Tool).options(
+            joinedload(Tool.tool_permissions).joinedload(ToolPermission.permission)
+        ).where(
+            Tool.is_enabled == True
+        )
         
-        # Department-specific tools
-        dept = user_context['department'].lower()
-        if dept == "hr":
-            tool_permissions["hr_tools"] = ["employee_search", "policy_lookup"]
-        elif dept == "it":
-            tool_permissions["it_tools"] = ["code_search", "documentation_lookup", "api_search"]
-        elif dept == "finance":
-            tool_permissions["finance_tools"] = ["financial_reports", "budget_analysis"]
+        result = await self.db.execute(tools_query)
+        available_tools = result.scalars().all()
         
-        # Role-based tools
-        if user_context['role'] in ['MANAGER', 'DIRECTOR']:
-            tool_permissions["management_tools"] = ["team_analytics", "performance_reports"]
+        # Group tools by category
+        user_tools = {}
         
-        if user_context['role'] == 'CEO':
-            tool_permissions["executive_tools"] = ["company_analytics", "strategic_reports"]
+        for tool in available_tools:
+            # Check department restriction
+            if not tool.is_available_for_department(user_department):
+                continue
+            
+            # Check permission requirements
+            has_access = False
+            required_permissions = []
+            
+            for tool_perm in tool.tool_permissions:
+                if tool_perm.is_enabled:
+                    required_permissions.append(tool_perm.permission.permission_name)
+                    if tool_perm.permission.permission_name in user_permissions:
+                        has_access = True
+                        break
+            
+            # Nếu tool không có permission requirements, default allow
+            if not required_permissions:
+                has_access = True
+            
+            if has_access:
+                category = tool.category
+                
+                if category not in user_tools:
+                    user_tools[category] = []
+                
+                # Tạo tool info với metadata từ database
+                tool_info = {
+                    "id": str(tool.id),
+                    "name": tool.name,
+                    "display_name": tool.display_name,
+                    "description": tool.description,
+                    "version": tool.version,
+                    "config": tool.tool_config or {},
+                    "usage_limits": tool.usage_limits or {},
+                    "documentation_url": tool.documentation_url,
+                    "required_permissions": required_permissions
+                }
+                
+                user_tools[category].append(tool_info)
         
-        # Permission-based tools
-        if "EXTERNAL_API_ACCESS" in user_context['permissions']:
-            tool_permissions["external_tools"] = ["web_search", "external_integrations"]
-        
-        return tool_permissions
+        return user_tools
     
     async def check_tool_permission(
         self, 
         user_id: str, 
-        tool_id: str, 
-        tool_category: str
+        tool_name: str
     ) -> bool:
         """
-        Check user có permission sử dụng specific tool không
-        """
-        tool_permissions = await self.get_user_tool_permissions(user_id)
+        Check user có permission sử dụng specific tool không - database-driven approach
         
-        for category, tools in tool_permissions.items():
-            if tool_category == category and tool_id in tools:
-                await self._log_tool_access(user_id, tool_id, True)
-                return True
+        Args:
+            user_id: ID của user
+            tool_name: Tên tool cần check
+            
+        Returns:
+            bool: True nếu có quyền sử dụng
+        """
+        user_context = await self.get_user_all_permissions(user_id)
+        if not user_context:
+            return False
         
-        await self._log_tool_access(user_id, tool_id, False)
-        return False
-    
-    async def create_access_audit_entry(
-        self,
-        user_id: str,
-        action: str,
-        resource_type: str,
-        resource_id: str,
-        access_granted: bool,
-        additional_data: Dict[str, Any] = None
-    ) -> AuditLogEntry:
-        """
-        Tạo audit log entry cho mọi access attempt
-        """
-        audit_entry = AuditLogEntry(
-            timestamp=datetime.now(),
-            user_id=user_id,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            access_granted=access_granted,
-            permission_checked=[],
-            ip_address="",  # Will be filled by middleware
-            user_agent="",  # Will be filled by middleware
-            session_id="",  # Will be filled by middleware
-            details=additional_data or {}
+        user_permissions = user_context.get('permissions', [])
+        user_department = user_context.get('department', '')
+        
+        # Get tool từ database
+        tool_query = select(Tool).options(
+            joinedload(Tool.tool_permissions).joinedload(ToolPermission.permission)
+        ).where(
+            Tool.name == tool_name,
+            Tool.is_enabled == True
         )
         
-        # Save to database
-        await self._save_audit_log(audit_entry)
+        result = await self.db.execute(tool_query)
+        tool = result.scalar_one_or_none()
         
-        return audit_entry
+        if not tool:
+            await self._log_tool_access(user_id, tool_name, False, "Tool not found or disabled")
+            return False
+        
+        # Check department restriction
+        if not tool.is_available_for_department(user_department):
+            await self._log_tool_access(user_id, tool_name, False, f"Tool not available for department: {user_department}")
+            return False
+        
+        # Check permission requirements
+        required_permissions = []
+        has_permission = False
+        
+        for tool_perm in tool.tool_permissions:
+            if tool_perm.is_enabled:
+                required_permissions.append(tool_perm.permission.permission_name)
+                if tool_perm.permission.permission_name in user_permissions:
+                    has_permission = True
+                    break
+        
+        # Nếu tool không có permission requirements, default allow
+        if not required_permissions:
+            has_permission = True
+        
+        await self._log_tool_access(
+            user_id, 
+            tool_name, 
+            has_permission,
+            f"Required: {required_permissions}, User has: {user_permissions}" if not has_permission else ""
+        )
+        
+        return has_permission
+    
+    async def check_document_access(
+        self,
+        user_id: str,
+        document_id: str,
+        action: str = "read"
+    ) -> bool:
+        """
+        Check user có thể access document cụ thể không
+        
+        Args:
+            user_id: ID của user
+            document_id: ID của document
+            action: Action cần thực hiện (read, write, delete)
+            
+        Returns:
+            bool: True nếu có quyền
+        """
+        user_context = await self.get_user_all_permissions(user_id)
+        if not user_context:
+            return False
+        
+        # Get document
+        doc_query = select(Document).where(Document.id == document_id)
+        result = await self.db.execute(doc_query)
+        document = result.scalar_one_or_none()
+        
+        if not document:
+            return False
+        
+        # Convert document to dict format
+        doc_dict = {
+            "id": str(document.id),
+            "title": document.title,
+            "department": document.department,
+            "access_level": document.access_level,
+            "required_permissions": document.required_permissions or [],
+            "uploaded_by": str(document.uploaded_by)
+        }
+        
+        return await self._can_access_document(user_context, doc_dict, action)
+    
+    async def add_user_to_group(self, user_id: str, group_name: str, added_by: str = None) -> bool:
+        """
+        Thêm user vào group
+        
+        Args:
+            user_id: ID của user
+            group_name: Tên group
+            added_by: User thực hiện thêm
+            
+        Returns:
+            bool: True nếu thành công
+        """
+        try:
+            # Get group
+            group_query = select(Group).where(Group.group_name == group_name)
+            result = await self.db.execute(group_query)
+            group = result.scalar_one_or_none()
+            
+            if not group:
+                raise NotFoundError(f"Group {group_name} not found")
+            
+            # Check if already member
+            existing_query = select(UserGroupMembership).where(
+                UserGroupMembership.user_id == user_id,
+                UserGroupMembership.group_id == str(group.id)
+            )
+            existing = await self.db.execute(existing_query)
+            
+            if existing.scalar_one_or_none():
+                return True  # Already member
+            
+            # Add membership
+            membership = UserGroupMembership(
+                user_id=user_id,
+                group_id=str(group.id),
+                added_by=added_by,
+                role_in_group="MEMBER"
+            )
+            
+            self.db.add(membership)
+            await self.db.commit()
+            
+            # Clear cache
+            self._clear_user_cache(user_id)
+            
+            logger.info(f"Added user {user_id} to group {group_name}")
+            return True
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to add user to group: {e}")
+            return False
+    
+    async def remove_user_from_group(self, user_id: str, group_name: str) -> bool:
+        """
+        Xóa user khỏi group
+        """
+        try:
+            # Get group
+            group_query = select(Group).where(Group.group_name == group_name)
+            result = await self.db.execute(group_query)
+            group = result.scalar_one_or_none()
+            
+            if not group:
+                return False
+            
+            # Remove membership
+            membership_query = select(UserGroupMembership).where(
+                UserGroupMembership.user_id == user_id,
+                UserGroupMembership.group_id == str(group.id)
+            )
+            result = await self.db.execute(membership_query)
+            membership = result.scalar_one_or_none()
+            
+            if membership:
+                await self.db.delete(membership)
+                await self.db.commit()
+                
+                # Clear cache
+                self._clear_user_cache(user_id)
+                
+                logger.info(f"Removed user {user_id} from group {group_name}")
+            
+            return True
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to remove user from group: {e}")
+            return False
     
     # Private helper methods
     
-    async def _get_user_permissions(self, user_id: str) -> List[str]:
-        """Get list of permission strings for user"""
-        query = select(Permission.permission_name).join(
-            UserPermission, Permission.id == UserPermission.permission_id
-        ).where(UserPermission.user_id == user_id)
-        
-        result = await self.db.execute(query)
-        return [row[0] for row in result.fetchall()]
-    
-    async def _get_user_access_levels(self, user_id: str) -> List[AccessLevel]:
-        """Get user access levels"""
-        user_context = await self.get_user_context(user_id)
-        if not user_context:
-            return [AccessLevel.PUBLIC]
-        
-        access_levels = [AccessLevel.PUBLIC]
-        
-        if user_context['role'] in ['EMPLOYEE', 'STAFF']:
-            access_levels.append(AccessLevel.INTERNAL)
-        
-        if user_context['role'] in ['MANAGER', 'SENIOR']:
-            access_levels.extend([AccessLevel.INTERNAL, AccessLevel.CONFIDENTIAL])
-        
-        if user_context['role'] in ['DIRECTOR', 'CEO']:
-            access_levels.extend([
-                AccessLevel.INTERNAL, 
-                AccessLevel.CONFIDENTIAL, 
-                AccessLevel.RESTRICTED
-            ])
-        
-        return access_levels
-    
-    def _check_access_level(
-        self, 
-        user_context: UserContext, 
-        required_level: AccessLevel
-    ) -> bool:
-        """Check if user has required access level"""
-        return required_level in user_context['access_levels']
-    
     async def _check_resource_permission(
         self,
-        user_context: UserContext,
+        user_id: str,
+        user_permissions: Dict[str, Any],
         resource_type: str,
-        resource_id: str
+        resource_id: str,
+        action: str,
+        additional_context: Dict[str, Any] = None
     ) -> bool:
         """Check specific resource permission"""
-        # Department-based access
-        if resource_type == "collection":
-            if resource_id == "public_knowledge":
-                return True
+        
+        permissions = user_permissions.get('permissions', [])
+        department = user_permissions.get('department', '')
+        role = user_permissions.get('role', '')
+        
+        if resource_type == "document":
+            return await self.check_document_access(user_id, resource_id, action)
             
-            if resource_id.startswith(user_context['department'].lower()):
-                return True
+        elif resource_type == "tool":
+            return await self.check_tool_permission(user_id, resource_id)
             
-            if resource_id == "cross_department_shared":
-                return "CROSS_DEPT_ACCESS" in user_context['permissions']
+        elif resource_type == "collection":
+            accessible_collections = await self.get_accessible_collections(user_id)
+            return resource_id in accessible_collections
+            
+        elif resource_type == "admin":
+            return any(perm.startswith("admin_") for perm in permissions)
         
         return False
     
     async def _can_access_document(
         self, 
-        user_context: UserContext, 
-        doc: DocumentMetadata
+        user_context: Dict[str, Any], 
+        doc: Dict[str, Any],
+        action: str = "read"
     ) -> bool:
         """Check if user can access specific document"""
-        # Check access level
-        if doc['access_level'] not in user_context['access_levels']:
-            return False
         
-        # Check department access
-        if doc['department'] != user_context['department']:
-            if doc['department'] != "PUBLIC":
-                required_perm = f"{doc['department']}_ACCESS"
-                if required_perm not in user_context['permissions']:
-                    return False
+        permissions = user_context.get('permissions', [])
+        department = user_context.get('department', '')
+        role = user_context.get('role', '')
+        user_id = user_context.get('user_id', '')
         
-        # Check specific permissions
-        for req_perm in doc['required_permissions']:
-            if req_perm not in user_context['permissions']:
+        # Check if user is owner
+        if doc.get('uploaded_by') == user_id:
+            return True
+        
+        # Check access level permissions
+        access_level = doc.get('access_level', 'public')
+        
+        if access_level == "public":
+            return "document_read_public" in permissions
+        elif access_level == "private":
+            # Private docs only accessible by same department
+            if doc.get('department', '').upper() != department.upper():
                 return False
+            return "document_read_internal" in permissions
+        elif access_level == "internal":
+            return "document_read_internal" in permissions
+        elif access_level == "confidential":
+            return "document_read_confidential" in permissions
+        elif access_level == "restricted":
+            return "document_read_restricted" in permissions
         
-        return True
+        # Check specific required permissions
+        required_perms = doc.get('required_permissions', [])
+        if required_perms:
+            return any(perm in permissions for perm in required_perms)
+        
+        return False
     
     async def _log_access_attempt(
         self,
@@ -353,55 +579,51 @@ class PermissionService:
         reason: str = ""
     ):
         """Log access attempt to audit trail"""
-        await self.create_access_audit_entry(
-            user_id=user_id,
-            action="ACCESS_ATTEMPT",
-            resource_type=resource_type,
-            resource_id=resource_id,
-            access_granted=access_granted,
-            additional_data={"reason": reason}
-        )
+        try:
+            audit_log = AuditLog(
+                user_id=user_id,
+                action="ACCESS_ATTEMPT",
+                resource_type=resource_type,
+                resource_id=resource_id,
+                action_result="SUCCESS" if access_granted else "DENIED",
+                additional_data={"reason": reason} if reason else None,
+                category="SECURITY_EVENT" if not access_granted else "USER_ACTION",
+                severity="WARNING" if not access_granted else "INFO"
+            )
+            
+            self.db.add(audit_log)
+            await self.db.commit()
+            
+        except Exception as e:
+            logger.error(f"Failed to log access attempt: {e}")
     
-    async def _log_document_access_denied(
-        self, 
-        user_id: str, 
-        doc: DocumentMetadata
-    ):
+    async def _log_document_access_denied(self, user_id: str, doc: Dict[str, Any]):
         """Log when document access is denied"""
-        await self.create_access_audit_entry(
+        await self._log_access_attempt(
             user_id=user_id,
-            action="DOCUMENT_ACCESS_DENIED",
             resource_type="document",
-            resource_id=doc['document_id'],
+            resource_id=doc.get('id', 'unknown'),
             access_granted=False,
-            additional_data={
-                "document_title": doc['title'],
-                "required_access_level": doc['access_level'].value,
-                "document_department": doc['department']
-            }
+            reason=f"Insufficient permissions for document: {doc.get('title', 'Unknown')}"
         )
     
-    async def _log_tool_access(self, user_id: str, tool_id: str, access_granted: bool):
+    async def _log_tool_access(self, user_id: str, tool_name: str, access_granted: bool, reason: str = ""):
         """Log tool access attempt"""
-        await self.create_access_audit_entry(
+        await self._log_access_attempt(
             user_id=user_id,
-            action="TOOL_ACCESS",
             resource_type="tool",
-            resource_id=tool_id,
-            access_granted=access_granted
+            resource_id=tool_name,
+            access_granted=access_granted,
+            reason=reason
         )
     
-    async def _save_audit_log(self, audit_entry: AuditLogEntry):
-        """Save audit log to database"""
-        audit_log = AuditLog(
-            timestamp=audit_entry['timestamp'],
-            user_id=audit_entry['user_id'],
-            action=audit_entry['action'],
-            resource_type=audit_entry['resource_type'],
-            resource_id=audit_entry['resource_id'],
-            access_granted=audit_entry['access_granted'],
-            details=audit_entry['details']
-        )
-        
-        self.db.add(audit_log)
-        await self.db.commit()
+    def _clear_user_cache(self, user_id: str):
+        """Clear user permission cache"""
+        cache_key = f"user_permissions:{user_id}"
+        if cache_key in self._permission_cache:
+            del self._permission_cache[cache_key]
+    
+    def clear_all_cache(self):
+        """Clear all permission cache"""
+        self._permission_cache.clear()
+        logger.info("Permission cache cleared")

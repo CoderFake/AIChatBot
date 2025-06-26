@@ -272,7 +272,6 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
 def setup_exception_handlers(app: FastAPI) -> None:
     """Setup tất cả exception handlers cho FastAPI app"""
     
-    # Custom exception handlers
     app.add_exception_handler(BaseAPIException, base_api_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)

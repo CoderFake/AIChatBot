@@ -92,6 +92,12 @@ class Settings(BaseModel):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
     ALLOWED_HOSTS: List[str] = Field(default=["*"])
     CORS_ORIGINS: List[str] = Field(default=["*"])
+
+    # OTP Settings
+    OTP_SECRET_KEY: str = Field(default="your_secret_key_here")
+    OTP_VALIDITY_SECONDS: int = Field(default=30)
+    OTP_DIGITS: int = Field(default=8)
+    OTP_TOLERANCE_WINDOWS: int = Field(default=2)
     
     # Infrastructure Configs
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)

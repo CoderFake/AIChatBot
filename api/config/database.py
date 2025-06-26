@@ -59,10 +59,10 @@ class DatabaseManager:
             await self._setup_event_listeners()
             
             self._initialized = True
-            logger.info("Database manager đã được khởi tạo thành công")
+            logger.info("Database manager initialized successfully")
             
         except Exception as e:
-            logger.error(f"Lỗi khởi tạo database manager: {str(e)}")
+            logger.error(f"Failed to initialize database manager: {str(e)}")
             raise
     
     async def _create_async_engine(self):
@@ -94,7 +94,7 @@ class DatabaseManager:
             pool_recycle=3600,
         )
         
-        logger.info(f"Async database engine đã được tạo: {settings.DATABASE_HOST}:{settings.DATABASE_PORT}")
+        logger.info(f"Async database engine created: {settings.DATABASE_HOST}:{settings.DATABASE_PORT}")
     
     def _create_sync_engine(self):
         """
@@ -123,7 +123,7 @@ class DatabaseManager:
             future=True
         )
         
-        logger.info(f"Sync database engine đã được tạo: {settings.DATABASE_HOST}:{settings.DATABASE_PORT}")
+        logger.info(f"Sync database engine created: {settings.DATABASE_HOST}:{settings.DATABASE_PORT}")
     
     def _create_session_factories(self):
         """
@@ -145,7 +145,7 @@ class DatabaseManager:
             autocommit=False
         )
         
-        logger.info("Database session factories đã được tạo")
+        logger.info("Database session factories created")
     
     async def _setup_event_listeners(self):
         """
@@ -192,7 +192,7 @@ class DatabaseManager:
         Sync context manager để lấy database session
         """
         if not self._initialized:
-            raise RuntimeError("Database manager chưa được khởi tạo. Gọi initialize() trước.")
+            raise RuntimeError("Database manager not initialized. Call initialize() first.")
         
         return self._sync_session_factory()
     
@@ -215,7 +215,7 @@ class DatabaseManager:
         async with self._async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         
-        logger.info("Tất cả database tables đã được tạo")
+        logger.info("All database tables created")
     
     async def drop_all_tables(self):
         """
@@ -227,7 +227,7 @@ class DatabaseManager:
         async with self._async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
         
-        logger.warning("Tất cả database tables đã được xóa")
+        logger.warning("All database tables dropped")
     
     async def check_connection(self) -> bool:
         """
@@ -267,11 +267,11 @@ class DatabaseManager:
         """
         if self._async_engine:
             await self._async_engine.dispose()
-            logger.info("Async database engine đã được đóng")
+            logger.info("Async database engine closed")
         
         if self._sync_engine:
             self._sync_engine.dispose()
-            logger.info("Sync database engine đã được đóng")
+            logger.info("Sync database engine closed")
         
         self._initialized = False
 
@@ -356,7 +356,6 @@ async def init_db():
     global engine, async_session_factory, pg_pool
     
     try:
-        # SQLAlchemy Async Engine
         engine = create_async_engine(
             settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://"),
             echo=settings.DEBUG,
@@ -365,15 +364,13 @@ async def init_db():
             pool_pre_ping=True,
             pool_recycle=3600,
         )
-        
-        # Async Session Factory
+
         async_session_factory = async_sessionmaker(
             engine,
             class_=AsyncSession,
             expire_on_commit=False
         )
         
-        # Raw AsyncPG Connection Pool
         pg_pool = await asyncpg.create_pool(
             settings.DATABASE_URL,
             min_size=5,
@@ -406,7 +403,7 @@ async def close_db():
     except Exception as e:
         logger.error(f"Error closing database connections: {e}")
 
-async def get_db_session() -> AsyncSession:
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Get database session"""
     if not async_session_factory:
         raise RuntimeError("Database not initialized")

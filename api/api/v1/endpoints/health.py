@@ -18,7 +18,8 @@ from models.schemas import (
     VectorDatabaseHealth,
     CacheHealth,
     EmbeddingHealth,
-    WorkflowHealth
+    WorkflowHealth,
+    SystemConfiguration
 )
 
 router = APIRouter()
@@ -102,19 +103,18 @@ async def detailed_health_check():
             },
             collection_status=collection_stats,
             workflow_status=workflow_status,
-            configuration={
-                "enabled_providers": settings.get_enabled_providers(),
-                "enabled_agents": settings.get_enabled_agents(),
-                "enabled_tools": settings.get_enabled_tools(),
-                "intelligent_orchestration": True,
-                "streaming_enabled": True,
-                "multi_language": True,
-                "hybrid_search": True,
-                "auto_reindexing": True,
-                "permission_system": True,
-                "langgraph_enabled": True,
-                "multi_tenant": settings.ENABLE_MULTI_TENANT
-            }
+            configuration=SystemConfiguration(
+                enabled_providers=list(settings.enabled_providers.keys()),
+                enabled_agents=list(settings.get_enabled_agents().keys()),
+                enabled_tools=list(settings.get_enabled_tools().keys()),
+                intelligent_orchestration=True,
+                streaming_enabled=True,
+                multi_language=True,
+                hybrid_search=True,
+                auto_reindexing=True,
+                permission_system=True,
+                langgraph_enabled=True
+            )
         )
         
     except Exception as e:

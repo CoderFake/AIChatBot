@@ -87,7 +87,6 @@ class SystemConfiguration(BaseModel):
     auto_reindexing: bool
     permission_system: bool
     langgraph_enabled: bool
-    multi_tenant: bool
 
 class DetailedHealthResponse(BaseModel):
     """Comprehensive health check response"""

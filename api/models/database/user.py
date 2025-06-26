@@ -169,10 +169,10 @@ class User(BaseModel):
     )
 
     __table_args__ = (
-        Index('idx_user_active_tenant', 'tenant_id', 'is_active'),
+        Index('idx_user_active', 'is_active'),
         Index('idx_user_department_role', 'department', 'role'),
-        Index('idx_user_email_tenant', 'email', 'tenant_id'),
-        Index('idx_user_username_tenant', 'username', 'tenant_id'),
+        Index('idx_user_email', 'email'),
+        Index('idx_user_username', 'username'),
         Index('idx_user_last_login', 'last_login'),
         Index('idx_user_locked_until', 'locked_until'),
     )

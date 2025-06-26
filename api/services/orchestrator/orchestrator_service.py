@@ -52,7 +52,6 @@ class OrchestratorService:
         logger.info(f"🎯 Starting orchestration for: {original_query[:100]}...")
         
         try:
-            # B1: Query Analysis & Refinement
             query_analysis = await self._analyze_and_refine_query(
                 original_query, user_context, conversation_history
             )
@@ -60,32 +59,26 @@ class OrchestratorService:
             if query_analysis.query_type == QueryType.CHITCHAT:
                 return await self._handle_chitchat(query_analysis, user_context)
             
-            # B2: Task Distribution
             task_distribution = await self._distribute_tasks(query_analysis, user_context)
             
-            # B3: Tool Selection
             tool_selection = await self._select_tools(
                 query_analysis, task_distribution, user_context
             )
             
-            # B4: RAG Retrieval với permission check
             retrieval_results = await self._execute_rag_retrieval(
                 query_analysis, task_distribution, user_context
             )
             
-            # B5: Document Evaluation & Ranking
             ranked_documents = await self._evaluate_and_rank_documents(
                 retrieval_results, query_analysis
             )
             
-            # B6: Agent Execution & Conflict Resolution
             agent_responses = await self._execute_agents(
                 task_distribution, tool_selection, ranked_documents, query_analysis
             )
             
             conflict_resolution = await self._resolve_conflicts(agent_responses, query_analysis)
             
-            # B7: Final Response Assembly
             final_response = await self._assemble_final_response(
                 conflict_resolution, ranked_documents, query_analysis
             )
@@ -111,14 +104,14 @@ class OrchestratorService:
         """
         B1: Phân tích và tinh chỉnh query sử dụng LLM
         """
-        logger.info("📋 Analyzing and refining query...")
+        logger.info("Analyzing and refining query...")
         
         try:
             llm = await llm_provider_manager.get_provider()
             
             conversation_context = ""
             if conversation_history:
-                recent_turns = conversation_history[-3:]  # 3 lượt gần nhất
+                recent_turns = conversation_history[-3:]
                 conversation_context = "\n".join([
                     f"User: {turn.get('user_message', '')}\nBot: {turn.get('bot_response', '')}"
                     for turn in recent_turns
@@ -188,7 +181,7 @@ Trả về JSON:
         """
         B2: Phân phối nhiệm vụ cho agents dựa trên LLM analysis
         """
-        logger.info("🔀 Distributing tasks to agents...")
+        logger.info("Distributing tasks to agents...")
         
         try:
             llm = await llm_provider_manager.get_provider()
@@ -295,7 +288,6 @@ Trả về JSON:
             response = await llm.ainvoke(tool_selection_prompt)
             selection_data = self._parse_json_response(response.content)
             
-            # Filter tools theo user permissions
             selected_tools = [
                 tool for tool in selection_data.get("selected_tools", [])
                 if tool in user_tool_permissions
@@ -331,7 +323,6 @@ Trả về JSON:
         retrieval_results = {}
         
         try:
-            # Determine target collections for each agent
             for agent_name in task_distribution.selected_agents:
                 agent_collections = await self._get_agent_collections(agent_name, user_context)
                 sub_query = task_distribution.sub_queries.get(agent_name, query_analysis.refined_query)
@@ -339,7 +330,6 @@ Trả về JSON:
                 agent_results = []
                 for collection in agent_collections:
                     try:
-                        # Vector search sử dụng milvus_service đã có
                         vector_results = await milvus_service.search(
                             query=sub_query,
                             collection_name=collection,
@@ -347,7 +337,6 @@ Trả về JSON:
                             threshold=self.settings.rag.get("default_threshold", 0.7)
                         )
                         
-                        # Apply permission filtering
                         filtered_results = await self._apply_permission_filter(
                             vector_results, user_context
                         )
@@ -373,7 +362,7 @@ Trả về JSON:
         """
         B5: Đánh giá và xếp hạng documents sử dụng LLM
         """
-        logger.info("📊 Evaluating and ranking documents...")
+        logger.info("Evaluating and ranking documents...")
         
         try:
             llm = await llm_provider_manager.get_provider()
@@ -438,9 +427,8 @@ Trả về JSON:
                             "reasoning": "Fallback evaluation"
                         })
                 
-                # Sort by relevance
                 evaluated_docs.sort(key=lambda x: x["relevance_score"], reverse=True)
-                ranked_results[agent_name] = evaluated_docs[:5]  # Top 5 documents
+                ranked_results[agent_name] = evaluated_docs[:5] 
             
             return ranked_results
             
@@ -458,11 +446,10 @@ Trả về JSON:
         """
         B6: Thực hiện agents sử dụng domain agents đã có
         """
-        logger.info("🤖 Executing domain agents...")
+        logger.info("Executing domain agents...")
         
         agent_responses = {}
         
-        # Execute agents in parallel
         tasks = []
         for agent_name in task_distribution.selected_agents:
             if agent_name in self.agents:
@@ -475,7 +462,6 @@ Trả về JSON:
                 )
                 tasks.append((agent_name, task))
         
-        # Gather results
         for agent_name, task in tasks:
             try:
                 result = await task
@@ -507,7 +493,6 @@ Trả về JSON:
             
             agent = self.agents[agent_name]
             
-            # Prepare context from documents
             context = {
                 "documents": documents,
                 "query": query,
@@ -515,7 +500,6 @@ Trả về JSON:
                 "available_tools": available_tools
             }
             
-            # Execute agent task
             response = await agent.execute_task(
                 task=query,
                 context=context,
@@ -654,7 +638,6 @@ Trả về JSON:
                 }
                 all_evidence.append(source_info)
         
-        # Remove duplicates and sort by credibility
         unique_evidence = []
         seen_urls = set()
         for evidence in all_evidence:
@@ -666,7 +649,7 @@ Trả về JSON:
         
         return {
             "response": formatted_response,
-            "evidence": unique_evidence[:10],  # Top 10 evidence
+            "evidence": unique_evidence[:10],
             "confidence": conflict_resolution.confidence_score,
             "language": query_analysis.language,
             "metadata": {
@@ -678,7 +661,6 @@ Trả về JSON:
             }
         }
     
-    # Helper methods
     
     async def _handle_chitchat(
         self,

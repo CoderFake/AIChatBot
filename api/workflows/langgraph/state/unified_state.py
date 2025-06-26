@@ -23,7 +23,6 @@ class UnifiedRAGState(TypedDict):
     
     # User context và permissions
     user_id: Optional[str]
-    tenant_id: Optional[str]
     session_id: str
     user_context: Dict[str, Any]
     user_permissions: List[str]

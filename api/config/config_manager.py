@@ -1,38 +1,17 @@
 from typing import Dict, Any, List, Optional, Callable
 import asyncio
 import json
-from datetime import datetime
-from dataclasses import dataclass, field
-from enum import Enum
+from utils.datetime_utils import CustomDateTime as datetime
 
 from config.settings import get_settings, reload_settings, Settings
+from services.llm.provider_manager import llm_provider_manager
+from services.tools.tool_manager import tool_manager
 from utils.logging import get_logger
+from common.types import ConfigChangeType
+from common.dataclasses import ConfigChange
 
 logger = get_logger(__name__)
 
-class ConfigChangeType(Enum):
-    """Types of configuration changes"""
-    PROVIDER_ENABLED = "provider_enabled"
-    PROVIDER_DISABLED = "provider_disabled"
-    PROVIDER_CONFIG_CHANGED = "provider_config_changed"
-    TOOL_ENABLED = "tool_enabled"
-    TOOL_DISABLED = "tool_disabled"
-    TOOL_CONFIG_CHANGED = "tool_config_changed"
-    AGENT_ENABLED = "agent_enabled"
-    AGENT_DISABLED = "agent_disabled"
-    AGENT_CONFIG_CHANGED = "agent_config_changed"
-    WORKFLOW_CONFIG_CHANGED = "workflow_config_changed"
-    ORCHESTRATOR_CONFIG_CHANGED = "orchestrator_config_changed"
-
-@dataclass
-class ConfigChange:
-    """Configuration change event"""
-    change_type: ConfigChangeType
-    component_name: str
-    old_value: Any
-    new_value: Any
-    timestamp: datetime = field(default_factory=datetime.now)
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class ConfigSubscriber:
     """Base class for configuration subscribers"""
@@ -42,11 +21,7 @@ class ConfigSubscriber:
         return True
 
 class ConfigManager:
-    """
-    Real-time configuration management
-    Monitors và propagates configuration changes
-    """
-    
+
     def __init__(self):
         self._subscribers: Dict[str, List[ConfigSubscriber]] = {}
         self._current_settings: Optional[Settings] = None
@@ -54,16 +29,46 @@ class ConfigManager:
         self._change_queue: asyncio.Queue = asyncio.Queue()
         
     async def initialize(self):
-        """Initialize configuration manager"""
+        """Initialize configuration manager và tất cả components"""
         try:
             self._current_settings = get_settings()
             
-            asyncio.create_task(self._monitor_changes())
+            if not llm_provider_manager._initialized:
+                await llm_provider_manager.initialize()
+                logger.info("LLM Provider Manager initialized")
             
-            logger.info("Configuration manager initialized")
+            if not hasattr(tool_manager, '_initialized') or not tool_manager._initialized:
+                tool_manager.reload_tools()
+                logger.info("Tool Manager initialized")
+            
+            if not self._monitoring:
+                asyncio.create_task(self._monitor_changes())
+            
+            logger.info("Configuration manager initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize config manager: {e}")
+            raise
+    
+    async def reinitialize(self):
+        """Reinitialize configuration manager với settings mới"""
+        try:
+            logger.info("Reinitializing configuration manager...")
+            
+            self._current_settings = reload_settings()
+            
+            if llm_provider_manager._initialized:
+                llm_provider_manager._initialized = False
+            await llm_provider_manager.initialize()
+            logger.info("LLM Provider Manager reinitialized")
+            
+            tool_manager.reload_tools()
+            logger.info("Tool Manager reinitialized")
+            
+            logger.info("Configuration manager reinitialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to reinitialize config manager: {e}")
             raise
     
     def subscribe(self, component_name: str, subscriber: ConfigSubscriber):
@@ -81,7 +86,7 @@ class ConfigManager:
     
     async def apply_config_change(self, change_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Apply configuration change from admin API
+        Apply configuration change từ API requests
         Returns status of the change application
         """
         try:
@@ -98,17 +103,102 @@ class ConfigManager:
             if not config_change:
                 return {"success": False, "error": "Invalid change data"}
             
-            await self._change_queue.put(config_change)
+            success = await self._apply_immediate_change(config_change)
             
-            return {
-                "success": True,
-                "change_id": f"{component_name}_{datetime.now().timestamp()}",
-                "message": f"Configuration change queued for {component_name}"
-            }
+            if success:
+                await self._change_queue.put(config_change)
+                
+                return {
+                    "success": True,
+                    "change_id": f"{component_name}_{datetime.now().timestamp()}",
+                    "message": f"Configuration change applied for {component_name}"
+                }
+            else:
+                return {"success": False, "error": f"Failed to apply change for {component_name}"}
             
         except Exception as e:
             logger.error(f"Failed to apply config change: {e}")
             return {"success": False, "error": str(e)}
+    
+    async def _apply_immediate_change(self, change: ConfigChange) -> bool:
+        """Apply change immediately để có real-time response"""
+        try:
+            setting_success = await self._apply_setting_change(change)
+            
+            if not setting_success:
+                return False
+            
+            component_success = await self._apply_component_change(change)
+            
+            return component_success
+            
+        except Exception as e:
+            logger.error(f"Failed to apply immediate change: {e}")
+            return False
+    
+    async def _apply_component_change(self, change: ConfigChange) -> bool:
+        try:
+            if change.change_type.name.startswith("PROVIDER_"):
+                return await self._apply_provider_change(change)
+            elif change.change_type.name.startswith("TOOL_"):
+                return await self._apply_tool_change(change)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply component change: {e}")
+            return False
+    
+    async def _apply_provider_change(self, change: ConfigChange) -> bool:
+        """Apply provider configuration change"""
+        try:
+            provider_name = change.component_name
+            
+            if change.change_type == ConfigChangeType.PROVIDER_ENABLED:
+                if provider_name in llm_provider_manager._providers:
+                    logger.info(f"Provider {provider_name} already initialized and enabled")
+                else:
+                    await self._reinitialize_provider_manager()
+                    
+            elif change.change_type == ConfigChangeType.PROVIDER_DISABLED:
+                if provider_name in llm_provider_manager._providers:
+                    del llm_provider_manager._providers[provider_name]
+                    logger.info(f"Provider {provider_name} disabled and removed")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply provider change: {e}")
+            return False
+    
+    async def _apply_tool_change(self, change: ConfigChange) -> bool:
+        """Apply tool configuration change"""
+        try:
+            tool_name = change.component_name
+            
+            if change.change_type == ConfigChangeType.TOOL_ENABLED:
+                tool_manager.reload_tools()
+                logger.info(f"Tool {tool_name} enabled - tools reloaded")
+                
+            elif change.change_type == ConfigChangeType.TOOL_DISABLED:
+                tool_manager.reload_tools()
+                logger.info(f"Tool {tool_name} disabled - tools reloaded")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply tool change: {e}")
+            return False
+    
+    async def _reinitialize_provider_manager(self):
+        """Reinitialize provider manager"""
+        try:
+            llm_provider_manager._initialized = False
+            await llm_provider_manager.initialize()
+            logger.info("Provider manager reinitialized")
+        except Exception as e:
+            logger.error(f"Failed to reinitialize provider manager: {e}")
+            raise
     
     async def _create_config_change(
         self, 
@@ -123,18 +213,23 @@ class ConfigManager:
             
             old_value = None
             if change_enum in [ConfigChangeType.PROVIDER_ENABLED, ConfigChangeType.PROVIDER_DISABLED]:
-                old_value = self._current_settings.llm_providers.get(component_name, {}).enabled
+                if hasattr(self._current_settings, 'llm_providers') and self._current_settings.llm_providers:
+                    provider_config = self._current_settings.llm_providers.get(component_name)
+                    old_value = provider_config.enabled if provider_config else False
             elif change_enum in [ConfigChangeType.TOOL_ENABLED, ConfigChangeType.TOOL_DISABLED]:
-                old_value = self._current_settings.tools.get(component_name, {}).get("enabled", False)
+                if hasattr(self._current_settings, 'tools') and self._current_settings.tools:
+                    old_value = self._current_settings.tools.get(component_name, {}).get("enabled", False)
             elif change_enum in [ConfigChangeType.AGENT_ENABLED, ConfigChangeType.AGENT_DISABLED]:
-                old_value = self._current_settings.agents.get(component_name, {}).enabled
+                if hasattr(self._current_settings, 'agents') and self._current_settings.agents:
+                    agent_config = self._current_settings.agents.get(component_name)
+                    old_value = agent_config.enabled if agent_config else False
             
             return ConfigChange(
                 change_type=change_enum,
                 component_name=component_name,
                 old_value=old_value,
                 new_value=new_config,
-                metadata={"source": "admin_api"}
+                metadata={"source": "api_request"}
             )
             
         except ValueError as e:
@@ -167,14 +262,6 @@ class ConfigManager:
         try:
             logger.info(f"Processing config change: {change.change_type} for {change.component_name}")
             
-            # Apply change to current settings
-            success = await self._apply_setting_change(change)
-            
-            if not success:
-                logger.error(f"Failed to apply setting change: {change}")
-                return
-            
-            # Notify relevant subscribers
             await self._notify_subscribers(change)
             
             logger.info(f"Config change processed successfully: {change.component_name}")
@@ -185,32 +272,31 @@ class ConfigManager:
     async def _apply_setting_change(self, change: ConfigChange) -> bool:
         """Apply change to settings object"""
         try:
-            # Update in-memory settings
             if change.change_type == ConfigChangeType.PROVIDER_ENABLED:
-                if change.component_name in self._current_settings.llm_providers:
+                if hasattr(self._current_settings, 'llm_providers') and change.component_name in self._current_settings.llm_providers:
                     self._current_settings.llm_providers[change.component_name].enabled = True
                     
             elif change.change_type == ConfigChangeType.PROVIDER_DISABLED:
-                if change.component_name in self._current_settings.llm_providers:
+                if hasattr(self._current_settings, 'llm_providers') and change.component_name in self._current_settings.llm_providers:
                     self._current_settings.llm_providers[change.component_name].enabled = False
                     
             elif change.change_type == ConfigChangeType.TOOL_ENABLED:
-                if change.component_name in self._current_settings.tools:
-                    self._current_settings.tools[change.component_name]["enabled"] = True
+                # Tool settings được handle qua environment variables
+                # Có thể implement dynamic tool settings nếu cần
+                pass
                     
             elif change.change_type == ConfigChangeType.TOOL_DISABLED:
-                if change.component_name in self._current_settings.tools:
-                    self._current_settings.tools[change.component_name]["enabled"] = False
+                # Tool settings được handle qua environment variables
+                pass
                     
             elif change.change_type == ConfigChangeType.AGENT_ENABLED:
-                if change.component_name in self._current_settings.agents:
+                if hasattr(self._current_settings, 'agents') and change.component_name in self._current_settings.agents:
                     self._current_settings.agents[change.component_name].enabled = True
                     
             elif change.change_type == ConfigChangeType.AGENT_DISABLED:
-                if change.component_name in self._current_settings.agents:
+                if hasattr(self._current_settings, 'agents') and change.component_name in self._current_settings.agents:
                     self._current_settings.agents[change.component_name].enabled = False
             
-            # Persist changes to file/database if needed
             await self._persist_settings()
             
             return True
@@ -221,21 +307,19 @@ class ConfigManager:
     
     async def _persist_settings(self):
         """Persist settings to storage"""
-        # In production, this would save to database
-        # For now, just log the change
-        logger.info("Settings persisted (placeholder implementation)")
+        # TODO: Implement settings persistence if needed
+        logger.info("Settings changes applied (in-memory)")
     
     async def _notify_subscribers(self, change: ConfigChange):
         """Notify subscribers about configuration change"""
         
-        # Determine which components need to be notified
         notify_components = []
         
         if change.change_type.name.startswith("PROVIDER_"):
             notify_components.extend(["llm_provider_manager", "workflow"])
             
         elif change.change_type.name.startswith("TOOL_"):
-            notify_components.extend(["tool_service", "workflow"])
+            notify_components.extend(["tool_manager", "workflow"])
             
         elif change.change_type.name.startswith("AGENT_"):
             notify_components.extend(["agent_orchestrator", "workflow"])
@@ -243,7 +327,6 @@ class ConfigManager:
         elif change.change_type.name.startswith("WORKFLOW_"):
             notify_components.append("workflow")
         
-        # Notify all relevant subscribers
         for component in notify_components:
             if component in self._subscribers:
                 for subscriber in self._subscribers[component]:
@@ -257,19 +340,32 @@ class ConfigManager:
         if not self._current_settings:
             self._current_settings = get_settings()
         
-        return {
-            "providers": {
+        config = {}
+        
+        # Providers
+        if hasattr(self._current_settings, 'llm_providers') and self._current_settings.llm_providers:
+            config["providers"] = {
                 name: {
                     "enabled": config.enabled,
                     "models": config.models,
                     "default_model": config.default_model
                 }
                 for name, config in self._current_settings.llm_providers.items()
-            },
-            "tools": {
-                name: config for name, config in self._current_settings.tools.items()
-            },
-            "agents": {
+            }
+        
+        # Tools (from tool manager)
+        tools_summary = tool_manager.get_tools_summary()
+        enabled_tools = tool_manager.get_enabled_tools()
+        config["tools"] = {
+            "enabled_tools": enabled_tools,
+            "total_tools": tools_summary.get("total_tools", 0),
+            "system_tools": tools_summary.get("system_tools", 0),
+            "agent_tools": tools_summary.get("agent_tools", 0)
+        }
+        
+        # Agents
+        if hasattr(self._current_settings, 'agents') and self._current_settings.agents:
+            config["agents"] = {
                 name: {
                     "enabled": config.enabled,
                     "domain": config.domain,
@@ -277,16 +373,23 @@ class ConfigManager:
                     "model": config.model
                 }
                 for name, config in self._current_settings.agents.items()
-            },
-            "workflow": {
+            }
+        
+        # Workflow
+        if hasattr(self._current_settings, 'workflow') and self._current_settings.workflow:
+            config["workflow"] = {
                 "max_iterations": self._current_settings.workflow.max_iterations,
                 "timeout_seconds": self._current_settings.workflow.timeout_seconds,
                 "enable_reflection": self._current_settings.workflow.enable_reflection,
                 "enable_semantic_routing": self._current_settings.workflow.enable_semantic_routing,
                 "checkpointer_type": self._current_settings.workflow.checkpointer_type
-            },
-            "orchestrator": self._current_settings.orchestrator
-        }
+            }
+        
+        # Orchestrator
+        if hasattr(self._current_settings, 'orchestrator') and self._current_settings.orchestrator:
+            config["orchestrator"] = self._current_settings.orchestrator
+        
+        return config
     
     async def stop_monitoring(self):
         """Stop configuration monitoring"""

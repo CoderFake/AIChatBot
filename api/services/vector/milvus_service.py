@@ -14,18 +14,14 @@ from utils.logging import get_logger
 from core.exceptions import VectorDatabaseError
 from services.types import IndexType
 from services.dataclasses.milvus import ChunkingConfig, SearchResult
+from utils.file_utils import unstructured_processor
+from common.types import Department
+
 logger = get_logger(__name__)
 
 
 class OptimizedMilvusService:
-    """
-    Milvus service tối ưu cho Agentic RAG
-    - Collection riêng cho từng agent/domain
-    - Chunking tự động theo file size
-    - BM25 + Vector hybrid search
-    - Reindexing tự động
-    """
-    
+
     def __init__(self):
         self.settings = get_settings()
         self.embedding_model = None
@@ -45,13 +41,10 @@ class OptimizedMilvusService:
                 password=self.settings.vector_db.password
             )
             
-            # Initialize embedding model
             await self._initialize_embedding_model()
-            
-            # Create/load collections cho từng agent
+
             await self._initialize_collections()
             
-            # Setup reindexing scheduler
             asyncio.create_task(self._reindexing_scheduler())
             
             self._initialized = True
@@ -119,20 +112,16 @@ class OptimizedMilvusService:
     async def _create_or_load_collection(self, name: str, config: Dict[str, Any]) -> Collection:
         """Create hoặc load existing collection"""
         
-        # Check if collection exists
         if utility.has_collection(name):
             collection = Collection(name)
             await self._ensure_collection_indexed(collection, config)
             return collection
         
-        # Create new collection
         schema = self._create_collection_schema()
         collection = Collection(name=name, schema=schema, description=config["description"])
         
-        # Create index
         await self._create_collection_index(collection, config)
         
-        # Load collection
         collection.load()
         
         return collection
@@ -144,19 +133,17 @@ class OptimizedMilvusService:
             FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=100),
             FieldSchema(name="chunk_index", dtype=DataType.INT64),
             FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=10000),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),  # BAAI/bge-m3
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),  
             
-            # Metadata fields
             FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=500),
             FieldSchema(name="author", dtype=DataType.VARCHAR, max_length=200),
             FieldSchema(name="department", dtype=DataType.VARCHAR, max_length=100),
             FieldSchema(name="access_level", dtype=DataType.VARCHAR, max_length=50),
             FieldSchema(name="file_type", dtype=DataType.VARCHAR, max_length=20),
             FieldSchema(name="file_size", dtype=DataType.INT64),
-            FieldSchema(name="created_at", dtype=DataType.INT64),  # Unix timestamp
+            FieldSchema(name="created_at", dtype=DataType.INT64), 
             FieldSchema(name="updated_at", dtype=DataType.INT64),
-            
-            # Search optimization fields
+        
             FieldSchema(name="language", dtype=DataType.VARCHAR, max_length=10),
             FieldSchema(name="keywords", dtype=DataType.VARCHAR, max_length=1000),
             FieldSchema(name="bm25_score", dtype=DataType.FLOAT),
@@ -175,10 +162,7 @@ class OptimizedMilvusService:
             "params": config["index_params"]
         }
         
-        # Vector index
         collection.create_index(field_name="embedding", index_params=index_params)
-        
-        # Scalar indexes cho filtering
         collection.create_index(field_name="document_id")
         collection.create_index(field_name="department")
         collection.create_index(field_name="access_level")
@@ -189,13 +173,158 @@ class OptimizedMilvusService:
         """Ensure collection có proper indexes"""
         indexes = collection.indexes
         
-        # Check if embedding field has index
         has_vector_index = any(idx.field_name == "embedding" for idx in indexes)
         
         if not has_vector_index:
             logger.info(f"Creating missing index for collection {collection.name}")
             await self._create_collection_index(collection, config)
     
+    async def add_document_with_department(
+        self,
+        file_content: bytes,
+        filename: str,
+        department: Department,
+        document_id: str,
+        metadata: Dict[str, Any],
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Add document sử dụng Department mapping và Unstructured processing
+        
+        Args:
+            file_content: Raw file content
+            filename: Original filename
+            department: Department enum để xác định collection
+            document_id: Unique document identifier
+            metadata: Additional metadata
+            **kwargs: Additional parameters cho Unstructured
+            
+        Returns:
+            Processing result dictionary
+        """
+        if not self._initialized:
+            await self.initialize()
+        
+        try:
+            processing_result = await unstructured_processor.process_document_for_milvus(
+                file_content=file_content,
+                filename=filename,
+                department=department,
+                metadata=metadata,
+                **kwargs
+            )
+            
+            if not processing_result["success"]:
+                return processing_result
+            
+            collection_name = processing_result["collection_name"]
+            
+            if collection_name not in self.collections:
+                raise VectorDatabaseError(f"Collection {collection_name} not found")
+            
+            collection = self.collections[collection_name]
+            chunks = processing_result["chunks"]
+            enhanced_metadata = processing_result["metadata"]
+            
+            chunk_texts = [chunk["content"] for chunk in chunks]
+            embeddings = await self._generate_embeddings(chunk_texts)
+            
+            entities = self._prepare_entities_from_unstructured(
+                document_id=document_id,
+                chunks=chunks,
+                embeddings=embeddings,
+                metadata=enhanced_metadata,
+                filename=filename
+            )
+            
+            insert_result = collection.insert(entities)
+            collection.flush()
+            
+            await self._schedule_reindex_if_needed(collection_name)
+            
+            result = {
+                **processing_result,
+                "milvus_insert_ids": insert_result.primary_keys,
+                "collection": collection_name,
+                "document_id": document_id,
+                "insertion_status": "success"
+            }
+            
+            logger.info(
+                f"Document {filename} successfully added to {collection_name}: "
+                f"{len(chunks)} chunks, avg_size={result['processing_stats']['avg_chunk_size']}"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to add document {filename} to department {department.value}: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "filename": filename,
+                "department": department.value,
+                "document_id": document_id
+            }
+    
+    def _prepare_entities_from_unstructured(
+        self,
+        document_id: str,
+        chunks: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+        metadata: Dict[str, Any],
+        filename: str
+    ) -> List[List]:
+        """Prepare entities từ Unstructured processed chunks"""
+        
+        timestamp = int(datetime.now().timestamp())
+        
+        entities = [
+            [],  # id
+            [],  # document_id
+            [],  # chunk_index
+            [],  # content
+            [],  # embedding
+            [],  # title
+            [],  # author
+            [],  # department
+            [],  # access_level
+            [],  # file_type
+            [],  # file_size
+            [],  # created_at
+            [],  # updated_at
+            [],  # language
+            [],  # keywords
+            []   # bm25_score
+        ]
+        
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            chunk_id = f"{document_id}_{chunk['chunk_index']}"
+            
+            # Extract chunk metadata
+            chunk_metadata = chunk.get("metadata", {})
+            
+            entities[0].append(chunk_id)
+            entities[1].append(document_id)
+            entities[2].append(chunk["chunk_index"])
+            entities[3].append(chunk["content"])
+            entities[4].append(embedding)
+            entities[5].append(metadata.get("title", filename))
+            entities[6].append(metadata.get("author", ""))
+            entities[7].append(metadata.get("department", ""))
+            entities[8].append(metadata.get("access_level", "public"))
+            entities[9].append(metadata.get("file_type", "unknown"))
+            entities[10].append(metadata.get("file_size", 0))
+            entities[11].append(timestamp)
+            entities[12].append(timestamp)
+            entities[13].append(metadata.get("language", "vi"))
+            
+            keywords = " ".join(chunk["content"].split()[:20])
+            entities[14].append(keywords)
+            entities[15].append(0.0)  
+        
+        return entities
+
     async def add_document(
         self,
         collection_name: str,
@@ -205,64 +334,31 @@ class OptimizedMilvusService:
         metadata: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Add document to collection với optimal chunking
-        
-        Args:
-            collection_name: Target collection
-            document_id: Unique document ID
-            file_content: Raw file content
-            filename: Original filename
-            metadata: Document metadata
-            
-        Returns:
-            Processing result
+        Legacy method - redirect to new add_document_with_department
+        Deprecated: Use add_document_with_department instead
         """
-        if not self._initialized:
-            await self.initialize()
+        department_mapping = {
+            "hr_documents": Department.HR,
+            "it_documents": Department.IT,
+            "finance_documents": Department.FINANCE,
+            "general_documents": Department.GENERAL
+        }
         
-        if collection_name not in self.collections:
-            raise VectorDatabaseError(f"Collection {collection_name} not found")
+        department = department_mapping.get(collection_name, Department.GENERAL)
         
-        try:
-            collection = self.collections[collection_name]
-            
-            # Extract text from file
-            text_content = await self._extract_text_from_file(file_content, filename)
-            
-            # Calculate optimal chunking config
-            chunking_config = self._calculate_chunking_config(len(file_content), len(text_content))
-            
-            # Create chunks
-            chunks = await self._create_optimized_chunks(text_content, chunking_config, metadata)
-            
-            # Generate embeddings
-            embeddings = await self._generate_embeddings([chunk["content"] for chunk in chunks])
-            
-            # Prepare data for insertion
-            entities = self._prepare_entities(document_id, chunks, embeddings, metadata, filename)
-            
-            # Insert into collection
-            insert_result = collection.insert(entities)
-            
-            # Flush to ensure data is written
-            collection.flush()
-            
-            # Schedule reindexing if needed
-            await self._schedule_reindex_if_needed(collection_name)
-            
-            return {
-                "document_id": document_id,
-                "collection": collection_name,
-                "chunks_created": len(chunks),
-                "chunking_config": chunking_config.__dict__,
-                "insert_ids": insert_result.primary_keys,
-                "status": "success"
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to add document {document_id}: {e}")
-            raise VectorDatabaseError(f"Document insertion failed: {e}")
-    
+        logger.warning(
+            f"Using deprecated add_document method. "
+            f"Consider using add_document_with_department with department={department.value}"
+        )
+        
+        return await self.add_document_with_department(
+            file_content=file_content,
+            filename=filename,
+            department=department,
+            document_id=document_id,
+            metadata=metadata
+        )
+
     async def search(
         self,
         query: str,
@@ -315,16 +411,12 @@ class OptimizedMilvusService:
     ) -> List[SearchResult]:
         """Hybrid search combining BM25 and vector search"""
         
-        # Vector search
         vector_results = await self._vector_search(collection, query, top_k * 2, threshold, filters)
         
-        # BM25 search (simplified implementation)
         bm25_results = await self._bm25_search(collection, query, top_k * 2, filters)
         
-        # Combine and rerank results
         combined_results = self._combine_search_results(vector_results, bm25_results, query)
         
-        # Return top-k results
         return combined_results[:top_k]
     
     async def _vector_search(
@@ -337,19 +429,15 @@ class OptimizedMilvusService:
     ) -> List[SearchResult]:
         """Pure vector search"""
         
-        # Generate query embedding
         query_embedding = await self._generate_embeddings([query])
         
-        # Build search expression
         search_expr = self._build_search_expression(filters)
         
-        # Search parameters
         search_params = {
             "metric_type": "COSINE",
             "params": {"ef": min(top_k * 4, 200)}
         }
         
-        # Execute search
         results = collection.search(
             data=query_embedding,
             anns_field="embedding",
@@ -359,7 +447,6 @@ class OptimizedMilvusService:
             output_fields=["id", "document_id", "chunk_index", "content", "title", "author", "department"]
         )
         
-        # Process results
         search_results = []
         for hits in results:
             for hit in hits:
@@ -388,24 +475,20 @@ class OptimizedMilvusService:
     ) -> List[SearchResult]:
         """BM25 keyword search implementation"""
         
-        # Simple BM25 implementation using content matching
         query_terms = query.lower().split()
         
-        # Build search expression for content matching
         content_expr_parts = []
         for term in query_terms:
             content_expr_parts.append(f'content like "%{term}%"')
         
         content_expr = " or ".join(content_expr_parts)
         
-        # Combine with other filters
         search_expr = self._build_search_expression(filters)
         if search_expr and content_expr:
             search_expr = f"({search_expr}) and ({content_expr})"
         elif content_expr:
             search_expr = content_expr
         
-        # Query collection
         try:
             results = collection.query(
                 expr=search_expr or "",
@@ -413,7 +496,6 @@ class OptimizedMilvusService:
                 limit=top_k
             )
             
-            # Calculate BM25 scores
             bm25_results = []
             for result in results:
                 score = self._calculate_bm25_score(result["content"], query_terms)
@@ -431,7 +513,6 @@ class OptimizedMilvusService:
                     chunk_index=result["chunk_index"]
                 ))
             
-            # Sort by BM25 score
             bm25_results.sort(key=lambda x: x.score, reverse=True)
             return bm25_results
             
@@ -447,10 +528,8 @@ class OptimizedMilvusService:
     ) -> List[SearchResult]:
         """Combine và rerank vector và BM25 results"""
         
-        # Create result map
         result_map = {}
         
-        # Add vector results với weight
         for result in vector_results:
             result_map[result.id] = {
                 "result": result,
@@ -458,7 +537,6 @@ class OptimizedMilvusService:
                 "bm25_score": 0.0
             }
         
-        # Add BM25 results
         for result in bm25_results:
             if result.id in result_map:
                 result_map[result.id]["bm25_score"] = result.score
@@ -469,17 +547,13 @@ class OptimizedMilvusService:
                     "bm25_score": result.score
                 }
         
-        # Calculate combined scores
         combined_results = []
         for entry in result_map.values():
-            # Hybrid scoring: 70% vector, 30% BM25
             combined_score = (entry["vector_score"] * 0.7) + (entry["bm25_score"] * 0.3)
             
-            # Update result score
             entry["result"].score = combined_score
             combined_results.append(entry["result"])
         
-        # Sort by combined score
         combined_results.sort(key=lambda x: x.score, reverse=True)
         return combined_results
     
@@ -491,24 +565,20 @@ class OptimizedMilvusService:
         if not content_terms:
             return 0.0
         
-        # BM25 parameters
         k1 = 1.5
         b = 0.75
-        avgdl = 100  # Average document length estimate
+        avgdl = 100  
         
         score = 0.0
         doc_len = len(content_terms)
         
         for term in query_terms:
-            # Term frequency
             tf = content_terms.count(term)
             if tf == 0:
                 continue
             
-            # IDF estimate (simplified)
-            idf = math.log(1000 / (1 + tf))  # Assume corpus size of 1000
+            idf = math.log(1000 / (1 + tf)) 
             
-            # BM25 formula
             score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avgdl)))
         
         return score
@@ -539,82 +609,25 @@ class OptimizedMilvusService:
         return " and ".join(expr_parts)
     
     async def _extract_text_from_file(self, file_content: bytes, filename: str) -> str:
-        """Extract text từ file content"""
-        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        """
+        DEPRECATED: Use UnstructuredFileProcessor instead
+        Legacy method kept for compatibility
+        """
+        logger.warning("Using deprecated _extract_text_from_file. Use UnstructuredFileProcessor instead.")
         
         try:
-            if file_ext == 'txt':
-                return file_content.decode('utf-8', errors='ignore')
-            elif file_ext == 'pdf':
-                return await self._extract_pdf_text(file_content)
-            elif file_ext in ['docx', 'doc']:
-                return await self._extract_docx_text(file_content)
-            elif file_ext == 'md':
-                return file_content.decode('utf-8', errors='ignore')
-            else:
-                logger.warning(f"Unsupported file type: {file_ext}")
-                return file_content.decode('utf-8', errors='ignore')
-                
+            return await unstructured_processor._fallback_text_extraction(file_content, filename)
         except Exception as e:
-            logger.error(f"Text extraction failed for {filename}: {e}")
-            return ""
-    
-    async def _extract_pdf_text(self, file_content: bytes) -> str:
-        """Extract text từ PDF"""
-        try:
-            import PyPDF2
-            import io
-            
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            return text.strip()
-        except Exception as e:
-            logger.error(f"PDF extraction failed: {e}")
-            return ""
-    
-    async def _extract_docx_text(self, file_content: bytes) -> str:
-        """Extract text từ DOCX"""
-        try:
-            import docx
-            import io
-            
-            doc = docx.Document(io.BytesIO(file_content))
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            return text.strip()
-        except Exception as e:
-            logger.error(f"DOCX extraction failed: {e}")
+            logger.error(f"Legacy text extraction failed for {filename}: {e}")
             return ""
     
     def _calculate_chunking_config(self, file_size: int, text_length: int) -> ChunkingConfig:
-        """Calculate optimal chunking config dựa trên file size"""
-        
-        config = ChunkingConfig()
-        
-        # Adjust chunk size based on file size
-        if file_size < 50 * 1024:  # < 50KB
-            config.size_multiplier = 0.5
-        elif file_size < 500 * 1024:  # < 500KB
-            config.size_multiplier = 1.0
-        elif file_size < 5 * 1024 * 1024:  # < 5MB
-            config.size_multiplier = 1.5
-        else:  # >= 5MB
-            config.size_multiplier = 2.0
-        
-        # Calculate final sizes
-        config.base_chunk_size = int(config.base_chunk_size * config.size_multiplier)
-        config.base_overlap = int(config.base_overlap * config.size_multiplier)
-        
-        # Ensure within bounds
-        config.base_chunk_size = max(config.min_chunk_size, 
-                                   min(config.max_chunk_size, config.base_chunk_size))
-        config.base_overlap = min(config.base_chunk_size // 4, config.base_overlap)
-        
-        logger.info(f"Chunking config: size={config.base_chunk_size}, overlap={config.base_overlap}")
-        return config
+        """
+        DEPRECATED: Use UnstructuredFileProcessor.calculate_chunking_config instead
+        Legacy method kept for compatibility
+        """
+        logger.warning("Using deprecated _calculate_chunking_config. Use UnstructuredFileProcessor instead.")
+        return unstructured_processor.calculate_chunking_config(file_size, text_length)
     
     async def _create_optimized_chunks(
         self,
@@ -622,53 +635,12 @@ class OptimizedMilvusService:
         config: ChunkingConfig,
         metadata: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Create optimized chunks từ text"""
-        
-        chunks = []
-        
-        # Simple sentence-aware chunking
-        sentences = text.split('. ')
-        current_chunk = ""
-        chunk_index = 0
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            
-            # Check if adding sentence exceeds chunk size
-            potential_chunk = current_chunk + sentence + ". "
-            
-            if len(potential_chunk) <= config.base_chunk_size:
-                current_chunk = potential_chunk
-            else:
-                # Save current chunk if it's not empty
-                if current_chunk.strip():
-                    chunks.append({
-                        "content": current_chunk.strip(),
-                        "chunk_index": chunk_index,
-                        "metadata": metadata.copy()
-                    })
-                    chunk_index += 1
-                
-                # Start new chunk với overlap
-                if config.base_overlap > 0 and current_chunk:
-                    # Take last part for overlap
-                    overlap_text = current_chunk[-config.base_overlap:]
-                    current_chunk = overlap_text + sentence + ". "
-                else:
-                    current_chunk = sentence + ". "
-        
-        # Add final chunk
-        if current_chunk.strip():
-            chunks.append({
-                "content": current_chunk.strip(),
-                "chunk_index": chunk_index,
-                "metadata": metadata.copy()
-            })
-        
-        logger.info(f"Created {len(chunks)} chunks from text")
-        return chunks
+        """
+        DEPRECATED: Use UnstructuredFileProcessor.create_smart_chunks instead
+        Legacy method kept for compatibility
+        """
+        logger.warning("Using deprecated _create_optimized_chunks. Use UnstructuredFileProcessor instead.")
+        return unstructured_processor._create_text_chunks(text, config)
     
     async def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings sử dụng BAAI/bge-m3"""
@@ -690,50 +662,12 @@ class OptimizedMilvusService:
         metadata: Dict[str, Any],
         filename: str
     ) -> List[List]:
-        """Prepare entities cho Milvus insertion"""
-        
-        timestamp = int(datetime.now().timestamp())
-        
-        entities = [
-            [],  # id
-            [],  # document_id
-            [],  # chunk_index
-            [],  # content
-            [],  # embedding
-            [],  # title
-            [],  # author
-            [],  # department
-            [],  # access_level
-            [],  # file_type
-            [],  # file_size
-            [],  # created_at
-            [],  # updated_at
-            [],  # language
-            [],  # keywords
-            []   # bm25_score
-        ]
-        
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            chunk_id = f"{document_id}_{i}"
-            
-            entities[0].append(chunk_id)
-            entities[1].append(document_id)
-            entities[2].append(chunk["chunk_index"])
-            entities[3].append(chunk["content"])
-            entities[4].append(embedding)
-            entities[5].append(metadata.get("title", filename))
-            entities[6].append(metadata.get("author", ""))
-            entities[7].append(metadata.get("department", ""))
-            entities[8].append(metadata.get("access_level", "public"))
-            entities[9].append(filename.split('.')[-1] if '.' in filename else "unknown")
-            entities[10].append(metadata.get("file_size", 0))
-            entities[11].append(timestamp)
-            entities[12].append(timestamp)
-            entities[13].append(metadata.get("language", "vi"))
-            entities[14].append(" ".join(chunk["content"].split()[:20]))  # First 20 words as keywords
-            entities[15].append(0.0)  # BM25 score placeholder
-        
-        return entities
+        """
+        DEPRECATED: Use _prepare_entities_from_unstructured instead
+        Legacy method kept for compatibility
+        """
+        logger.warning("Using deprecated _prepare_entities. Use _prepare_entities_from_unstructured instead.")
+        return self._prepare_entities_from_unstructured(document_id, chunks, embeddings, metadata, filename)
     
     async def delete_document(self, collection_name: str, document_id: str) -> bool:
         """Delete document từ collection"""
@@ -743,14 +677,11 @@ class OptimizedMilvusService:
         try:
             collection = self.collections[collection_name]
             
-            # Delete by document_id
             expr = f'document_id == "{document_id}"'
             collection.delete(expr)
             
-            # Flush changes
             collection.flush()
             
-            # Schedule reindexing
             await self._schedule_reindex_if_needed(collection_name)
             
             logger.info(f"Document {document_id} deleted from {collection_name}")
@@ -764,11 +695,9 @@ class OptimizedMilvusService:
         """Schedule reindexing nếu cần thiết"""
         collection = self.collections[collection_name]
         
-        # Get collection stats
         stats = collection.get_stats()
         row_count = stats.get("row_count", 0)
         
-        # Reindex nếu có > 10000 documents hoặc sau delete operations
         if row_count > 10000:
             asyncio.create_task(self._reindex_collection(collection_name))
     
@@ -780,16 +709,12 @@ class OptimizedMilvusService:
             
             logger.info(f"Starting reindex for collection {collection_name}")
             
-            # Release collection
             collection.release()
             
-            # Drop old index
             collection.drop_index("embedding")
             
-            # Recreate index với optimized parameters
             await self._create_collection_index(collection, config)
             
-            # Reload collection
             collection.load()
             
             logger.info(f"Reindex completed for collection {collection_name}")
@@ -801,10 +726,8 @@ class OptimizedMilvusService:
         """Background scheduler cho reindexing"""
         while True:
             try:
-                # Check mỗi 6 giờ
                 await asyncio.sleep(6 * 3600)
                 
-                # Check từng collection
                 for collection_name in self.collections:
                     await self._check_and_reindex(collection_name)
                     
@@ -817,14 +740,11 @@ class OptimizedMilvusService:
             collection = self.collections[collection_name]
             stats = collection.get_stats()
             
-            # Metrics để quyết định reindex
             row_count = stats.get("row_count", 0)
-            # Có thể thêm metrics khác như query performance, fragmentation, etc.
             
-            # Reindex conditions
             needs_reindex = (
-                row_count > 50000 or  # Large collection
-                False  # Add other conditions
+                row_count > 50000 or  
+                False 
             )
             
             if needs_reindex:
@@ -839,10 +759,8 @@ class OptimizedMilvusService:
             if not self._initialized:
                 return False
             
-            # Check connection
             connections.get_connection_addr("default")
             
-            # Check collections
             for collection_name, collection in self.collections.items():
                 if not utility.has_collection(collection_name):
                     return False
@@ -871,5 +789,5 @@ class OptimizedMilvusService:
         
         return stats
 
-# Global instance
+
 milvus_service = OptimizedMilvusService()

@@ -57,21 +57,6 @@ class SoftDeleteMixin:
         self.deleted_by = None
 
 
-class TenantMixin:
-    """
-    Mixin để thêm multi-tenant support
-    """
-    
-    @declared_attr
-    def tenant_id(cls):
-        return Column(
-            String(36),
-            nullable=False,
-            index=True,
-            comment="Tenant ID cho multi-tenant isolation"
-        )
-
-
 class AuditMixin:
     """
     Mixin để thêm audit trail fields
@@ -95,7 +80,7 @@ class AuditMixin:
     )
 
 
-class BaseModel(Base, TimestampMixin, SoftDeleteMixin, TenantMixin, AuditMixin):
+class BaseModel(Base, TimestampMixin, SoftDeleteMixin, AuditMixin):
     """
     Base model class cho tất cả database models
     Kết hợp tất cả mixins cần thiết
@@ -128,7 +113,7 @@ class BaseModel(Base, TimestampMixin, SoftDeleteMixin, TenantMixin, AuditMixin):
         Update model từ dictionary data
         """
         for key, value in data.items():
-            if hasattr(self, key) and key not in ['id', 'created_at', 'tenant_id']:
+            if hasattr(self, key) and key not in ['id', 'created_at']:
                 setattr(self, key, value)
         
         if user_id:
@@ -271,8 +256,8 @@ class DatabaseModel:
         indexes = [
             Index('idx_created_at', 'created_at'),
             Index('idx_updated_at', 'updated_at'),
-            Index('idx_tenant_active', 'tenant_id', 'is_active'),
-            Index('idx_tenant_deleted', 'tenant_id', 'is_deleted'),
+            Index('idx_is_active', 'is_active'),
+            Index('idx_is_deleted', 'is_deleted'),
         ]
         
         return indexes
@@ -293,6 +278,5 @@ class DatabaseModel:
             "created_by": model_instance.created_by,
             "updated_by": model_instance.updated_by,
             "version": model_instance.version,
-            "tenant_id": model_instance.tenant_id,
             "is_deleted": model_instance.is_deleted
         }
