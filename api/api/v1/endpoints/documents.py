@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
 from typing import Optional
 import asyncio
-from datetime import datetime
 
-from schemas.document_schemas import (
-    DocumentMetadata, DocumentResponse, DocumentSearchRequest, DocumentSearchResponse,
+from models import DocumentMetadata
+from models.schemas import (
+    DocumentResponse, DocumentSearchRequest, DocumentSearchResponse,
     DocumentStatusResponse, DocumentListResponse, DocumentStatsResponse,
     DocumentDeleteResponse, DocumentReprocessResponse
 )
@@ -38,7 +38,6 @@ async def upload_document(
         # Parse tags
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
         
-        # Create metadata
         metadata = DocumentMetadata(
             title=title or file.filename,
             author=author,

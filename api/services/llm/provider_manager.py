@@ -5,22 +5,13 @@ Configuration-driven provider management
 
 from typing import Dict, List, Any, Optional
 from abc import ABC, abstractmethod
-import asyncio
-from dataclasses import dataclass
 
+from services.dataclasses.llm import LLMResponse
 from config.settings import get_settings, LLMProviderConfig
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-@dataclass
-class LLMResponse:
-    """Standard LLM response wrapper"""
-    content: str
-    model: str
-    provider: str
-    usage: Dict[str, Any] = None
-    metadata: Dict[str, Any] = None
 
 class BaseLLMProvider(ABC):
     """Base class for LLM providers"""

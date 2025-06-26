@@ -1,5 +1,6 @@
+from api.api.v1.endpoints import config
 from fastapi import APIRouter
-from api.v1.endpoints import health, query, documents, admin
+from api.v1.endpoints import health, documents, admin
 
 api_router = APIRouter()
 
@@ -8,12 +9,6 @@ api_router.include_router(
     health.router, 
     prefix="/health", 
     tags=["Health"]
-)
-
-api_router.include_router(
-    query.router, 
-    prefix="/query", 
-    tags=["RAG Query"]
 )
 
 api_router.include_router(
