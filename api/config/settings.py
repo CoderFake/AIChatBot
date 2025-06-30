@@ -60,10 +60,10 @@ class AgentConfig(BaseModel):
     capabilities: List[str] = Field(default_factory=list)
     tools: List[str] = Field(default_factory=list)
     model: str = Field(default="gemini-2.0-flash")
-    provider: str = Field(default="gemini")  # Provider riêng cho từng agent
+    provider: str = Field(default="gemini") 
     confidence_threshold: float = Field(default=0.7)
-    temperature: float = Field(default=0.7)  # Temperature setting cho agent
-    max_tokens: int = Field(default=8192)    # Max tokens cho agent
+    temperature: float = Field(default=0.7)
+    max_tokens: int = Field(default=8192)
 
 class WorkflowConfig(BaseModel):
     """Workflow configuration"""
@@ -131,7 +131,7 @@ class Settings(BaseModel):
         ),
         "mistral": LLMProviderConfig(
             name="mistral",
-            enabled=False,  # Default disabled
+            enabled=False,
             config={
                 "api_key": os.getenv("MISTRAL_API_KEY", ""),
                 "timeout": 60,
@@ -170,7 +170,7 @@ class Settings(BaseModel):
             ],
             tools=["document_search", "web_search"],
             model="gemini-2.0-flash",
-            provider="gemini",  # Specific provider cho HR agent
+            provider="gemini", 
             confidence_threshold=0.75
         ),
         "finance_specialist": AgentConfig(
@@ -183,7 +183,7 @@ class Settings(BaseModel):
             ],
             tools=["document_search", "calculation", "web_search"],
             model="llama3.1:8b",
-            provider="ollama",  # Finance agent dùng Ollama
+            provider="ollama",
             confidence_threshold=0.75
         ),
         "it_specialist": AgentConfig(
@@ -196,7 +196,7 @@ class Settings(BaseModel):
             ],
             tools=["document_search", "web_search", "code_generation"],
             model="mistral-large-latest", 
-            provider="mistral",  # IT agent dùng Mistral
+            provider="mistral",
             confidence_threshold=0.70
         ),
         "general_assistant": AgentConfig(
@@ -209,7 +209,7 @@ class Settings(BaseModel):
             ],
             tools=["web_search", "document_search", "translation"],
             model="llama-3.1-405b",
-            provider="meta",  # General agent dùng Meta
+            provider="meta", 
             confidence_threshold=0.60
         )
     })

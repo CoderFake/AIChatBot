@@ -4,7 +4,6 @@ from api.v1.endpoints import health, documents, admin
 
 api_router = APIRouter()
 
-# Core API endpoints
 api_router.include_router(
     health.router, 
     prefix="/health", 

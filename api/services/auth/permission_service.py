@@ -6,7 +6,14 @@ from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import joinedload
 
 from models.database.user import User
-from models.database.permission import Permission, UserPermission, Group, GroupPermission, UserGroupMembership, ToolPermission
+from models.database.permission import (
+    Permission,
+    UserPermission,
+    Group,
+    GroupPermission,
+    UserGroupMembership,
+    ToolPermission
+)
 from models.database.tool import Tool
 from models.database.document import Document
 from models.database.audit_log import AuditLog
@@ -17,6 +24,7 @@ from core.exceptions import PermissionDeniedError, NotFoundError
 
 logger = get_logger(__name__)
 settings = get_settings()
+
 
 class PermissionService:
     """
@@ -60,7 +68,6 @@ class PermissionService:
                 )
                 return False
             
-            # Check specific resource permission
             has_permission = await self._check_resource_permission(
                 user_id, user_permissions, resource_type, resource_id, action, additional_context
             )
@@ -170,10 +177,8 @@ class PermissionService:
         department = user_context.get('department', '').lower()
         role = user_context.get('role', '')
         
-        # Public collections - everyone can access
         accessible_collections.append("general_documents")
         
-        # Department-specific collections
         if "hr_access" in permissions or department == Department.HR.value:
             accessible_collections.append("hr_documents")
             accessible_collections.append("hr_policies")
@@ -186,7 +191,6 @@ class PermissionService:
             accessible_collections.append("it_documents")
             accessible_collections.append("it_procedures")
         
-        # Cross-department access
         if "cross_department_access" in permissions:
             accessible_collections.extend([
                 "hr_documents", "hr_policies",
@@ -244,7 +248,6 @@ class PermissionService:
         user_permissions = user_context.get('permissions', [])
         user_department = user_context.get('department', '')
         
-        # Query tools với permissions từ database
         tools_query = select(Tool).options(
             joinedload(Tool.tool_permissions).joinedload(ToolPermission.permission)
         ).where(
@@ -254,15 +257,12 @@ class PermissionService:
         result = await self.db.execute(tools_query)
         available_tools = result.scalars().all()
         
-        # Group tools by category
         user_tools = {}
         
         for tool in available_tools:
-            # Check department restriction
             if not tool.is_available_for_department(user_department):
                 continue
             
-            # Check permission requirements
             has_access = False
             required_permissions = []
             
@@ -273,7 +273,6 @@ class PermissionService:
                         has_access = True
                         break
             
-            # Nếu tool không có permission requirements, default allow
             if not required_permissions:
                 has_access = True
             
@@ -283,7 +282,6 @@ class PermissionService:
                 if category not in user_tools:
                     user_tools[category] = []
                 
-                # Tạo tool info với metadata từ database
                 tool_info = {
                     "id": str(tool.id),
                     "name": tool.name,
@@ -322,7 +320,6 @@ class PermissionService:
         user_permissions = user_context.get('permissions', [])
         user_department = user_context.get('department', '')
         
-        # Get tool từ database
         tool_query = select(Tool).options(
             joinedload(Tool.tool_permissions).joinedload(ToolPermission.permission)
         ).where(
@@ -337,12 +334,10 @@ class PermissionService:
             await self._log_tool_access(user_id, tool_name, False, "Tool not found or disabled")
             return False
         
-        # Check department restriction
         if not tool.is_available_for_department(user_department):
             await self._log_tool_access(user_id, tool_name, False, f"Tool not available for department: {user_department}")
             return False
         
-        # Check permission requirements
         required_permissions = []
         has_permission = False
         
@@ -353,7 +348,6 @@ class PermissionService:
                     has_permission = True
                     break
         
-        # Nếu tool không có permission requirements, default allow
         if not required_permissions:
             has_permission = True
         
@@ -387,7 +381,6 @@ class PermissionService:
         if not user_context:
             return False
         
-        # Get document
         doc_query = select(Document).where(Document.id == document_id)
         result = await self.db.execute(doc_query)
         document = result.scalar_one_or_none()
@@ -395,7 +388,6 @@ class PermissionService:
         if not document:
             return False
         
-        # Convert document to dict format
         doc_dict = {
             "id": str(document.id),
             "title": document.title,
@@ -420,7 +412,6 @@ class PermissionService:
             bool: True nếu thành công
         """
         try:
-            # Get group
             group_query = select(Group).where(Group.group_name == group_name)
             result = await self.db.execute(group_query)
             group = result.scalar_one_or_none()
@@ -428,7 +419,6 @@ class PermissionService:
             if not group:
                 raise NotFoundError(f"Group {group_name} not found")
             
-            # Check if already member
             existing_query = select(UserGroupMembership).where(
                 UserGroupMembership.user_id == user_id,
                 UserGroupMembership.group_id == str(group.id)
@@ -436,9 +426,8 @@ class PermissionService:
             existing = await self.db.execute(existing_query)
             
             if existing.scalar_one_or_none():
-                return True  # Already member
+                return True
             
-            # Add membership
             membership = UserGroupMembership(
                 user_id=user_id,
                 group_id=str(group.id),
@@ -449,7 +438,6 @@ class PermissionService:
             self.db.add(membership)
             await self.db.commit()
             
-            # Clear cache
             self._clear_user_cache(user_id)
             
             logger.info(f"Added user {user_id} to group {group_name}")
@@ -465,7 +453,6 @@ class PermissionService:
         Xóa user khỏi group
         """
         try:
-            # Get group
             group_query = select(Group).where(Group.group_name == group_name)
             result = await self.db.execute(group_query)
             group = result.scalar_one_or_none()
@@ -473,7 +460,6 @@ class PermissionService:
             if not group:
                 return False
             
-            # Remove membership
             membership_query = select(UserGroupMembership).where(
                 UserGroupMembership.user_id == user_id,
                 UserGroupMembership.group_id == str(group.id)
@@ -485,7 +471,6 @@ class PermissionService:
                 await self.db.delete(membership)
                 await self.db.commit()
                 
-                # Clear cache
                 self._clear_user_cache(user_id)
                 
                 logger.info(f"Removed user {user_id} from group {group_name}")
@@ -497,7 +482,6 @@ class PermissionService:
             logger.error(f"Failed to remove user from group: {e}")
             return False
     
-    # Private helper methods
     
     async def _check_resource_permission(
         self,
@@ -542,17 +526,14 @@ class PermissionService:
         role = user_context.get('role', '')
         user_id = user_context.get('user_id', '')
         
-        # Check if user is owner
         if doc.get('uploaded_by') == user_id:
             return True
         
-        # Check access level permissions
         access_level = doc.get('access_level', 'public')
         
         if access_level == "public":
             return "document_read_public" in permissions
         elif access_level == "private":
-            # Private docs only accessible by same department
             if doc.get('department', '').upper() != department.upper():
                 return False
             return "document_read_internal" in permissions
@@ -563,7 +544,6 @@ class PermissionService:
         elif access_level == "restricted":
             return "document_read_restricted" in permissions
         
-        # Check specific required permissions
         required_perms = doc.get('required_permissions', [])
         if required_perms:
             return any(perm in permissions for perm in required_perms)
