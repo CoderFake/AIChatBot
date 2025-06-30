@@ -16,7 +16,7 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 settings = get_settings()
 
-# SQLAlchemy Base Class
+
 class Base(declarative_base()):
     metadata = MetaData(
         naming_convention={

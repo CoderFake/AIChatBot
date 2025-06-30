@@ -39,7 +39,6 @@ class ConfigAuthMiddleware:
             Dict chứa user context và permissions
         """
         try:
-            # Verify OTP first
             if not otp_manager.verify_totp(otp_token):
                 logger.warning(f"Invalid OTP for user {user_id}")
                 raise HTTPException(
@@ -47,7 +46,6 @@ class ConfigAuthMiddleware:
                     detail="Invalid OTP token"
                 )
             
-            # Get user permissions
             permission_service = PermissionService(db)
             user_context = await permission_service.get_user_all_permissions(user_id)
             

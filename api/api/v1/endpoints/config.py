@@ -26,7 +26,6 @@ async def get_system_health() -> HealthResponse:
     Comprehensive system health check - no auth required
     """
     try:
-        # Check provider manager
         llm_health = {}
         try:
             if not llm_provider_manager._initialized:
@@ -36,7 +35,6 @@ async def get_system_health() -> HealthResponse:
             logger.warning(f"LLM health check failed: {e}")
             llm_health = {"error": str(e)}
         
-        # Check tool manager
         tool_health = {}
         try:
             enabled_tools = tool_manager.get_enabled_tools()
@@ -49,7 +47,6 @@ async def get_system_health() -> HealthResponse:
         except Exception as e:
             tool_health = {"status": "error", "error": str(e)}
         
-        # Check config manager
         config_health = {}
         try:
             current_config = await config_manager.get_current_config()
@@ -62,7 +59,6 @@ async def get_system_health() -> HealthResponse:
         except Exception as e:
             config_health = {"status": "error", "error": str(e)}
         
-        # Determine overall status
         component_statuses = [
             all(llm_health.values()) if isinstance(llm_health, dict) and "error" not in llm_health else False,
             tool_health.get("status") == "healthy",
@@ -102,10 +98,8 @@ async def get_system_configuration(
         config_perms = user_context.get('config_permissions', {})
         department = user_context.get('department', '')
         
-        # Get full config
         current_config = await config_manager.get_current_config()
         
-        # Filter config based on permissions
         filtered_config = {}
         
         # Admin sees everything
@@ -260,18 +254,14 @@ async def list_available_tools(
         config_perms = user_context.get('config_permissions', {})
         department = user_context.get('department', '')
         
-        # Get all tools from registry
         all_tools = tool_registry.get_all_tools()
         
-        # Filter tools based on permissions
         accessible_tools = {}
         
         for tool_name, tool_def in all_tools.items():
-            # Admin sees all tools
             if config_perms.get('can_manage_all_tools'):
                 accessible_tools[tool_name] = tool_def
             elif config_perms.get('can_manage_department_tools'):
-                # Check if tool is available for user's department
                 departments_allowed = tool_def.get('departments_allowed')
                 if not departments_allowed or department in departments_allowed:
                     accessible_tools[tool_name] = tool_def
@@ -301,17 +291,14 @@ async def list_available_providers(
     try:
         config_perms = user_context.get('config_permissions', {})
         
-        # Get current config
         current_config = await config_manager.get_current_config()
         providers = current_config.get('providers', {})
         
-        # Filter providers based on permissions
         accessible_providers = {}
         
         if config_perms.get('can_manage_all_providers'):
             accessible_providers = providers
         elif config_perms.get('can_manage_department_providers'):
-            # Department managers can manage all providers
             accessible_providers = providers
         
         return {
@@ -339,18 +326,14 @@ async def reload_system_configuration(
     try:
         logger.info(f"System reload initiated by user {user_context['user_id']}")
         
-        # Reload config manager
         await config_manager.initialize()
         
-        # Reload provider manager
         if llm_provider_manager._initialized:
             llm_provider_manager._initialized = False
             await llm_provider_manager.initialize()
         
-        # Reload tools
         tool_manager.reload_tools()
         
-        # Get updated config
         updated_config = await config_manager.get_current_config()
         
         logger.info("System configuration reloaded successfully")

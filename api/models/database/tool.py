@@ -75,7 +75,6 @@ class Tool(BaseModel):
         comment="Tool hệ thống không thể xóa"
     )
     
-    # Usage restrictions
     usage_limits = Column(
         JSONB,
         nullable=True,
@@ -115,6 +114,12 @@ class Tool(BaseModel):
         cascade="all, delete-orphan"
     )
     
+    agent_tools = relationship(
+        "AgentTool",
+        back_populates="tool",
+        cascade="all, delete-orphan"
+    )
+    
     __table_args__ = (
         Index('idx_tool_category_enabled', 'category', 'is_enabled'),
         Index('idx_tool_enabled', 'is_enabled'),
@@ -126,7 +131,7 @@ class Tool(BaseModel):
             return False
         
         if not self.departments_allowed:
-            return True  # Không giới hạn department
+            return True 
         
         return department.lower() in [dept.lower() for dept in self.departments_allowed]
     
