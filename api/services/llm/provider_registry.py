@@ -3,7 +3,7 @@ from typing import Dict, Any, List
 
 
 class ProviderRegistry:
-    """Registry chứa definitions của default providers"""
+    """Registry of default providers""" 
     
     def __init__(self):
         self._initialized = False

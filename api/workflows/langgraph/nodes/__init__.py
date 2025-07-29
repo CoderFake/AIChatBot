@@ -3,8 +3,8 @@ Workflow nodes - tối ưu hóa
 Gộp các nodes thành core nodes để giảm complexity
 """
 
-from .base_node import BaseWorkflowNode, AnalysisNode
-from .core_nodes import (
+from .base import BaseWorkflowNode, AnalysisNode
+from .nodes import (
     QueryAnalysisNode,
     PermissionNode,
     RetrievalNode,

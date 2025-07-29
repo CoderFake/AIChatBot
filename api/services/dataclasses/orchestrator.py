@@ -5,7 +5,7 @@ from services.types import QueryType, ExecutionStrategy
 
 @dataclass
 class QueryAnalysis:
-    """Kết quả phân tích query ban đầu"""
+    """Result of initial query analysis"""
     refined_query: str
     query_type: QueryType
     language: str
@@ -15,7 +15,7 @@ class QueryAnalysis:
 
 @dataclass
 class TaskDistribution:
-    """Phân phối nhiệm vụ cho agents"""
+    """Distribute tasks to agents"""
     strategy: ExecutionStrategy
     selected_agents: List[str]
     sub_queries: Dict[str, str]
@@ -24,7 +24,7 @@ class TaskDistribution:
 
 @dataclass
 class ToolSelection:
-    """Lựa chọn tools cho execution"""
+    """Select tools for execution"""
     selected_tools: List[str]
     tool_configs: Dict[str, Dict[str, Any]]
     usage_strategy: str
@@ -32,7 +32,7 @@ class ToolSelection:
 
 @dataclass
 class ConflictResolution:
-    """Giải quyết xung đột giữa agents"""
+    """Resolve conflict between agents"""
     winning_response: str
     evidence_ranking: List[Dict[str, Any]]
     conflict_explanation: str

@@ -1,0 +1,1 @@
+# Base state for LangGraph workflows

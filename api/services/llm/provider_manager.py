@@ -1,6 +1,6 @@
 """
-Simplified LLM Provider Manager
-Configuration-driven provider management
+LLM Provider Manager
+Insert or Update into Database if not exist
 """
 
 from typing import Dict, List, Any, Optional
@@ -54,10 +54,8 @@ class GeminiProvider(BaseLLMProvider):
             
             import google.generativeai as genai
             
-            # Configure with first API key
             genai.configure(api_key=self._api_keys[0])
             
-            # Test connection
             test_model = genai.GenerativeModel(self.config.default_model)
             await test_model.generate_content_async("Hello")
             
