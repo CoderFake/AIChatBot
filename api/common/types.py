@@ -6,25 +6,26 @@ from enum import Enum
 
 
 class AccessLevel(Enum):
-    """Enum định nghĩa các cấp độ truy cập tài liệu"""
+    """Enum define access level for document""" 
     PUBLIC = "public"
     PRIVATE = "private"
-    INTERNAL = "internal"
-    CONFIDENTIAL = "confidential"
-    RESTRICTED = "restricted"
 
+
+class DBDocumentPermissionLevel(Enum):
+    PUBLIC = "milvus_public"
+    PRIVATE = "milvus_private"
 
 class UserRole(Enum):
-    """Enum định nghĩa các vai trò người dùng"""
-    EMPLOYEE = "EMPLOYEE"
-    MANAGER = "MANAGER"
-    DIRECTOR = "DIRECTOR"
-    CEO = "CEO"
+    """Enum define user roles"""
+    MAINTAINER = "MAINTAINER"
     ADMIN = "ADMIN"
+    DEPT_ADMIN = "DEPT_ADMIN"
+    DEPT_MANAGER = "DEPT_MANAGER"
+    USER = "USER"
 
 
 class ProcessingStatus(Enum):
-    """Trạng thái xử lý chung"""
+    """Enum define processing status"""
     PENDING = "pending"
     PROCESSING = "processing"
     IN_PROGRESS = "in_progress"
@@ -34,7 +35,7 @@ class ProcessingStatus(Enum):
 
 
 class QueryType(Enum):
-    """Loại query trong hệ thống"""
+    """Enum define query type"""
     RAG_QUERY = "rag_query"
     CHITCHAT = "chitchat"
     ACTION_REQUEST = "action_request"
@@ -42,7 +43,7 @@ class QueryType(Enum):
 
 
 class QueryDomain(Enum):
-    """Domain của query"""
+    """Enum define query domain"""
     HR = "hr"
     IT = "it" 
     FINANCE = "finance"
@@ -51,7 +52,7 @@ class QueryDomain(Enum):
 
 
 class Department(Enum):
-    """Các phòng ban trong công ty"""
+    """Enum define departments"""
     HR = "hr"
     IT = "it"
     FINANCE = "finance"
@@ -60,7 +61,7 @@ class Department(Enum):
 
 
 class Language(Enum):
-    """Ngôn ngữ hỗ trợ"""
+    """Enum define languages""" 
     VIETNAMESE = "vi"
     ENGLISH = "en"
     JAPANESE = "ja"
@@ -68,7 +69,7 @@ class Language(Enum):
 
 
 class FileType(Enum):
-    """Loại file hỗ trợ"""
+    """Enum define file types"""
     PDF = "pdf"
     DOCX = "docx"
     TXT = "txt"

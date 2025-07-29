@@ -27,21 +27,34 @@ class ToolRegistry:
     """
     
     def __init__(self):
-        self._tool_definitions = self._initialize_tool_definitions()
+        self._tool_definitions = {}
+        self._initialized = False
+    
+    def _generate_settings_key(self, tool_name: str) -> str:
+        """Auto-generate settings key from tool name (NO HARDCODE)"""
+        return f"ENABLE_{tool_name.upper().replace('-', '_')}_TOOL"
+    
+    def _ensure_initialized(self):
+        """Lazy initialization to avoid hardcode (NO HARDCODE)"""
+        if not self._initialized:
+            self._tool_definitions = self._initialize_tool_definitions()
+            self._initialized = True
     
     def _initialize_tool_definitions(self) -> Dict[str, Dict[str, Any]]:
         """
-        Khởi tạo định nghĩa của tất cả tools
-        Khi thêm tool mới, chỉ cần thêm vào đây
+        Khởi tạo định nghĩa của tất cả tools (NO HARDCODE settings_key)
+        Khi thêm tool mới, chỉ cần thêm vào đây - settings_key auto-generated
         """
-        return {
+        
+        tools = {
             # WEB TOOLS
             "web_search": {
                 "display_name": "Tìm kiếm Web",
                 "category": ToolCategory.WEB_TOOLS.value,
                 "description": "Tìm kiếm thông tin trên internet sử dụng DuckDuckGo",
                 "implementation_class": "services.tools.tools.web_search_tool",
-                "settings_key": "ENABLE_WEB_SEARCH_TOOL",
+                
+                "default_enabled": True,
                 "tool_config": {
                     "max_results": 5,
                     "region": "vn-vi",
@@ -69,7 +82,8 @@ class ToolRegistry:
                 "category": ToolCategory.DOCUMENT_TOOLS.value,
                 "description": "Tìm kiếm trong cơ sở dữ liệu vector của tài liệu",
                 "implementation_class": "services.tools.tools.document_search_tool",
-                "settings_key": "ENABLE_DOCUMENT_SEARCH_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "default_top_k": 5,
                     "default_threshold": 0.7,
@@ -94,7 +108,8 @@ class ToolRegistry:
                 "category": ToolCategory.DOCUMENT_TOOLS.value,
                 "description": "Tóm tắt nội dung tài liệu theo nhiều định dạng",
                 "implementation_class": "services.tools.tools.document_summarize_tool",
-                "settings_key": "ENABLE_DOCUMENT_SEARCH_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "summary_types": ["brief", "detailed", "bullet_points"],
                     "max_document_length": 50000
@@ -119,7 +134,8 @@ class ToolRegistry:
                 "category": ToolCategory.CALCULATION_TOOLS.value,
                 "description": "Thực hiện các phép tính toán học an toàn",
                 "implementation_class": "services.tools.tools.calculation_tool",
-                "settings_key": "ENABLE_CALCULATION_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "safe_mode": True,
                     "max_precision": 10,
@@ -144,7 +160,8 @@ class ToolRegistry:
                 "category": ToolCategory.CALCULATION_TOOLS.value,
                 "description": "Thực hiện các phép tính thống kê trên dữ liệu",
                 "implementation_class": "services.tools.tools.statistics_tool",
-                "settings_key": "ENABLE_CALCULATION_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "max_data_points": 10000,
                     "supported_operations": ["mean", "median", "std", "var", "min", "max"]
@@ -169,7 +186,8 @@ class ToolRegistry:
                 "category": ToolCategory.UTILITY_TOOLS.value,
                 "description": "Lấy thông tin ngày giờ hiện tại",
                 "implementation_class": "services.tools.tools.datetime_tool",
-                "settings_key": "ENABLE_DATETIME_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "timezone": "Asia/Ho_Chi_Minh",
                     "format_locale": "vi_VN",
@@ -194,7 +212,8 @@ class ToolRegistry:
                 "category": ToolCategory.UTILITY_TOOLS.value,
                 "description": "Lấy thông tin thời tiết theo địa điểm",
                 "implementation_class": "services.tools.tools.weather_tool",
-                "settings_key": "ENABLE_DATETIME_TOOL",
+                
+                "default_enabled": True, 
                 "tool_config": {
                     "default_location": "Ho Chi Minh City",
                     "api_provider": "placeholder",
@@ -221,6 +240,7 @@ class ToolRegistry:
                 "description": "Đọc nội dung file text an toàn",
                 "implementation_class": "services.tools.tools.file_read_tool",
                 "settings_key": "ENABLE_FILE_TOOLS",
+                "default_enabled": True, 
                 "tool_config": {
                     "allowed_extensions": [".txt", ".md", ".json", ".csv"],
                     "max_file_size": 10485760,  # 10MB
@@ -246,6 +266,7 @@ class ToolRegistry:
                 "description": "Parse và format dữ liệu JSON",
                 "implementation_class": "services.tools.tools.json_parse_tool",
                 "settings_key": "ENABLE_FILE_TOOLS",
+                "default_enabled": True, 
                 "tool_config": {
                     "max_json_size": 1048576,  # 1MB
                     "pretty_print": True,
@@ -272,6 +293,7 @@ class ToolRegistry:
                 "description": "Tạo template email theo các định dạng khác nhau",
                 "implementation_class": "services.tools.tools.email_template_tool",
                 "settings_key": "ENABLE_COMMUNICATION_TOOLS",
+                "default_enabled": True, 
                 "tool_config": {
                     "template_types": ["formal", "informal", "meeting", "thank_you"],
                     "localization": "vi_VN",
@@ -291,17 +313,26 @@ class ToolRegistry:
                 "documentation_url": "https://docs.example.com/tools/email-template"
             }
         }
+        
+        for tool_name, tool_def in tools.items():
+            if "settings_key" not in tool_def or tool_def["settings_key"].startswith("ENABLE_"):
+                tools[tool_name]["settings_key"] = self._generate_settings_key(tool_name)
+                
+        return tools
     
     def get_all_tools(self) -> Dict[str, Dict[str, Any]]:
         """Lấy tất cả tool definitions"""
+        self._ensure_initialized()
         return self._tool_definitions.copy()
     
     def get_tool_definition(self, tool_name: str) -> Optional[Dict[str, Any]]:
         """Lấy definition của một tool cụ thể"""
+        self._ensure_initialized()
         return self._tool_definitions.get(tool_name)
     
     def get_tools_by_category(self, category: str) -> Dict[str, Dict[str, Any]]:
         """Lấy tools theo category"""
+        self._ensure_initialized()
         return {
             name: definition for name, definition in self._tool_definitions.items()
             if definition["category"] == category
@@ -309,6 +340,7 @@ class ToolRegistry:
     
     def get_tool_names(self) -> List[str]:
         """Lấy danh sách tên tất cả tools"""
+        self._ensure_initialized()
         return list(self._tool_definitions.keys())
     
     def get_categories(self) -> List[str]:
@@ -356,6 +388,8 @@ class ToolRegistry:
             "category": category,
             "description": description,
             "implementation_class": implementation_class,
+            "settings_key": kwargs.get("settings_key", self._generate_settings_key(name)),  # NO HARDCODE
+            "default_enabled": kwargs.get("default_enabled", True),  # NO HARDCODE DEFAULT
             "tool_config": kwargs.get("tool_config", {}),
             "requirements": kwargs.get("requirements", {
                 "permissions": [],

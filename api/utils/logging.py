@@ -12,7 +12,7 @@ from config.settings import get_settings
 settings = get_settings()
 
 class JsonFormatter(logging.Formatter):
-    """JSON formatter cho structured logging"""
+    """JSON formatter for structured logging""" 
     
     def format(self, record: logging.LogRecord) -> str:
         log_entry = {
@@ -25,7 +25,6 @@ class JsonFormatter(logging.Formatter):
             "line": record.lineno,
         }
         
-        # Thêm extra fields nếu có
         if hasattr(record, 'user_id'):
             log_entry['user_id'] = record.user_id
         if hasattr(record, 'request_id'):
@@ -33,7 +32,6 @@ class JsonFormatter(logging.Formatter):
         if hasattr(record, 'execution_time'):
             log_entry['execution_time'] = record.execution_time
         
-        # Thêm exception info nếu có
         if record.exc_info:
             log_entry['exception'] = self.formatException(record.exc_info)
         
@@ -57,11 +55,7 @@ class ColoredFormatter(logging.Formatter):
         
         color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
         reset = self.COLORS['RESET']
-        
-        # Format timestamp
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Format message
         formatted_message = (
             f"{color}[{timestamp}] {record.levelname:8s}{reset} "
             f"{record.name:20s} | {record.getMessage()}"
@@ -72,18 +66,16 @@ class ColoredFormatter(logging.Formatter):
 def setup_logging() -> None:
     """Setup logging configuration"""
     
-    # Tạo thư mục logs nếu chưa có
-    log_dir = Path("/app/logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    # Root logger
+    import os
+    log_base = os.getenv("LOG_DIR", "./logs")
+    log_dir = Path(log_base)
+    log_dir.mkdir(parents=True, exist_ok=True)
+   
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     
-    # Clear existing handlers
     root_logger.handlers.clear()
     
-    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     
@@ -95,7 +87,6 @@ def setup_logging() -> None:
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
     
-    # File handler cho general logs
     file_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "app.log",
         maxBytes=10 * 1024 * 1024,  # 10MB
@@ -106,7 +97,6 @@ def setup_logging() -> None:
     file_handler.setFormatter(JsonFormatter())
     root_logger.addHandler(file_handler)
     
-    # Error file handler
     error_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "error.log",
         maxBytes=10 * 1024 * 1024,  # 10MB
@@ -117,7 +107,6 @@ def setup_logging() -> None:
     error_handler.setFormatter(JsonFormatter())
     root_logger.addHandler(error_handler)
     
-    # Access log handler
     access_logger = logging.getLogger("access")
     access_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "access.log",
@@ -128,11 +117,7 @@ def setup_logging() -> None:
     access_handler.setFormatter(JsonFormatter())
     access_logger.addHandler(access_handler)
     access_logger.setLevel(logging.INFO)
-    
-    # Disable propagation để tránh duplicate logs
     access_logger.propagate = False
-    
-    # Third-party library loggers
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -143,24 +128,23 @@ def setup_logging() -> None:
         logging.getLogger("multipart").setLevel(logging.WARNING)
 
 def get_logger(name: str) -> logging.Logger:
-    """Get logger instance với tên cụ thể"""
+    """Get logger instance with specific name"""
     
-    # Setup logging nếu chưa được setup
     if not logging.getLogger().handlers:
         setup_logging()
     
     return logging.getLogger(name)
 
 class LoggerMixin:
-    """Mixin class để thêm logging vào classes"""
+    """Mixin class to add logging to classes"""
     
     @property
     def logger(self) -> logging.Logger:
-        """Get logger cho class hiện tại"""
+        """Get logger for current class"""
         return get_logger(self.__class__.__name__)
 
 class RequestLoggerAdapter(logging.LoggerAdapter):
-    """Logger adapter để thêm request context"""
+    """Logger adapter to add request context"""
     
     def __init__(self, logger: logging.Logger, request_id: str, user_id: Optional[str] = None):
         super().__init__(logger, {})
@@ -179,13 +163,12 @@ def get_request_logger(
     request_id: str, 
     user_id: Optional[str] = None
 ) -> RequestLoggerAdapter:
-    """Get logger với request context"""
+    """Get logger with request context"""
     logger = get_logger(name)
     return RequestLoggerAdapter(logger, request_id, user_id)
 
-# Performance logging decorator
 def log_performance(logger_name: Optional[str] = None):
-    """Decorator để log performance của functions"""
+    """Decorator to log performance of functions""" 
     
     def decorator(func):
         import functools
@@ -247,6 +230,5 @@ def log_performance(logger_name: Optional[str] = None):
     
     return decorator
 
-# Initialize logging when module is imported
 if not logging.getLogger().handlers:
     setup_logging()

@@ -1,48 +1,50 @@
-from sqlalchemy import Column, String, Boolean, JSON, ForeignKey, UniqueConstraint, Index, Integer
+# api/models/database/provider.py
+"""
+Provider and model management for LLM providers
+Department level configurations with API keys
+"""
+from typing import Dict, Any, Optional
+from sqlalchemy import Column, String, Boolean, Text, Integer, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.sql import text
+
 from models.database.base import BaseModel
 
 
 class Provider(BaseModel):
     """
-    Provider model để quản lý các nhà cung cấp LLM
-    Ví dụ: OpenAI, Anthropic, Google, etc.
+    LLM Provider model (OpenAI, Anthropic, Google, etc.)
+    Global provider definitions
     """
     
     __tablename__ = "providers"
     
-    name = Column(
-        String(100), 
-        nullable=False, 
-        unique=True, 
-        index=True,
-        comment="Tên provider (OpenAI, Anthropic, etc.)"
-    )
-    
-    display_name = Column(
-        String(200),
+    provider_code = Column(
+        String(50),
         nullable=False,
-        comment="Tên hiển thị của provider"
+        unique=True,
+        index=True,
+        comment="Unique provider code (openai, anthropic, google)"
     )
     
-    description = Column(
-        String(500),
-        nullable=True,
-        comment="Mô tả về provider"
+    provider_name = Column(
+        String(100),
+        nullable=False,
+        comment="Provider display name"
     )
     
     is_enabled = Column(
-        Boolean, 
-        nullable=False, 
+        Boolean,
+        nullable=False,
         default=True,
-        comment="Provider có được bật không"
+        comment="Whether provider is globally enabled"
     )
     
     base_config = Column(
-        JSON, 
+        JSONB,
         nullable=False,
-        comment="Cấu hình cơ bản của provider (endpoints, auth, etc.)"
+        comment="Base configuration (endpoints, auth methods, etc.)"
     )
     
     # Relationships
@@ -52,8 +54,8 @@ class Provider(BaseModel):
         cascade="all, delete-orphan"
     )
     
-    agent_providers = relationship(
-        "AgentProvider",
+    department_configs = relationship(
+        "DepartmentProviderConfig",
         back_populates="provider",
         cascade="all, delete-orphan"
     )
@@ -63,13 +65,12 @@ class Provider(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<Provider(name='{self.name}', enabled={self.is_enabled})>"
+        return f"<Provider(code='{self.provider_code}', name='{self.provider_name}')>"
 
 
 class ProviderModel(BaseModel):
     """
-    Model được cung cấp bởi Provider
-    Ví dụ: gpt-4, gpt-3.5-turbo, claude-3-opus, etc.
+    Models provided by each provider
     """
     
     __tablename__ = "provider_models"
@@ -79,74 +80,67 @@ class ProviderModel(BaseModel):
         ForeignKey("providers.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của provider"
+        comment="Provider ID"
     )
     
-    model_name = Column(
+    model_code = Column(
         String(100),
         nullable=False,
         index=True,
-        comment="Tên model (gpt-4, claude-3-opus, etc.)"
+        comment="Model code (gpt-4, claude-3-opus)"
     )
     
-    display_name = Column(
+    model_name = Column(
         String(200),
         nullable=False,
-        comment="Tên hiển thị của model"
+        comment="Model display name"
     )
     
     model_type = Column(
         String(50),
         nullable=False,
         index=True,
-        comment="Loại model: text, chat, embedding, etc."
-    )
-    
-    max_tokens = Column(
-        Integer,
-        nullable=True,
-        comment="Số token tối đa của model"
+        comment="Model type: text, chat, embedding"
     )
     
     is_enabled = Column(
         Boolean,
         nullable=False,
         default=True,
-        comment="Model có được bật không"
+        comment="Whether model is enabled"
     )
     
     model_config = Column(
-        JSON,
+        JSONB,
         nullable=True,
-        comment="Cấu hình riêng của model"
+        comment="Model-specific configuration"
     )
     
-    # Relationships
     provider = relationship("Provider", back_populates="models")
     
     __table_args__ = (
-        UniqueConstraint('provider_id', 'model_name', name='uq_provider_model'),
+        UniqueConstraint('provider_id', 'model_code', name='uq_provider_model'),
         Index('idx_provider_model_enabled', 'provider_id', 'is_enabled'),
-        Index('idx_model_type_enabled', 'model_type', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<ProviderModel(provider_id={self.provider_id}, model_name='{self.model_name}')>"
+        return f"<ProviderModel(provider_id={self.provider_id}, model_code='{self.model_code}')>"
 
 
-class AgentProvider(BaseModel):
+class DepartmentProviderConfig(BaseModel):
     """
-    AgentProvider model để quản lý provider được sử dụng bởi agent
-    Mỗi agent có thể có 1 provider để thực hiện LLM calls
+    Department-level provider configuration with API keys
+    Each department can configure different providers
     """
     
-    __tablename__ = "agent_providers"
+    __tablename__ = "department_provider_configs"
     
-    agent_id = Column(
-        String(100),
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của agent"
+        comment="Department ID"
     )
     
     provider_id = Column(
@@ -154,139 +148,43 @@ class AgentProvider(BaseModel):
         ForeignKey("providers.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của provider được sử dụng"
+        comment="Provider ID"
     )
     
-    model_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("provider_models.id", ondelete="CASCADE"),
+    api_key = Column(
+        String(500),
         nullable=False,
-        index=True,
-        comment="ID của model được sử dụng"
-    )
-    
-    is_active = Column(
-        Boolean,
-        nullable=False,
-        default=True,
-        comment="AgentProvider có được bật không"
-    )
-    
-    priority = Column(
-        Integer,
-        nullable=False,
-        default=1,
-        comment="Độ ưu tiên khi có nhiều provider"
-    )
-    
-    custom_config = Column(
-        JSON,
-        nullable=True,
-        comment="Cấu hình tùy chỉnh cho agent này"
-    )
-    
-    # Relationships  
-    provider = relationship("Provider", back_populates="agent_providers")
-    model = relationship("ProviderModel")
-    
-    agent_tools = relationship(
-        "AgentTool",
-        back_populates="agent_provider",
-        cascade="all, delete-orphan"
-    )
-    
-    __table_args__ = (
-        UniqueConstraint('agent_id', 'provider_id', name='uq_agent_provider'),
-        Index('idx_agent_provider_active', 'agent_id', 'is_active'),
-        Index('idx_agent_priority', 'agent_id', 'priority'),
-    )
-    
-    def __repr__(self) -> str:
-        return f"<AgentProvider(agent_id='{self.agent_id}', provider_id={self.provider_id}, active={self.is_active})>"
-
-
-class AgentTool(BaseModel):
-    """
-    AgentTool model để quản lý tools được sử dụng bởi agent
-    Mỗi agent có thể có nhiều tools và có thể bật/tắt từng tool
-    """
-
-    __tablename__ = "agent_tools"
-
-    agent_provider_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("agent_providers.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="ID của agent provider"
-    )
-    
-    tool_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("tools.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="ID của tool"
+        comment="Encrypted API key for this provider"
     )
     
     is_enabled = Column(
         Boolean,
         nullable=False,
         default=True,
-        comment="Tool có được bật cho agent này không"
+        comment="Whether this provider config is enabled"
     )
     
-    tool_config = Column(
-        JSON,
+    config_data = Column(
+        JSONB,
         nullable=True,
-        comment="Cấu hình riêng của tool cho agent này"
+        comment="Department-specific provider configuration"
     )
     
-    usage_stats = Column(
-        JSON,
+    configured_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
-        comment="Thống kê sử dụng tool: calls_count, success_rate, etc."
+        comment="User who configured this provider"
     )
-
+    
     # Relationships
-    agent_provider = relationship("AgentProvider", back_populates="agent_tools")
-    tool = relationship("Tool")
-
+    department = relationship("Department", back_populates="provider_configs")
+    provider = relationship("Provider", back_populates="department_configs")
+    
     __table_args__ = (
-        UniqueConstraint('agent_provider_id', 'tool_id', name='uq_agent_tool'),
-        Index('idx_agent_tool_enabled', 'agent_provider_id', 'is_enabled'),
-        Index('idx_agent_tool_priority', 'agent_provider_id', 'priority'),
+        UniqueConstraint('department_id', 'provider_id', name='uq_dept_provider'),
+        Index('idx_dept_provider_enabled', 'department_id', 'is_enabled'),
     )
     
-    def toggle_enabled(self):
-        """Bật/tắt tool"""
-        self.is_enabled = not self.is_enabled
-    
-    def increment_usage(self):
-        """Tăng counter sử dụng tool"""
-        if not self.usage_stats:
-            self.usage_stats = {"calls_count": 0, "success_count": 0}
-        
-        self.usage_stats["calls_count"] = self.usage_stats.get("calls_count", 0) + 1
-    
-    def increment_success(self):
-        """Tăng counter thành công"""
-        if not self.usage_stats:
-            self.usage_stats = {"calls_count": 0, "success_count": 0}
-        
-        self.usage_stats["success_count"] = self.usage_stats.get("success_count", 0) + 1
-    
-    @property
-    def success_rate(self) -> float:
-        """Tính tỷ lệ thành công"""
-        if not self.usage_stats or self.usage_stats.get("calls_count", 0) == 0:
-            return 0.0
-        
-        success_count = self.usage_stats.get("success_count", 0)
-        calls_count = self.usage_stats.get("calls_count", 0)
-        
-        return (success_count / calls_count) * 100
-
     def __repr__(self) -> str:
-        return f"<AgentTool(agent_provider_id={self.agent_provider_id}, tool_id={self.tool_id}, enabled={self.is_enabled})>"
-
+        return f"<DepartmentProviderConfig(dept_id={self.department_id}, provider_id={self.provider_id})>"

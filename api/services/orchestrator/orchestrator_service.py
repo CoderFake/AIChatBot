@@ -720,34 +720,25 @@ Trả lời ngắn gọn, thân thiện bằng {query_analysis.language}.
         return list(set(accessible))
     
     async def _get_user_tool_permissions(self, user_context: Dict[str, Any]) -> List[str]:
-        """Get tools user có permission sử dụng dựa trên role"""
-        user_role = user_context.get("role", "user").lower()
-        user_department = user_context.get("department", "").lower()
+        """DRY: Dùng permission_service thay vì duplicate logic"""
+        user_id = user_context.get('user_id')
+        if not user_id:
+            return []
         
-        # Base tools for all users
-        allowed_tools = ["datetime"]
+        if not self.permission_service:
+            # Fallback cho case không có permission_service
+            return ["document_search", "datetime"]
         
-        # Role-based tool permissions
-        if user_role in ["employee", "staff"]:
-            allowed_tools.extend(["document_search"])
-            
-        elif user_role in ["manager", "senior"]:
-            allowed_tools.extend(["document_search", "web_search"])
-            
-        elif user_role in ["director", "ceo", "admin"]:
-            allowed_tools.extend(["document_search", "web_search", "calculation"])
+        # Dùng permission_service để get tool permissions
+        tool_perms = await self.permission_service.get_user_tool_permissions(user_id)
         
-        # Department-specific tools
-        if user_department == "it":
-            allowed_tools.extend(["code_generation", "system_analysis"])
-        elif user_department == "finance":
-            allowed_tools.extend(["calculation", "financial_analysis"])
-        elif user_department == "hr":
-            allowed_tools.extend(["policy_search", "employee_lookup"])
+        # Flatten categories thành list tool names
+        allowed_tools = []
+        for category_tools in tool_perms.values():
+            for tool in category_tools:
+                allowed_tools.append(tool['name'])
         
-        # Filter by enabled tools in admin settings
-        enabled_tools = self.settings.get_enabled_tools()
-        return [tool for tool in allowed_tools if tool in enabled_tools]
+        return allowed_tools if allowed_tools else ["document_search", "datetime"]
     
     async def _get_agent_collections(self, agent_name: str, user_context: Dict[str, Any]) -> List[str]:
         """Get collections cho specific agent dựa trên user permissions"""
@@ -868,4 +859,15 @@ Available tools: {available_tools}
 Trả lời bằng {language}, chuyên nghiệp và chính xác.
 """
         
-        response =
+        response = await llm.ainvoke(agent_prompt)
+        
+        return {
+            "response": response.content,
+            "evidence": evidence,
+            "confidence": 0.9,
+            "metadata": {
+                "agent": agent_name,
+                "tools_used": available_tools,
+                "documents_count": len(documents)
+            }
+        }

@@ -1,7 +1,4 @@
-"""
-Auth Middleware cho config management
-Xác minh user_id và OTP cho các thao tác config
-"""
+
 from typing import Optional, Dict, Any
 from fastapi import HTTPException, Header, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,15 +25,15 @@ class ConfigAuthMiddleware:
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """
-        Verify user có quyền config và OTP hợp lệ
+        Verify user has permission to config and OTP is valid
         
         Args:
-            user_id: User ID từ header
+            user_id: User ID from header
             otp_token: OTP token từ header
             db: Database session
             
         Returns:
-            Dict chứa user context và permissions
+            Dict contains user context and permissions   
         """
         try:
             if not otp_manager.verify_totp(otp_token):
@@ -56,43 +53,10 @@ class ConfigAuthMiddleware:
                     detail="User not found or inactive"
                 )
             
-            # Check config permissions
-            permissions = user_context.get('permissions', [])
-            role = user_context.get('role', '')
-            department = user_context.get('department', '')
+            config_perms = await permission_service.get_user_config_permissions(user_id)
+            user_context['config_permissions'] = config_perms
             
-            # Admin có full access
-            if role == UserRole.ADMIN.value or 'admin_full_access' in permissions:
-                user_context['config_permissions'] = {
-                    'can_manage_all_tools': True,
-                    'can_manage_all_providers': True,
-                    'can_manage_all_configs': True,
-                    'departments_allowed': ['all']
-                }
-            else:
-                # Department-specific permissions
-                config_perms = {
-                    'can_manage_all_tools': False,
-                    'can_manage_all_providers': False,
-                    'can_manage_all_configs': False,
-                    'departments_allowed': [department] if department else []
-                }
-                
-                # Check department config permissions
-                if 'config_tools' in permissions:
-                    config_perms['can_manage_department_tools'] = True
-                
-                if 'config_providers' in permissions:
-                    config_perms['can_manage_department_providers'] = True
-                
-                # Manager+ có quyền config department của mình
-                if role in [UserRole.MANAGER.value, UserRole.DIRECTOR.value, UserRole.CEO.value]:
-                    config_perms['can_manage_department_tools'] = True
-                    config_perms['can_manage_department_providers'] = True
-                
-                user_context['config_permissions'] = config_perms
-            
-            logger.info(f"Config access verified for user {user_id} with role {role}")
+            logger.info(f"Config access verified for user {user_id} with role {user_context.get('role', '')}")
             return user_context
             
         except HTTPException:
@@ -122,14 +86,11 @@ class ConfigAuthMiddleware:
         config_perms = user_context.get('config_permissions', {})
         department = user_context.get('department', '')
         
-        # Admin có full access
         if config_perms.get('can_manage_all_tools'):
             return True
-        
-        # Check department-specific tools
+      
         if config_perms.get('can_manage_department_tools'):
-            # TODO: Check if tool belongs to user's department
-            # Có thể check từ tool registry hoặc database
+           
             return True
         
         return False
@@ -140,22 +101,20 @@ class ConfigAuthMiddleware:
         user_context: Dict[str, Any]
     ) -> bool:
         """
-        Verify user có quyền config specific provider
+        Verify user has permission to config specific provider
         
         Args:
-            provider_name: Tên provider cần config
-            user_context: User context từ verify_config_access
+            provider_name: Name of provider to config
+            user_context: User context from verify_config_access
             
         Returns:
-            bool: True nếu có quyền
-        """
+            bool: True if has permission
+        """ 
         config_perms = user_context.get('config_permissions', {})
         
-        # Admin có full access
         if config_perms.get('can_manage_all_providers'):
             return True
         
-        # Department managers có thể config providers của department
         if config_perms.get('can_manage_department_providers'):
             return True
         
@@ -171,8 +130,8 @@ async def verify_config_permission(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Dependency function để verify config permissions
-    Sử dụng trong các config endpoints
+    Dependency function to verify config permissions
+    Used in config endpoints
     """
     return await config_auth.verify_config_access(user_id, otp_token, db)
 
@@ -183,7 +142,7 @@ async def verify_admin_permission(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Dependency function chỉ cho admin full access
+    Dependency function only for admin full access 
     """
     user_context = await config_auth.verify_config_access(user_id, otp_token, db)
     

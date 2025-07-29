@@ -77,16 +77,8 @@ class ToolManager:
         logger.info(f"Initialized ToolNode with {len(enabled_tools)} tools")
     
     def _is_tool_enabled(self, tool_name: str) -> bool:
-        tool_definition = tool_registry.get_tool_definition(tool_name)
-        
-        if tool_definition:
-            settings_key = tool_definition.get("settings_key")
-            if settings_key:
-                return getattr(settings, settings_key, False)
-            
-            return True
-       
-        return True
+        """Check if tool is enabled via centralized settings"""
+        return settings.is_tool_enabled(tool_name)
     
     # ================================
     # AGENT TOOL REGISTRATION
@@ -134,10 +126,10 @@ class ToolManager:
     
     def list_available_tools_for_agent(self) -> Dict[str, Dict[str, Any]]:
         """
-        Lấy danh sách tools có thể đăng ký từ AVAILABLE_TOOLS
+        Get list of tools that can be registered from AVAILABLE_TOOLS
         
     Returns:
-            Dict chứa thông tin tools
+            Dict contains tool information
         """
         available_tools = get_available_tools()
         tools_info = {}
@@ -165,39 +157,32 @@ class ToolManager:
         tool_config: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Đăng ký tool cho một agent cụ thể
+        Register tool for a specific agent
         
         Args:
-            agent_name: Tên agent đăng ký tool
-            tool_name: Tên tool (unique trong scope của agent)
-            tool_function: Function implement tool (phải có decorator @tool)
-            tool_config: Config cho tool (metadata)
+            agent_name: Name of agent to register tool
+            tool_name: Name of tool (unique in agent's scope)  
+            tool_function: Function implement tool (must have @tool decorator)
+            tool_config: Config for tool (metadata)
             
         Returns:
-            bool: True nếu đăng ký thành công
+            bool: True if registration is successful
         """
         try:
-            # Validate tool function
             if not hasattr(tool_function, 'name'):
                 logger.error(f"Tool function must have @tool decorator: {tool_name}")
                 return False
             
-            # Create agent namespace if not exists
             if agent_name not in self._agent_tools:
                 self._agent_tools[agent_name] = {}
             
-            # Generate unique tool name
             full_tool_name = f"{agent_name}_{tool_name}"
             
-            # Check for conflicts
             if full_tool_name in self._active_tools:
                 logger.warning(f"Tool {full_tool_name} already exists")
                 return False
             
-            # Register in agent tools
             self._agent_tools[agent_name][full_tool_name] = tool_function
-            
-            # Auto-register in tool registry if config provided
             if tool_config:
                 success = tool_registry.register_tool(
                     name=full_tool_name,
@@ -249,17 +234,13 @@ class ToolManager:
                 logger.warning(f"Tool {full_tool_name} not found for agent {agent_name}")
                 return False
             
-            # Remove from agent tools
             del self._agent_tools[agent_name][full_tool_name]
             
-            # Remove from registry
             tool_registry.unregister_tool(full_tool_name)
             
-            # Remove usage stats
             if full_tool_name in self.usage_stats:
                 del self.usage_stats[full_tool_name]
             
-            # Re-initialize tool node
             self._initialize_tool_node()
             
             logger.info(f"Unregistered tool {full_tool_name} from agent {agent_name}")
@@ -303,7 +284,6 @@ class ToolManager:
         
         for tool_name, config in tools_config.items():
             try:
-                # Load tool function dynamically
                 tool_function = self._load_agent_tool_function(agent_name, tool_name, config)
                 
                 if tool_function:
@@ -336,11 +316,9 @@ class ToolManager:
             Tool function hoặc None nếu load failed
         """
         try:
-            # Construct module path
             module_path = config.get("module_path", f"agents.{agent_name}.tools")
             function_name = config.get("function_name", f"{tool_name}_tool")
             
-            # Import module and get function
             module = importlib.import_module(module_path)
             tool_function = getattr(module, function_name, None)
             
@@ -348,7 +326,6 @@ class ToolManager:
                 logger.error(f"Function {function_name} not found in {module_path}")
                 return None
             
-            # Validate it's a proper tool
             if not hasattr(tool_function, 'name'):
                 logger.error(f"Function {function_name} must have @tool decorator")
                 return None
@@ -428,7 +405,6 @@ class ToolManager:
                 existing_tool = result.scalar_one_or_none()
                 
                 if existing_tool:
-                    # Cập nhật nếu version khác
                     if existing_tool.version != tool_def["version"]:
                         existing_tool.version = tool_def["version"]
                         existing_tool.tool_config = tool_def["tool_config"]
@@ -436,7 +412,6 @@ class ToolManager:
                         update_count += 1
                         logger.info(f"Updated tool {tool_name} to version {tool_def['version']}")
                 else:
-                    # Tạo tool mới
                     new_tool = Tool(
                         name=tool_name,
                         display_name=tool_def["display_name"],

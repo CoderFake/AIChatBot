@@ -14,7 +14,7 @@ from utils.logging import get_logger
 from core.exceptions import VectorDatabaseError
 from services.types import IndexType
 from services.dataclasses.milvus import ChunkingConfig, SearchResult
-from utils.file_utils import unstructured_processor
+from utils.file_utils import docling_processor
 from common.types import Department
 
 logger = get_logger(__name__)
@@ -55,49 +55,44 @@ class OptimizedMilvusService:
             raise VectorDatabaseError(f"Milvus initialization failed: {e}")
     
     async def _initialize_embedding_model(self):
-        """Initialize BAAI/bge-m3 embedding model"""
+        """Initialize embedding model từ settings"""
         try:
+            model_name = self.settings.rag.get("embedding_model", "BAAI/bge-m3")
+            device = self.settings.rag.get("embedding_device", "cpu")
+            
             self.embedding_model = SentenceTransformer(
-                self.settings.rag.get("embedding_model", "BAAI/bge-m3"),
-                device=self.settings.rag.get("embedding_device", "cpu")
+                model_name,
+                device=device
             )
-            logger.info("Embedding model BAAI/bge-m3 loaded successfully")
+            logger.info(f"Embedding model {model_name} loaded successfully on {device}")
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
     
     def _get_collection_configs(self) -> Dict[str, Dict[str, Any]]:
-        """Get collection configurations cho từng agent"""
-        return {
-            "hr_documents": {
-                "description": "HR documents và policies",
-                "agent": "hr_specialist",
-                "index_type": IndexType.HNSW,
-                "metric_type": "COSINE",
-                "index_params": {"M": 16, "efConstruction": 200}
-            },
-            "finance_documents": {
-                "description": "Finance documents và reports",
-                "agent": "finance_specialist", 
-                "index_type": IndexType.HNSW,
-                "metric_type": "COSINE",
-                "index_params": {"M": 16, "efConstruction": 200}
-            },
-            "it_documents": {
-                "description": "IT documents và procedures",
-                "agent": "it_specialist",
-                "index_type": IndexType.IVF_FLAT,
-                "metric_type": "COSINE",
-                "index_params": {"nlist": 1024}
-            },
-            "general_documents": {
-                "description": "General purpose documents",
-                "agent": "general_assistant",
-                "index_type": IndexType.HNSW,
-                "metric_type": "COSINE", 
-                "index_params": {"M": 16, "efConstruction": 200}
+        """Get collection configurations từ settings instead of hardcode"""
+        configs = {}
+        
+        for collection_name, collection_config in self.settings.collections.items():
+            if not collection_config.enabled:
+                continue
+                
+            # Convert string index_type to IndexType enum
+            try:
+                index_type = IndexType(collection_config.index_type)
+            except ValueError:
+                logger.warning(f"Invalid index_type {collection_config.index_type} for {collection_name}, using HNSW")
+                index_type = IndexType.HNSW
+            
+            configs[collection_name] = {
+                "description": collection_config.description,
+                "agent": collection_config.agent,
+                "index_type": index_type,
+                "metric_type": collection_config.metric_type,
+                "index_params": collection_config.index_params
             }
-        }
+        
+        return configs
     
     async def _initialize_collections(self):
         """Initialize tất cả collections"""
@@ -133,7 +128,7 @@ class OptimizedMilvusService:
             FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=100),
             FieldSchema(name="chunk_index", dtype=DataType.INT64),
             FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=10000),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),  
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.settings.rag.get("embedding_dimensions", 1024)),  
             
             FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=500),
             FieldSchema(name="author", dtype=DataType.VARCHAR, max_length=200),
@@ -147,11 +142,15 @@ class OptimizedMilvusService:
             FieldSchema(name="language", dtype=DataType.VARCHAR, max_length=10),
             FieldSchema(name="keywords", dtype=DataType.VARCHAR, max_length=1000),
             FieldSchema(name="bm25_score", dtype=DataType.FLOAT),
+            
+            # Docling specific metadata fields
+            FieldSchema(name="extraction_method", dtype=DataType.VARCHAR, max_length=50),
+            FieldSchema(name="export_type", dtype=DataType.VARCHAR, max_length=50),
         ]
         
         return CollectionSchema(
             fields=fields,
-            description="Optimized document collection cho Agentic RAG"
+            description="Optimized document collection cho Agentic RAG với Docling"
         )
     
     async def _create_collection_index(self, collection: Collection, config: Dict[str, Any]):
@@ -168,6 +167,7 @@ class OptimizedMilvusService:
         collection.create_index(field_name="access_level")
         collection.create_index(field_name="language")
         collection.create_index(field_name="created_at")
+        collection.create_index(field_name="extraction_method")
     
     async def _ensure_collection_indexed(self, collection: Collection, config: Dict[str, Any]):
         """Ensure collection có proper indexes"""
@@ -186,10 +186,11 @@ class OptimizedMilvusService:
         department: Department,
         document_id: str,
         metadata: Dict[str, Any],
+        use_chunks: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Add document sử dụng Department mapping và Unstructured processing
+        Add document sử dụng Department mapping và Docling processing
         
         Args:
             file_content: Raw file content
@@ -197,7 +198,8 @@ class OptimizedMilvusService:
             department: Department enum để xác định collection
             document_id: Unique document identifier
             metadata: Additional metadata
-            **kwargs: Additional parameters cho Unstructured
+            use_chunks: Có sử dụng DOC_CHUNKS mode không (default True)
+            **kwargs: Additional parameters cho Docling
             
         Returns:
             Processing result dictionary
@@ -206,11 +208,12 @@ class OptimizedMilvusService:
             await self.initialize()
         
         try:
-            processing_result = await unstructured_processor.process_document_for_milvus(
+            processing_result = await docling_processor.process_document_for_milvus(
                 file_content=file_content,
                 filename=filename,
                 department=department,
                 metadata=metadata,
+                use_chunks=use_chunks,
                 **kwargs
             )
             
@@ -229,7 +232,7 @@ class OptimizedMilvusService:
             chunk_texts = [chunk["content"] for chunk in chunks]
             embeddings = await self._generate_embeddings(chunk_texts)
             
-            entities = self._prepare_entities_from_unstructured(
+            entities = self._prepare_entities_from_docling(
                 document_id=document_id,
                 chunks=chunks,
                 embeddings=embeddings,
@@ -252,7 +255,8 @@ class OptimizedMilvusService:
             
             logger.info(
                 f"Document {filename} successfully added to {collection_name}: "
-                f"{len(chunks)} chunks, avg_size={result['processing_stats']['avg_chunk_size']}"
+                f"{len(chunks)} chunks, avg_size={result['processing_stats']['avg_chunk_size']}, "
+                f"extraction_method={enhanced_metadata.get('extraction_method', 'unknown')}"
             )
             
             return result
@@ -267,7 +271,7 @@ class OptimizedMilvusService:
                 "document_id": document_id
             }
     
-    def _prepare_entities_from_unstructured(
+    def _prepare_entities_from_docling(
         self,
         document_id: str,
         chunks: List[Dict[str, Any]],
@@ -275,9 +279,44 @@ class OptimizedMilvusService:
         metadata: Dict[str, Any],
         filename: str
     ) -> List[List]:
-        """Prepare entities từ Unstructured processed chunks"""
+        """Prepare entities từ Docling processed chunks với enhanced metadata using MetadataTransformer"""
+        from models import MetadataTransformer, EnhancedDocumentMetadata, AccessLevel
         
         timestamp = int(datetime.now().timestamp())
+        
+        # Create enhanced metadata từ raw metadata
+        try:
+            # Convert raw metadata dict to EnhancedDocumentMetadata
+            enhanced_metadata = EnhancedDocumentMetadata(
+                title=metadata.get("title"),
+                author=metadata.get("author"),
+                department=metadata.get("department"),
+                description=metadata.get("description"),
+                language=metadata.get("language", "vi"),
+                filename=filename,
+                file_size=metadata.get("file_size", 0),
+                file_hash=metadata.get("file_hash"),
+                file_type=metadata.get("file_type"),
+                extraction_method=metadata.get("extraction_method", "docling"),
+                export_type=metadata.get("export_type", "doc_chunks"),
+                access_level=AccessLevel(metadata.get("access_level", "public")),
+                total_chunks=metadata.get("total_chunks", len(chunks))
+            )
+            
+            # Validate consistency
+            issues = MetadataTransformer.validate_metadata_consistency(enhanced_metadata)
+            if issues:
+                logger.warning(f"Metadata validation issues for {filename}: {issues}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create enhanced metadata for {filename}: {e}")
+            # Fallback to basic metadata
+            enhanced_metadata = EnhancedDocumentMetadata(
+                title=metadata.get("title", filename),
+                filename=filename,
+                file_size=metadata.get("file_size", 0),
+                language=metadata.get("language", "vi")
+            )
         
         entities = [
             [],  # id
@@ -295,33 +334,51 @@ class OptimizedMilvusService:
             [],  # updated_at
             [],  # language
             [],  # keywords
-            []   # bm25_score
+            [],  # bm25_score
+            [],  # extraction_method
+            []   # export_type
         ]
+        
+        # Get Milvus-ready metadata
+        milvus_metadata = enhanced_metadata.to_milvus_metadata()
         
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             chunk_id = f"{document_id}_{chunk['chunk_index']}"
             
-            # Extract chunk metadata
-            chunk_metadata = chunk.get("metadata", {})
+            # Use MetadataTransformer for consistent mapping
+            chunk_data = {
+                "chunk_index": chunk["chunk_index"],
+                "content": chunk["content"],
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "bm25_score": 0.0
+            }
+            
+            complete_metadata = MetadataTransformer.enhanced_to_milvus_entities(
+                enhanced_metadata, document_id, chunk_data
+            )
             
             entities[0].append(chunk_id)
-            entities[1].append(document_id)
-            entities[2].append(chunk["chunk_index"])
-            entities[3].append(chunk["content"])
+            entities[1].append(complete_metadata["document_id"])
+            entities[2].append(complete_metadata["chunk_index"])
+            entities[3].append(complete_metadata["content"])
             entities[4].append(embedding)
-            entities[5].append(metadata.get("title", filename))
-            entities[6].append(metadata.get("author", ""))
-            entities[7].append(metadata.get("department", ""))
-            entities[8].append(metadata.get("access_level", "public"))
-            entities[9].append(metadata.get("file_type", "unknown"))
-            entities[10].append(metadata.get("file_size", 0))
-            entities[11].append(timestamp)
-            entities[12].append(timestamp)
-            entities[13].append(metadata.get("language", "vi"))
+            entities[5].append(complete_metadata["title"])
+            entities[6].append(complete_metadata["author"])
+            entities[7].append(complete_metadata["department"])
+            entities[8].append(complete_metadata["access_level"])
+            entities[9].append(complete_metadata["file_type"])
+            entities[10].append(complete_metadata["file_size"])
+            entities[11].append(complete_metadata["created_at"])
+            entities[12].append(complete_metadata["updated_at"])
+            entities[13].append(complete_metadata["language"])
             
+            # Generate keywords từ content
             keywords = " ".join(chunk["content"].split()[:20])
             entities[14].append(keywords)
-            entities[15].append(0.0)  
+            entities[15].append(complete_metadata["bm25_score"])
+            entities[16].append(complete_metadata["extraction_method"])
+            entities[17].append(complete_metadata["export_type"])
         
         return entities
 
@@ -444,7 +501,7 @@ class OptimizedMilvusService:
             param=search_params,
             limit=top_k,
             expr=search_expr,
-            output_fields=["id", "document_id", "chunk_index", "content", "title", "author", "department"]
+            output_fields=["id", "document_id", "chunk_index", "content", "title", "author", "department", "extraction_method", "export_type"]
         )
         
         search_results = []
@@ -458,7 +515,9 @@ class OptimizedMilvusService:
                         metadata={
                             "title": hit.entity.get("title"),
                             "author": hit.entity.get("author"),
-                            "department": hit.entity.get("department")
+                            "department": hit.entity.get("department"),
+                            "extraction_method": hit.entity.get("extraction_method"),
+                            "export_type": hit.entity.get("export_type")
                         },
                         document_id=hit.entity.get("document_id"),
                         chunk_index=hit.entity.get("chunk_index")
@@ -492,7 +551,7 @@ class OptimizedMilvusService:
         try:
             results = collection.query(
                 expr=search_expr or "",
-                output_fields=["id", "document_id", "chunk_index", "content", "title", "author", "department"],
+                output_fields=["id", "document_id", "chunk_index", "content", "title", "author", "department", "extraction_method", "export_type"],
                 limit=top_k
             )
             
@@ -507,7 +566,9 @@ class OptimizedMilvusService:
                     metadata={
                         "title": result.get("title"),
                         "author": result.get("author"), 
-                        "department": result.get("department")
+                        "department": result.get("department"),
+                        "extraction_method": result.get("extraction_method"),
+                        "export_type": result.get("export_type")
                     },
                     document_id=result["document_id"],
                     chunk_index=result["chunk_index"]
@@ -599,6 +660,12 @@ class OptimizedMilvusService:
         if "language" in filters:
             expr_parts.append(f'language == "{filters["language"]}"')
         
+        if "extraction_method" in filters:
+            expr_parts.append(f'extraction_method == "{filters["extraction_method"]}"')
+        
+        if "export_type" in filters:
+            expr_parts.append(f'export_type == "{filters["export_type"]}"')
+        
         if "date_range" in filters:
             date_range = filters["date_range"]
             if "start" in date_range:
@@ -610,24 +677,24 @@ class OptimizedMilvusService:
     
     async def _extract_text_from_file(self, file_content: bytes, filename: str) -> str:
         """
-        DEPRECATED: Use UnstructuredFileProcessor instead
+        DEPRECATED: Use DoclingFileProcessor instead
         Legacy method kept for compatibility
         """
-        logger.warning("Using deprecated _extract_text_from_file. Use UnstructuredFileProcessor instead.")
+        logger.warning("Using deprecated _extract_text_from_file. Use DoclingFileProcessor instead.")
         
         try:
-            return await unstructured_processor._fallback_text_extraction(file_content, filename)
+            return await docling_processor._fallback_text_extraction(file_content, filename)
         except Exception as e:
             logger.error(f"Legacy text extraction failed for {filename}: {e}")
             return ""
     
     def _calculate_chunking_config(self, file_size: int, text_length: int) -> ChunkingConfig:
         """
-        DEPRECATED: Use UnstructuredFileProcessor.calculate_chunking_config instead
+        DEPRECATED: Use DoclingFileProcessor.calculate_chunking_config instead
         Legacy method kept for compatibility
         """
-        logger.warning("Using deprecated _calculate_chunking_config. Use UnstructuredFileProcessor instead.")
-        return unstructured_processor.calculate_chunking_config(file_size, text_length)
+        logger.warning("Using deprecated _calculate_chunking_config. Use DoclingFileProcessor instead.")
+        return docling_processor.calculate_chunking_config(file_size, text_length)
     
     async def _create_optimized_chunks(
         self,
@@ -636,11 +703,11 @@ class OptimizedMilvusService:
         metadata: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """
-        DEPRECATED: Use UnstructuredFileProcessor.create_smart_chunks instead
+        DEPRECATED: Use DoclingFileProcessor.create_smart_chunks instead
         Legacy method kept for compatibility
         """
-        logger.warning("Using deprecated _create_optimized_chunks. Use UnstructuredFileProcessor instead.")
-        return unstructured_processor._create_text_chunks(text, config)
+        logger.warning("Using deprecated _create_optimized_chunks. Use DoclingFileProcessor instead.")
+        return docling_processor._create_text_chunks(text, config)
     
     async def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings sử dụng BAAI/bge-m3"""
@@ -663,11 +730,11 @@ class OptimizedMilvusService:
         filename: str
     ) -> List[List]:
         """
-        DEPRECATED: Use _prepare_entities_from_unstructured instead
+        DEPRECATED: Use _prepare_entities_from_docling instead
         Legacy method kept for compatibility
         """
-        logger.warning("Using deprecated _prepare_entities. Use _prepare_entities_from_unstructured instead.")
-        return self._prepare_entities_from_unstructured(document_id, chunks, embeddings, metadata, filename)
+        logger.warning("Using deprecated _prepare_entities. Use _prepare_entities_from_docling instead.")
+        return self._prepare_entities_from_docling(document_id, chunks, embeddings, metadata, filename)
     
     async def delete_document(self, collection_name: str, document_id: str) -> bool:
         """Delete document từ collection"""
@@ -778,11 +845,17 @@ class OptimizedMilvusService:
         for collection_name, collection in self.collections.items():
             try:
                 collection_stats = collection.get_stats()
+                # Get config from settings
+                collection_config = self.settings.get_collection_config(collection_name)
+                agent = collection_config.agent if collection_config else "unknown"
+                index_type = collection_config.index_type if collection_config else "unknown"
+                
                 stats[collection_name] = {
                     "row_count": collection_stats.get("row_count", 0),
-                    "agent": self.collection_configs[collection_name]["agent"],
-                    "index_type": self.collection_configs[collection_name]["index_type"].value,
-                    "last_check": datetime.now().isoformat()
+                    "agent": agent,
+                    "index_type": index_type,
+                    "last_check": datetime.now().isoformat(),
+                    "supported_extraction": "docling"
                 }
             except Exception as e:
                 stats[collection_name] = {"error": str(e)}

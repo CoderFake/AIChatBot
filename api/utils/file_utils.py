@@ -4,17 +4,9 @@ import hashlib
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
-from langchain_community.document_loaders import (
-    UnstructuredExcelLoader,
-    UnstructuredHTMLLoader,
-    UnstructuredMarkdownLoader,
-    UnstructuredPowerPointLoader,
-    UnstructuredWordDocumentLoader,
-    UnstructuredPDFLoader,
-    UnstructuredCSVLoader,
-    UnstructuredFileLoader  # Generic loader cho các file types khác
-)
-
+from langchain_docling import DoclingLoader
+from langchain_docling.loader import ExportType
+from docling.chunking import HybridChunker
 from langchain_core.documents import Document
 
 from common.types import Department, FileType
@@ -26,7 +18,11 @@ from config.settings import get_settings
 logger = get_logger(__name__)
 
 
-class UnstructuredFileProcessor:
+class DoclingFileProcessor:
+    """
+    File processor sử dụng Docling thay vì Unstructured
+    Hỗ trợ PDF, DOCX, PPTX, HTML và nhiều định dạng khác
+    """
     
     def __init__(self):
         self.settings = get_settings()
@@ -39,32 +35,18 @@ class UnstructuredFileProcessor:
             Department.GENERAL: "general_documents"
         }
         
-        self.loader_mapping = {
-            '.pdf': UnstructuredPDFLoader,
-            '.docx': UnstructuredWordDocumentLoader,
-            '.doc': UnstructuredWordDocumentLoader,
-            '.xlsx': UnstructuredExcelLoader,
-            '.xls': UnstructuredExcelLoader,
-            '.pptx': UnstructuredPowerPointLoader,
-            '.ppt': UnstructuredPowerPointLoader,
-            '.html': UnstructuredHTMLLoader,
-            '.htm': UnstructuredHTMLLoader,
-            '.md': UnstructuredMarkdownLoader,
-            '.csv': UnstructuredCSVLoader,
-            '.txt': UnstructuredFileLoader,  
-            '.rtf': UnstructuredFileLoader,
-            '.xml': UnstructuredFileLoader,
-            '.json': UnstructuredFileLoader
+        self.supported_extensions = {
+            '.pdf', '.docx', '.doc', '.pptx', '.ppt', 
+            '.html', '.htm', '.md', '.txt', '.rtf',
+            '.xlsx', '.xls', '.csv', '.xml', '.json'
         }
-        
-        self.supported_extensions = set(self.loader_mapping.keys())
     
     def get_collection_name(self, department: Department) -> str:
         """Get Milvus collection name từ Department"""
         return self.department_collections.get(department, "general_documents")
     
     def is_supported_file(self, filename: str) -> bool:
-        """Check xem file có được support bởi Unstructured không"""
+        """Check xem file có được support bởi Docling không"""
         extension = Path(filename).suffix.lower()
         return extension in self.supported_extensions
     
@@ -79,15 +61,15 @@ class UnstructuredFileProcessor:
             '.txt': FileType.TXT,
             '.md': FileType.MD,
             '.xlsx': FileType.XLSX,
-            '.pptx': FileType.PPTX
+            '.pptx': FileType.PPTX,
+            '.html': FileType.TXT,
+            '.htm': FileType.TXT,
+            '.csv': FileType.TXT,
+            '.xml': FileType.TXT,
+            '.json': FileType.TXT
         }
         
         return mapping.get(extension, FileType.TXT)
-    
-    def _get_loader_class(self, filename: str):
-        """Get appropriate Unstructured loader class cho file type"""
-        extension = Path(filename).suffix.lower()
-        return self.loader_mapping.get(extension, UnstructuredFileLoader)
     
     def calculate_chunking_config(self, file_size: int, estimated_text_length: int = None) -> ChunkingConfig:
         """
@@ -161,19 +143,21 @@ class UnstructuredFileProcessor:
         
         return config
     
-    async def extract_text_with_unstructured(
+    async def extract_text_with_docling(
         self, 
         file_content: bytes, 
         filename: str,
+        export_type: ExportType = ExportType.DOC_CHUNKS,
         **kwargs
     ) -> Tuple[str, List[Document]]:
         """
-        Extract text sử dụng appropriate Unstructured loader
+        Extract text sử dụng Docling DoclingLoader
         
         Args:
             file_content: Raw file content
             filename: Original filename
-            **kwargs: Additional parameters for Unstructured
+            export_type: ExportType.DOC_CHUNKS hoặc ExportType.MARKDOWN
+            **kwargs: Additional parameters for Docling
             
         Returns:
             Tuple of (full_text, documents_list)
@@ -193,21 +177,24 @@ class UnstructuredFileProcessor:
                 temp_file.write(file_content)
                 temp_file_path = temp_file.name
             
-            # Get appropriate loader class
-            LoaderClass = self._get_loader_class(filename)
-            
-            # Configure loader parameters
+            # Configure DoclingLoader
             loader_kwargs = {
-                "mode": kwargs.get("mode", "elements"),  # Default to elements mode
-                "strategy": kwargs.get("strategy", "auto"),  # Auto-detect best strategy
-                **{k: v for k, v in kwargs.items() if k not in ["mode", "strategy"]}
+                "export_type": export_type,
+                **kwargs
             }
             
-            # Local processing
-            logger.info(f"Using Unstructured local processing for {filename}")
+            # Use HybridChunker for better chunking if DOC_CHUNKS mode
+            if export_type == ExportType.DOC_CHUNKS:
+                chunker = HybridChunker()
+                loader_kwargs["chunker"] = chunker
             
-            # Create loader instance
-            loader = LoaderClass(temp_file_path, **loader_kwargs)
+            logger.info(f"Using Docling processing for {filename}")
+            
+            # Create DoclingLoader instance
+            loader = DoclingLoader(
+                file_path=temp_file_path,
+                **loader_kwargs
+            )
             
             # Load documents
             documents = loader.load()
@@ -216,14 +203,14 @@ class UnstructuredFileProcessor:
             full_text = "\n".join(doc.page_content for doc in documents)
             
             logger.info(
-                f"Extracted {len(documents)} elements, {len(full_text)} chars from {filename} "
-                f"using {LoaderClass.__name__}"
+                f"Extracted {len(documents)} documents, {len(full_text)} chars from {filename} "
+                f"using DoclingLoader with {export_type}"
             )
             
             return full_text, documents
             
         except Exception as e:
-            logger.error(f"Unstructured extraction failed for {filename}: {e}")
+            logger.error(f"Docling extraction failed for {filename}: {e}")
             # Fallback to simple text extraction
             return await self._fallback_text_extraction(file_content, filename), []
             
@@ -236,7 +223,7 @@ class UnstructuredFileProcessor:
                     logger.warning(f"Failed to cleanup temp file {temp_file_path}: {e}")
     
     async def _fallback_text_extraction(self, file_content: bytes, filename: str) -> str:
-        """Fallback text extraction cho khi Unstructured fails"""
+        """Fallback text extraction cho khi Docling fails"""
         extension = Path(filename).suffix.lower()
         
         try:
@@ -288,11 +275,22 @@ class UnstructuredFileProcessor:
         config: ChunkingConfig,
         preserve_structure: bool = True
     ) -> List[Dict[str, Any]]:
-       
+        """
+        Create smart chunks từ Docling documents hoặc text
+        
+        Args:
+            text: Full text content
+            documents: Docling documents với rich metadata
+            config: Chunking configuration
+            preserve_structure: Có preserve document structure không
+            
+        Returns:
+            List of chunk dictionaries
+        """
         chunks = []
         
         if preserve_structure and documents:
-            chunks = self._create_structured_chunks(documents, config)
+            chunks = self._create_docling_chunks(documents, config)
         else:
             chunks = self._create_text_chunks(text, config)
         
@@ -300,7 +298,7 @@ class UnstructuredFileProcessor:
             chunk.update({
                 "chunk_index": i,
                 "total_chunks": len(chunks),
-                "chunking_method": "structured" if preserve_structure and documents else "text_based",
+                "chunking_method": "docling_structured" if preserve_structure and documents else "text_based",
                 "chunk_size": len(chunk["content"]),
                 "config_used": config.__dict__
             })
@@ -309,8 +307,8 @@ class UnstructuredFileProcessor:
         
         return chunks
     
-    def _create_structured_chunks(self, documents: List[Document], config: ChunkingConfig) -> List[Dict[str, Any]]:
-        """Create chunks preserve structure từ Unstructured documents"""
+    def _create_docling_chunks(self, documents: List[Document], config: ChunkingConfig) -> List[Dict[str, Any]]:
+        """Create chunks preserve structure từ Docling documents với rich metadata"""
         chunks = []
         current_chunk = ""
         current_metadata = {}
@@ -332,7 +330,8 @@ class UnstructuredFileProcessor:
                     chunks.append({
                         "content": current_chunk.strip(),
                         "metadata": current_metadata.copy(),
-                        "source_elements": len(current_metadata)
+                        "source_elements": len(current_metadata),
+                        "docling_metadata": current_metadata.get("dl_meta", {})
                     })
                 
                 if config.base_overlap > 0 and current_chunk:
@@ -347,7 +346,8 @@ class UnstructuredFileProcessor:
             chunks.append({
                 "content": current_chunk.strip(),
                 "metadata": current_metadata.copy(),
-                "source_elements": len(current_metadata)
+                "source_elements": len(current_metadata),
+                "docling_metadata": current_metadata.get("dl_meta", {})
             })
         
         return chunks
@@ -403,16 +403,18 @@ class UnstructuredFileProcessor:
         filename: str,
         department: Department,
         metadata: Dict[str, Any],
+        use_chunks: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Complete pipeline để process document cho Milvus
+        Complete pipeline để process document cho Milvus sử dụng Docling
         
         Args:
             file_content: Raw file content
             filename: Original filename  
             department: Department enum cho collection mapping
             metadata: Additional metadata
+            use_chunks: Có sử dụng DOC_CHUNKS mode không (default True)
             **kwargs: Additional parameters
             
         Returns:
@@ -425,8 +427,11 @@ class UnstructuredFileProcessor:
             file_hash = self.generate_document_hash(file_content)
             file_type = self.get_file_type(filename)
             
-            extracted_text, documents = await self.extract_text_with_unstructured(
-                file_content, filename, **kwargs
+            # Choose export type
+            export_type = ExportType.DOC_CHUNKS if use_chunks else ExportType.MARKDOWN
+            
+            extracted_text, documents = await self.extract_text_with_docling(
+                file_content, filename, export_type=export_type, **kwargs
             )
             
             if not extracted_text.strip():
@@ -452,7 +457,8 @@ class UnstructuredFileProcessor:
                 "file_type": file_type.value,
                 "department": department.value,
                 "text_length": len(extracted_text),
-                "extraction_method": "unstructured",
+                "extraction_method": "docling",
+                "export_type": export_type.value,
                 "processing_timestamp": CustomDateTime.now().isoformat(),
                 "total_chunks": len(chunks),
                 "chunking_config": chunking_config.__dict__
@@ -471,7 +477,8 @@ class UnstructuredFileProcessor:
                     "text_length": len(extracted_text),
                     "chunks_created": len(chunks),
                     "avg_chunk_size": sum(len(c["content"]) for c in chunks) // len(chunks),
-                    "structured_elements": len(documents) if documents else 0
+                    "docling_documents": len(documents) if documents else 0,
+                    "export_type": export_type.value
                 }
             }
             
@@ -485,4 +492,8 @@ class UnstructuredFileProcessor:
             }
 
 
-unstructured_processor = UnstructuredFileProcessor()
+# Global instance
+docling_processor = DoclingFileProcessor()
+
+# Backward compatibility
+unstructured_processor = docling_processor

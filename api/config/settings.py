@@ -77,6 +77,24 @@ class WorkflowConfig(BaseModel):
     enable_hallucination_check: bool = Field(default=True)
     checkpointer_type: str = Field(default="redis")
 
+class StorageConfig(BaseModel):
+    """MinIO storage configuration"""
+    endpoint: str = Field(default="localhost:9000")
+    access_key: str = Field(default="minioadmin")
+    secret_key: str = Field(default="minioadmin")
+    secure: bool = Field(default=False)
+    bucket_prefix: str = Field(default="agentic-rag")
+
+class CollectionConfig(BaseModel):
+    """Milvus collection configuration"""
+    name: str
+    description: str
+    agent: str
+    index_type: str = Field(default="HNSW")  
+    metric_type: str = Field(default="COSINE")
+    index_params: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = Field(default=True)
+
 class Settings(BaseModel):
     """Main application settings"""
     
@@ -103,6 +121,7 @@ class Settings(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     vector_db: VectorConfig = Field(default_factory=VectorConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     
     # LLM Providers - Configurable, not hardcoded
     llm_providers: Dict[str, LLMProviderConfig] = Field(default_factory=lambda: {
@@ -133,18 +152,20 @@ class Settings(BaseModel):
             name="mistral",
             enabled=False,
             config={
-                "api_key": os.getenv("MISTRAL_API_KEY", ""),
+                "api_keys": os.getenv("MISTRAL_API_KEYS", "").split(",") if os.getenv("MISTRAL_API_KEYS") else [],
+                "base_url": os.getenv("MISTRAL_API_URL", "https://api.mistral.ai/v1"),
                 "timeout": 60,
-                "temperature": 0.7
+                "temperature": 0.7,
+                "max_tokens": 4096
             },
             models=["mistral-large-latest", "mistral-medium-latest", "mistral-small-latest"],
             default_model="mistral-large-latest"
         ),
         "meta": LLMProviderConfig(
             name="meta",
-            enabled=False,  # Default disabled
+            enabled=False,
             config={
-                "api_key": os.getenv("META_API_KEY", ""),
+                "api_keys": os.getenv("META_API_KEYS", "").split(",") if os.getenv("META_API_KEYS") else [],
                 "base_url": os.getenv("META_API_URL", "https://api.together.xyz/v1"),
                 "use_ollama": os.getenv("META_USE_OLLAMA", "false").lower() == "true",
                 "timeout": 60,
@@ -155,99 +176,27 @@ class Settings(BaseModel):
                 "llama-3.2-11b-vision-instruct", "llama-3.1-405b-instruct"
             ],
             default_model="llama-3.1-405b-instruct"
+        ),
+        "anthropic": LLMProviderConfig(
+            name="anthropic",
+            enabled=False,
+            config={
+                "api_keys": os.getenv("ANTHROPIC_API_KEYS", "").split(",") if os.getenv("ANTHROPIC_API_KEYS") else [],
+                "base_url": os.getenv("ANTHROPIC_API_URL", "https://api.anthropic.com/v1"),
+                "timeout": 120,
+                "temperature": 0.7,
+                "max_tokens": 4096
+            },
+            models=[
+                "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", 
+                "claude-3-opus-20240229", "claude-3-sonnet-20240229"
+            ],
+            default_model="claude-3-5-sonnet-20241022"
         )
     })
     
-    # Agents - Configurable capabilities với provider riêng
-    agents: Dict[str, AgentConfig] = Field(default_factory=lambda: {
-        "hr_specialist": AgentConfig(
-            name="hr_specialist",
-            enabled=True,
-            domain="hr",
-            capabilities=[
-                "policy_analysis", "compensation_queries", "employee_benefits",
-                "workplace_regulations", "performance_management"
-            ],
-            tools=["document_search", "web_search"],
-            model="gemini-2.0-flash",
-            provider="gemini", 
-            confidence_threshold=0.75
-        ),
-        "finance_specialist": AgentConfig(
-            name="finance_specialist",
-            enabled=True,
-            domain="finance",
-            capabilities=[
-                "financial_analysis", "budget_planning", "cost_analysis",
-                "tax_regulations", "audit_procedures"
-            ],
-            tools=["document_search", "calculation", "web_search"],
-            model="llama3.1:8b",
-            provider="ollama",
-            confidence_threshold=0.75
-        ),
-        "it_specialist": AgentConfig(
-            name="it_specialist",
-            enabled=True,
-            domain="it",
-            capabilities=[
-                "infrastructure_analysis", "security_assessment", "software_development",
-                "system_troubleshooting", "technology_planning"
-            ],
-            tools=["document_search", "web_search", "code_generation"],
-            model="mistral-large-latest", 
-            provider="mistral",
-            confidence_threshold=0.70
-        ),
-        "general_assistant": AgentConfig(
-            name="general_assistant",
-            enabled=True,
-            domain="general",
-            capabilities=[
-                "general_research", "information_synthesis", "communication_support",
-                "task_coordination", "multi_domain_analysis"
-            ],
-            tools=["web_search", "document_search", "translation"],
-            model="llama-3.1-405b",
-            provider="meta", 
-            confidence_threshold=0.60
-        )
-    })
-    
-    # Tools - Dynamic configuration
-    tools: Dict[str, Dict[str, Any]] = Field(default_factory=lambda: {
-        "document_search": {
-            "enabled": True,
-            "config": {
-                "top_k": 5,
-                "threshold": 0.7,
-                "timeout": 30
-            }
-        },
-        "web_search": {
-            "enabled": True,
-            "config": {
-                "engine": "duckduckgo",
-                "max_results": 5,
-                "timeout": 10,
-                "region": "vn-vi"
-            }
-        },
-        "calculation": {
-            "enabled": True,
-            "config": {
-                "max_expression_length": 1000,
-                "timeout": 5
-            }
-        },
-        "datetime": {
-            "enabled": True,
-            "config": {
-                "timezone": "Asia/Ho_Chi_Minh",
-                "formats": ["current", "date", "time", "detailed"]
-            }
-        }
-    })
+    # NO MORE HARDCODE AGENTS - Database-First approach
+    # Agents configuration loaded from database via agent_service
     
     # Workflow Configuration
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
@@ -270,10 +219,10 @@ class Settings(BaseModel):
         "chunk_size": 512,
         "chunk_overlap": 128,
         "embedding_model": "BAAI/bge-m3",
-        "embedding_dimensions": 1024
+        "embedding_dimensions": 1024,
+        "embedding_device": "cpu"
     })
     
-    # Multi-language Support - Remove hardcoded keywords
     languages: Dict[str, Dict[str, Any]] = Field(default_factory=lambda: {
         "vi": {
             "name": "Tiếng Việt",
@@ -331,20 +280,85 @@ class Settings(BaseModel):
     def is_development(self) -> bool:
         return self.ENV == "dev"
     
+    def _get_tool_settings_from_registry(self) -> Dict[str, bool]:
+        """Dynamic tool enablement from tool_registry + environment (DRY)"""
+        try:
+            from services.tools.tool_registry import tool_registry
+            
+            all_tools = tool_registry.get_all_tools()
+            tool_settings = {}
+            
+            for tool_name, tool_def in all_tools.items():
+                settings_key = tool_def.get("settings_key")
+                if settings_key:
+                    default_enabled = tool_def.get("default_enabled", True)
+                    env_value = os.getenv(settings_key, str(default_enabled).lower())
+                    tool_settings[tool_name] = env_value.lower() == "true"
+                else:
+                    tool_settings[tool_name] = True
+            
+            return tool_settings
+            
+        except Exception as e:
+            return {}
+    
+    
     def get_enabled_providers(self) -> List[str]:
         return [name for name, config in self.llm_providers.items() if config.enabled]
     
     def get_enabled_agents(self) -> List[str]:
-        return [name for name, config in self.agents.items() if config.enabled]
+        """Simple: Get enabled agents (to be implemented with database later)"""
+       
+        return []
     
     def get_enabled_tools(self) -> List[str]:
-        return [name for name, config in self.tools.items() if config.get("enabled", False)]
+        """Get list of tools enabled via environment variables (DRY)"""
+        tool_settings = self._get_tool_settings_from_registry()
+        return [tool_name for tool_name, enabled in tool_settings.items() if enabled]
     
-    def get_agent_config(self, agent_name: str) -> Optional[AgentConfig]:
-        return self.agents.get(agent_name)
+    def get_agent_config(self, agent_name: str) -> Optional[Dict[str, Any]]:
+       
+        return None
     
     def get_tool_config(self, tool_name: str) -> Optional[Dict[str, Any]]:
-        return self.tools.get(tool_name, {}).get("config")
+        """Get tool runtime configuration from tool_registry + environment (NO HARDCODE)"""
+        try:
+            from services.tools.tool_registry import tool_registry
+            
+            tool_def = tool_registry.get_tool_definition(tool_name)
+            if not tool_def:
+                return {}
+                
+            base_config = tool_def.get("tool_config", {})
+            runtime_config = {}
+            
+            for key, default_value in base_config.items():
+                env_key = f"{tool_name.upper()}_{key.upper()}"
+                env_value = os.getenv(env_key)
+                
+                if env_value is not None:
+                    if isinstance(default_value, int):
+                        runtime_config[key] = int(env_value)
+                    elif isinstance(default_value, float):
+                        runtime_config[key] = float(env_value)
+                    elif isinstance(default_value, bool):
+                        runtime_config[key] = env_value.lower() == "true"
+                    elif isinstance(default_value, list):
+                        runtime_config[key] = env_value.split(",") if env_value else []
+                    else:
+                        runtime_config[key] = env_value
+                else:
+                    runtime_config[key] = default_value
+                    
+            return runtime_config
+            
+        except Exception as e:
+            return {}
+    
+    def is_tool_enabled(self, tool_name: str) -> bool:
+        """Check if a tool is enabled via environment variable (DRY)"""
+        tool_settings = self._get_tool_settings_from_registry()
+        return tool_settings.get(tool_name, False)
     
     def get_provider_config(self, provider_name: str) -> Optional[Dict[str, Any]]:
         provider = self.llm_providers.get(provider_name)

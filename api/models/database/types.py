@@ -1,6 +1,7 @@
 from typing import Set
+from enum import Enum
 
-from common.types import AccessLevel, UserRole
+from common.types import *
 
 
 ACCESS_PERMISSIONS = {

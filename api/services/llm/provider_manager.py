@@ -521,67 +521,207 @@ class AnthropicProvider(BaseLLMProvider):
 
 class LLMProviderManager:
     """
-    Simplified LLM Provider Manager
-    Configuration-driven provider management
+    Database-first LLM Provider Manager with Registry Fallback
     """
+    
+    PROVIDER_CLASSES = {
+        "gemini": GeminiProvider,
+        "ollama": OllamaProvider,
+        "mistral": MistralProvider,
+        "meta": MetaProvider,
+        "anthropic": AnthropicProvider
+    }
     
     def __init__(self):
         self.settings = get_settings()
         self._providers: Dict[str, BaseLLMProvider] = {}
         self._initialized = False
+        self._db_session = None
     
-    async def initialize(self):
-        """Initialize enabled providers"""
+    async def initialize(self, db_session=None):
+        """Initialize enabled providers - DATABASE-FIRST approach"""
         if self._initialized:
             return
         
         try:
-            enabled_providers = self.settings.get_enabled_providers()
+            self._db_session = db_session
             
-            for provider_name in enabled_providers:
-                await self._initialize_provider(provider_name)
+            provider_configs = await self._load_providers_from_database()
+            
+            if not provider_configs:
+                logger.warning("No providers in database, using registry fallback")
+                provider_configs = await self._load_providers_from_registry_fallback()
+            
+            logger.info(f"Found {len(provider_configs)} provider configurations")
+            
+            initialized_count = 0
+            for provider_name, config in provider_configs.items():
+                if config.get("is_enabled", False):
+                    success = await self._initialize_provider(provider_name, config)
+                    if success:
+                        initialized_count += 1
             
             self._initialized = True
-            logger.info(f"LLM Provider Manager initialized with {len(self._providers)} providers")
+            logger.info(f"✅ LLM Provider Manager initialized with {initialized_count}/{len(provider_configs)} providers: {list(self._providers.keys())}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize LLM Provider Manager: {e}")
+            logger.error(f"❌ Failed to initialize LLM Provider Manager: {e}")
             raise
     
-    async def _initialize_provider(self, provider_name: str):
-        """Initialize specific provider"""
+    async def _load_providers_from_database(self) -> Dict[str, Dict[str, Any]]:
+        """Load provider configurations from database"""
         try:
-            provider_config = self.settings.llm_providers.get(provider_name)
+            if not self._db_session:
+                return {}
             
-            if not provider_config or not provider_config.enabled:
-                logger.info(f"Provider {provider_name} disabled")
-                return
+            from models.database import Provider
             
-            if provider_name == "gemini":
-                provider = GeminiProvider(provider_config)
-            elif provider_name == "ollama":
-                provider = OllamaProvider(provider_config)
-            elif provider_name == "mistral":
-                provider = MistralProvider(provider_config)
-            elif provider_name == "meta":
-                provider = MetaProvider(provider_config)
-            elif provider_name == "anthropic":
-                provider = AnthropicProvider(provider_config)
+            db_providers = self._db_session.query(Provider).all()
+            provider_configs = {}
+            
+            for db_provider in db_providers:
+                # Convert database Provider to LLMProviderConfig format
+                provider_configs[db_provider.name] = {
+                    "name": db_provider.name,
+                    "display_name": db_provider.display_name,
+                    "description": db_provider.description,
+                    "is_enabled": db_provider.is_enabled,
+                    "models": db_provider.models or [],
+                    "default_model": db_provider.default_model,
+                    "config": db_provider.provider_config or {},
+                    "source": "database"
+                }
+            
+            logger.info(f"📦 Loaded {len(provider_configs)} providers from database")
+            return provider_configs
+            
+        except Exception as e:
+            logger.error(f"Failed to load providers from database: {e}")
+            return {}
+    
+    async def _load_providers_from_registry_fallback(self) -> Dict[str, Dict[str, Any]]:
+        """Fallback: Load providers from registry + settings"""
+        try:
+            from services.llm.provider_registry import provider_registry
+            
+            registry_providers = provider_registry.get_all_providers()
+            provider_configs = {}
+            
+            for provider_name, registry_def in registry_providers.items():
+                # Check if enabled in settings
+                settings_config = self.settings.llm_providers.get(provider_name)
+                is_enabled = settings_config and settings_config.enabled if settings_config else False
+                
+                # Merge registry definition with settings
+                provider_configs[provider_name] = {
+                    "name": provider_name,
+                    "display_name": registry_def["display_name"],
+                    "description": registry_def["description"],
+                    "is_enabled": is_enabled,
+                    "models": registry_def["models"],
+                    "default_model": registry_def["default_model"],
+                    "config": {
+                        **registry_def["provider_config"],
+                        # Merge API keys from settings if available
+                        "api_keys": settings_config.config.get("api_keys", []) if settings_config else []
+                    },
+                    "source": "registry_fallback"
+                }
+            
+            logger.warning(f"🔄 Loaded {len(provider_configs)} providers from registry fallback")
+            return provider_configs
+            
+        except Exception as e:
+            logger.error(f"Registry fallback failed: {e}")
+            return {}
+    
+    def _convert_to_llm_provider_config(self, config: Dict[str, Any]) -> LLMProviderConfig:
+        """Convert config dict to LLMProviderConfig"""
+        return LLMProviderConfig(
+            name=config["name"],
+            enabled=config.get("is_enabled", False),
+            models=config.get("models", []),
+            default_model=config.get("default_model", ""),
+            config=config.get("config", {})
+        )
+    
+    async def _initialize_provider(self, provider_name: str, config: Dict[str, Any] = None) -> bool:
+        """Initialize specific provider from config"""
+        try:
+            # If no config provided, fallback to old behavior
+            if config is None:
+                provider_config = self.settings.llm_providers.get(provider_name)
+                if not provider_config or not provider_config.enabled:
+                    logger.info(f"Provider {provider_name} disabled or not configured")
+                    return False
+                llm_config = provider_config
             else:
-                logger.warning(f"Unknown provider: {provider_name}")
-                return
+                # New database-first approach
+                if not config.get("is_enabled", False):
+                    logger.info(f"Provider {provider_name} is disabled")
+                    return False
+                llm_config = self._convert_to_llm_provider_config(config)
+            
+            # Get provider class from registry
+            provider_class = self.PROVIDER_CLASSES.get(provider_name)
+            if not provider_class:
+                logger.warning(f"Unknown provider type: {provider_name}. Available: {list(self.PROVIDER_CLASSES.keys())}")
+                return False
+            
+            # Create provider instance
+            provider = provider_class(llm_config)
             
             # Initialize provider
             success = await provider.initialize()
             
             if success:
                 self._providers[provider_name] = provider
-                logger.info(f"Provider {provider_name} initialized successfully")
+                source = config.get("source", "settings") if config else "settings"
+                logger.info(f"✅ Provider {provider_name} initialized successfully ({source})")
+                return True
             else:
-                logger.error(f"Failed to initialize provider {provider_name}")
+                logger.error(f"❌ Failed to initialize provider {provider_name}")
+                return False
                 
         except Exception as e:
-            logger.error(f"Error initializing provider {provider_name}: {e}")
+            logger.error(f"❌ Error initializing provider {provider_name}: {e}")
+            return False
+    
+    def get_supported_providers(self) -> List[str]:
+        """Get list of all supported provider types"""
+        return list(self.PROVIDER_CLASSES.keys())
+    
+    def validate_provider_configs(self) -> Dict[str, List[str]]:
+        """Validate all provider configurations"""
+        validation_results = {}
+        
+        for provider_name, provider_config in self.settings.llm_providers.items():
+            issues = []
+            
+            # Check if provider type is supported
+            if provider_name not in self.PROVIDER_CLASSES:
+                issues.append(f"Unsupported provider type: {provider_name}")
+            
+            # Check required config fields
+            config = provider_config.config
+            if provider_name in ["gemini", "mistral", "meta", "anthropic"]:
+                if not config.get("api_keys") or not any(key.strip() for key in config.get("api_keys", [])):
+                    issues.append(f"Missing or empty API keys")
+            
+            if provider_name == "ollama":
+                if not config.get("base_url"):
+                    issues.append("Missing base_url for Ollama")
+            
+            # Check models
+            if not provider_config.models:
+                issues.append("No models configured")
+            
+            if not provider_config.default_model:
+                issues.append("No default model specified")
+            
+            validation_results[provider_name] = issues
+        
+        return validation_results
     
     async def get_provider(self, provider_name: Optional[str] = None) -> BaseLLMProvider:
         """Get LLM provider instance"""
@@ -596,22 +736,44 @@ class LLMProviderManager:
         else:
             return next(iter(self._providers.values()))
     
-    async def health_check_all(self) -> Dict[str, bool]:
-        """Check health of all providers"""
+    async def health_check_all(self) -> Dict[str, Dict[str, Any]]:
+        """Check health of all providers with detailed status"""
         health_status = {}
         
         for provider_name, provider in self._providers.items():
             try:
-                health_status[provider_name] = await provider.health_check()
+                is_healthy = await provider.health_check()
+                provider_config = self.settings.llm_providers.get(provider_name)
+                
+                health_status[provider_name] = {
+                    "healthy": is_healthy,
+                    "enabled": provider_config.enabled if provider_config else False,
+                    "models": provider_config.models if provider_config else [],
+                    "default_model": provider_config.default_model if provider_config else None
+                }
             except Exception as e:
                 logger.error(f"Health check failed for {provider_name}: {e}")
-                health_status[provider_name] = False
+                health_status[provider_name] = {
+                    "healthy": False,
+                    "error": str(e),
+                    "enabled": False
+                }
         
         return health_status
     
     def get_available_providers(self) -> List[str]:
-        """Get list of available providers"""
+        """Get list of available (initialized) providers"""
         return list(self._providers.keys())
+    
+    def get_provider_summary(self) -> Dict[str, Any]:
+        """Get summary of all provider configurations"""
+        return {
+            "supported": self.get_supported_providers(),
+            "configured": list(self.settings.llm_providers.keys()),
+            "enabled": self.settings.get_enabled_providers(),
+            "available": self.get_available_providers(),
+            "validation": self.validate_provider_configs()
+        }
 
 
 llm_provider_manager = LLMProviderManager()
