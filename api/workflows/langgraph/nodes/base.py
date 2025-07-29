@@ -1,0 +1,1 @@
+# base node for workflow of LangGraph

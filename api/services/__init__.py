@@ -14,7 +14,7 @@ from .tools.tool_service import ToolService
 
 # Agent Orchestration
 from .orchestrator.agent_orchestrator import AgentOrchestrator
-from .orchestrator.orchestrator_service import OrchestratorService
+from .orchestrator.orchestrator import OrchestratorService
 
 # Vector Operations
 from .vector.vector_service import VectorService

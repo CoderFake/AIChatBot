@@ -54,7 +54,6 @@ class Tenant(BaseModel):
         comment="Tenant configuration settings"
     )
     
-    # Relationships
     departments = relationship(
         "Department",
         back_populates="tenant",
