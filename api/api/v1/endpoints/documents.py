@@ -25,39 +25,31 @@ async def upload_document(
     title: Optional[str] = Form(None),
     author: Optional[str] = Form(None),
     department: Optional[str] = Form(None),
-    tags: Optional[str] = Form(""), 
     description: Optional[str] = Form(None),
     language: Optional[str] = Form("vi")
 ):
     """
-    Upload và process document cho RAG system
+    Upload and process document for RAG system
     """
     try:
         logger.info(f"Processing upload: {file.filename}")
-        
-        # Parse tags
-        tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
         
         metadata = DocumentMetadata(
             title=title or file.filename,
             author=author,
             department=department,
-            tags=tag_list,
             description=description,
             language=language
         )
         
-        # Read file content
         file_content = await file.read()
         
-        # Handle upload through service layer
         document_id, upload_info = await document_service.upload_document(
             filename=file.filename,
             file_content=file_content,
             metadata=metadata
         )
         
-        # Process document in background
         background_tasks.add_task(
             document_service.process_document_async,
             document_id,
@@ -84,21 +76,19 @@ async def upload_document(
 @log_performance()
 async def search_documents(request: DocumentSearchRequest):
     """
-    Search documents trong vector database
+    Search documents in vector database 
     """
     try:
         logger.info(f"Searching documents: {request.query}")
         
         start_time = asyncio.get_event_loop().time()
         
-        # Build search filters
-        search_filters = {}
+        search_filters = {} 
         if request.department:
             search_filters["department"] = request.department
         if request.document_type:
             search_filters["document_type"] = request.document_type
         
-        # Execute search through service layer
         results = await document_service.search_documents(
             query=request.query,
             top_k=request.top_k,
@@ -125,7 +115,7 @@ async def search_documents(request: DocumentSearchRequest):
 @router.get("/status/{document_id}", response_model=DocumentStatusResponse)
 async def get_document_status(document_id: str):
     """
-    Get processing status của document
+    Get processing status of document
     """
     try:
         status_info = await document_service.get_document_status(document_id)
@@ -156,10 +146,9 @@ async def list_documents(
     search: Optional[str] = None
 ):
     """
-    List documents với pagination và filtering
+    List documents with pagination and filtering    
     """
     try:
-        # Build filters
         filters = {}
         if department:
             filters["department"] = department
@@ -168,7 +157,6 @@ async def list_documents(
         if search:
             filters["search"] = search
         
-        # Get documents through service layer
         result = await document_service.list_documents(
             page=page,
             limit=limit,
@@ -191,12 +179,10 @@ async def list_documents(
 @router.delete("/delete/{document_id}", response_model=DocumentDeleteResponse)
 async def delete_document(document_id: str, background_tasks: BackgroundTasks):
     """
-    Delete document khỏi system
+    Delete document from system
     """
     try:
         logger.info(f"Deleting document: {document_id}")
-        
-        # Delete document through service layer (in background)
         background_tasks.add_task(document_service.delete_document, document_id)
         
         return DocumentDeleteResponse(
@@ -220,7 +206,6 @@ async def reprocess_document(document_id: str, background_tasks: BackgroundTasks
     try:
         logger.info(f"Reprocessing document: {document_id}")
         
-        # Reprocess document through service layer (in background)
         background_tasks.add_task(document_service.reprocess_document, document_id)
         
         return DocumentReprocessResponse(
@@ -239,7 +224,7 @@ async def reprocess_document(document_id: str, background_tasks: BackgroundTasks
 @router.get("/stats", response_model=DocumentStatsResponse)
 async def get_document_statistics():
     """
-    Get document statistics cho admin dashboard
+    Get document statistics for admin dashboard 
     """
     try:
         stats = await document_service.get_document_statistics()

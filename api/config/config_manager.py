@@ -1,6 +1,7 @@
 from typing import Dict, Any, List, Optional, Callable
 import asyncio
 import json
+from sqlalchemy.orm import Session
 from utils.datetime_utils import CustomDateTime as datetime
 
 from config.settings import get_settings, reload_settings, Settings
@@ -27,7 +28,204 @@ class ConfigManager:
         self._current_settings: Optional[Settings] = None
         self._monitoring = False
         self._change_queue: asyncio.Queue = asyncio.Queue()
+    
+    # ==================== DATABASE QUERIES (DRY) ====================
+    
+    def get_db_providers(self, db: Session) -> List[Dict[str, Any]]:
+        """Get all providers from database (DRY method)"""
+        try:
+            from models.database import Provider
+            
+            db_providers = db.query(Provider).all()
+            providers = []
+            
+            for provider in db_providers:
+                providers.append({
+                    "name": provider.name,
+                    "display_name": provider.display_name,
+                    "description": provider.description,
+                    "is_enabled": provider.is_enabled,
+                    "models": provider.models or [],
+                    "default_model": provider.default_model,
+                    "provider_config": provider.provider_config or {},
+                    "source": "database"
+                })
+            
+            return providers
+        except Exception as e:
+            logger.error(f"Failed to get DB providers: {e}")
+            return []
+    
+    def get_db_agents(self, db: Session) -> List[Dict[str, Any]]:
+        """Get all agents from database"""
+        try:
+            from models.database import Agent
+            
+            db_agents = db.query(Agent).all()
+            agents = []
+            
+            for agent in db_agents:
+                agents.append({
+                    "name": agent.name,
+                    "display_name": agent.display_name,
+                    "domain": agent.domain,
+                    "description": agent.description,
+                    "is_enabled": agent.is_enabled,
+                    "capabilities": agent.capabilities or [],
+                    "confidence_threshold": agent.confidence_threshold,
+                    "default_model": agent.default_model,
+                    "provider_name": agent.default_provider.name if agent.default_provider else None,
+                    "source": "database"
+                })
+            
+            return agents
+        except Exception as e:
+            logger.error(f"Failed to get DB agents: {e}")
+            return []
+    
+    def get_db_tools(self, db: Session) -> List[Dict[str, Any]]:
+        """Get all tools from database"""
+        try:
+            from models.database import Tool
+            
+            db_tools = db.query(Tool).all()
+            tools = []
+            
+            for tool in db_tools:
+                tools.append({
+                    "name": tool.name,
+                    "display_name": tool.display_name,
+                    "category": tool.category,
+                    "description": tool.description,
+                    "is_enabled": tool.is_enabled,
+                    "version": getattr(tool, 'version', '1.0.0'),
+                    "requirements": getattr(tool, 'requirements', {}) or {},
+                    "usage_limits": getattr(tool, 'usage_limits', {}) or {},
+                    "tool_config": tool.tool_config or {},
+                    "source": "database"
+                })
+            
+            return tools
+        except Exception as e:
+            logger.error(f"Failed to get DB tools: {e}")
+            return []
+    
+    def get_registry_providers(self) -> List[Dict[str, Any]]:
+        """Get providers from registry with settings check """
+        try:
+            from services.llm.provider_registry import provider_registry
+            
+            all_providers = provider_registry.get_all_providers()
+            providers = []
+            
+            for provider_name, provider_def in all_providers.items():
+                is_enabled = False
+                if hasattr(self._current_settings, 'llm_providers') and self._current_settings.llm_providers:
+                    is_enabled = provider_name in self._current_settings.llm_providers
+                
+                providers.append({
+                    "name": provider_name,
+                    "display_name": provider_def["display_name"],
+                    "description": provider_def["description"],
+                    "is_enabled": is_enabled,
+                    "models": provider_def["models"],
+                    "default_model": provider_def["default_model"],
+                    "provider_config": {
+                        **provider_def["provider_config"],
+                        "api_keys": self._current_settings.llm_providers.get(provider_name).config.get("api_keys", []) 
+                                   if self._current_settings.llm_providers and self._current_settings.llm_providers.get(provider_name) else []
+                    },
+                    "source": "registry_fallback"
+                })
+            
+            return providers
+        except Exception as e:
+            logger.error(f"Failed to get registry providers: {e}")
+            return []
+    
+    def get_registry_agents(self) -> List[Dict[str, Any]]:
+        """Get agents from registry with settings check (DRY method)"""
+        try:
+            from services.agents.agent_registry import agent_registry
+            
+            all_agents = agent_registry.get_all_agents()
+            agents = []
+            
+            for agent_name, agent_def in all_agents.items():
+                is_enabled = False
+                if hasattr(self._current_settings, 'agents') and self._current_settings.agents:
+                    is_enabled = agent_name in self._current_settings.agents
+                
+                agents.append({
+                    "name": agent_name,
+                    "display_name": agent_def["display_name"],
+                    "domain": agent_def["domain"],
+                    "description": agent_def["description"],
+                    "is_enabled": is_enabled,
+                    "capabilities": agent_def["capabilities"],
+                    "confidence_threshold": agent_def["confidence_threshold"],
+                    "default_model": agent_def["default_model"],
+                    "provider_name": agent_def["default_provider"],
+                    "source": "registry_fallback"
+                })
+            
+            return agents
+        except Exception as e:
+            logger.error(f"Failed to get registry agents: {e}")
+            return []
+    
+    def get_registry_tools(self) -> List[Dict[str, Any]]:
+        """Get tools from registry with settings check (DRY method)"""
+        try:
+            from services.tools.tool_registry import tool_registry
+            
+            all_tools = tool_registry.get_all_tools()
+            tools = []
+            
+            for tool_name, tool_def in all_tools.items():
+                is_enabled = self._current_settings.is_tool_enabled(tool_name)
+                tools.append({
+                    "name": tool_name,
+                    "display_name": tool_def.get("display_name", tool_name),
+                    "category": tool_def.get("category", "utility_tools"),
+                    "description": tool_def.get("description", ""),
+                    "is_enabled": is_enabled,
+                    "version": tool_def.get("version", "1.0.0"),
+                    "requirements": tool_def.get("requirements", {}),
+                    "usage_limits": tool_def.get("usage_limits", {}),
+                    "tool_config": tool_def.get("tool_config", {}),
+                    "source": "registry_fallback"
+                })
+            
+            return tools
+        except Exception as e:
+            logger.error(f"Failed to get registry tools: {e}")
+            return []
+    
+    def _format_config_response(self, items: List[Dict[str, Any]], source: str, warning: str = None, categories: List[str] = None, domains: List[str] = None) -> Dict[str, Any]:
+        """Format config response with enabled/disabled split (DRY method)"""
+        enabled_items = [item for item in items if item.get("is_enabled", False)]
+        disabled_items = [item for item in items if not item.get("is_enabled", False)]
         
+        response = {
+            "enabled_" + ("providers" if "provider" in source else "agents" if "agent" in source else "tools"): enabled_items,
+            "disabled_" + ("providers" if "provider" in source else "agents" if "agent" in source else "tools"): disabled_items,
+            "total_available": len(items),
+            "total_enabled": len(enabled_items),
+            "source": source
+        }
+        
+        if warning:
+            response["warning"] = warning
+        
+        if categories:
+            response["categories"] = categories
+        
+        if domains:
+            response["domains"] = domains
+            
+        return response
+    
     async def initialize(self):
         """Initialize configuration manager và tất cả components"""
         try:
@@ -217,8 +415,8 @@ class ConfigManager:
                     provider_config = self._current_settings.llm_providers.get(component_name)
                     old_value = provider_config.enabled if provider_config else False
             elif change_enum in [ConfigChangeType.TOOL_ENABLED, ConfigChangeType.TOOL_DISABLED]:
-                if hasattr(self._current_settings, 'tools') and self._current_settings.tools:
-                    old_value = self._current_settings.tools.get(component_name, {}).get("enabled", False)
+
+                old_value = self._current_settings.is_tool_enabled(component_name)
             elif change_enum in [ConfigChangeType.AGENT_ENABLED, ConfigChangeType.AGENT_DISABLED]:
                 if hasattr(self._current_settings, 'agents') and self._current_settings.agents:
                     agent_config = self._current_settings.agents.get(component_name)
@@ -335,45 +533,57 @@ class ConfigManager:
                     except Exception as e:
                         logger.error(f"Subscriber {component} failed to handle config change: {e}")
     
-    async def get_current_config(self) -> Dict[str, Any]:
-        """Get current configuration state"""
+    async def get_current_config(self, db: Session = None) -> Dict[str, Any]:
+        """Get current configuration state - DATABASE-FIRST approach"""
         if not self._current_settings:
             self._current_settings = get_settings()
         
         config = {}
         
         # Providers
-        if hasattr(self._current_settings, 'llm_providers') and self._current_settings.llm_providers:
-            config["providers"] = {
-                name: {
-                    "enabled": config.enabled,
-                    "models": config.models,
-                    "default_model": config.default_model
-                }
-                for name, config in self._current_settings.llm_providers.items()
-            }
+        if db:
+            try:
+                all_providers = self.get_db_providers(db)
+                config["providers"] = self._format_config_response(all_providers, "database_primary")
+            except Exception as e:
+                logger.warning(f"Database providers failed, using registry fallback: {e}")
+                all_providers = self.get_registry_providers()
+                config["providers"] = self._format_config_response(all_providers, "registry_fallback", "Database unavailable")
+        else:
+            all_providers = self.get_registry_providers()
+            config["providers"] = self._format_config_response(all_providers, "registry_fallback")
         
-        # Tools (from tool manager)
-        tools_summary = tool_manager.get_tools_summary()
-        enabled_tools = tool_manager.get_enabled_tools()
-        config["tools"] = {
-            "enabled_tools": enabled_tools,
-            "total_tools": tools_summary.get("total_tools", 0),
-            "system_tools": tools_summary.get("system_tools", 0),
-            "agent_tools": tools_summary.get("agent_tools", 0)
-        }
+        # Tools
+        if db:
+            try:
+                all_tools = self.get_db_tools(db)
+                categories = list(set([tool["category"] for tool in all_tools]))
+                config["tools"] = self._format_config_response(all_tools, "database_primary", categories=categories)
+            except Exception as e:
+                logger.warning(f"Database tools failed, using registry fallback: {e}")
+                all_tools = self.get_registry_tools()
+                categories = list(set([tool["category"] for tool in all_tools]))
+                config["tools"] = self._format_config_response(all_tools, "registry_fallback", "Database unavailable", categories)
+        else:
+            all_tools = self.get_registry_tools()
+            categories = list(set([tool["category"] for tool in all_tools]))
+            config["tools"] = self._format_config_response(all_tools, "registry_fallback", categories=categories)
         
         # Agents
-        if hasattr(self._current_settings, 'agents') and self._current_settings.agents:
-            config["agents"] = {
-                name: {
-                    "enabled": config.enabled,
-                    "domain": config.domain,
-                    "capabilities": config.capabilities,
-                    "model": config.model
-                }
-                for name, config in self._current_settings.agents.items()
-            }
+        if db:
+            try:
+                all_agents = self.get_db_agents(db)
+                domains = list(set([agent["domain"] for agent in all_agents]))
+                config["agents"] = self._format_config_response(all_agents, "database_primary", domains=domains)
+            except Exception as e:
+                logger.warning(f"Database agents failed, using registry fallback: {e}")
+                all_agents = self.get_registry_agents()
+                domains = list(set([agent["domain"] for agent in all_agents]))
+                config["agents"] = self._format_config_response(all_agents, "registry_fallback", "Database unavailable", domains)
+        else:
+            all_agents = self.get_registry_agents()
+            domains = list(set([agent["domain"] for agent in all_agents]))
+            config["agents"] = self._format_config_response(all_agents, "registry_fallback", domains=domains)
         
         # Workflow
         if hasattr(self._current_settings, 'workflow') and self._current_settings.workflow:

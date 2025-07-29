@@ -161,6 +161,63 @@ class PermissionService:
             logger.error(f"Failed to get user permissions: {e}")
             return {}
     
+    async def get_user_config_permissions(self, user_id: str) -> Dict[str, Any]:
+        """
+        DRY: Config permissions dùng chung logic với get_user_all_permissions
+        """
+        user_context = await self.get_user_all_permissions(user_id)
+        
+        if not user_context:
+            return {}
+        
+        permissions = user_context.get('permissions', [])
+        role = user_context.get('role', '')
+        department = user_context.get('department', '')
+        
+        # Config permissions based on user context
+        config_perms = {
+            'user_id': user_id,
+            'role': role,
+            'department': department,
+            'can_manage_all_tools': False,
+            'can_manage_all_providers': False,
+            'can_manage_all_configs': False,
+            'can_manage_department_tools': False,
+            'can_manage_department_providers': False,
+            'allowed_tools': [],
+            'allowed_providers': [],
+            'restrictions': {}
+        }
+        
+        # Admin có full access
+        if role == UserRole.ADMIN.value or 'admin_full_access' in permissions:
+            config_perms.update({
+                'can_manage_all_tools': True,
+                'can_manage_all_providers': True,
+                'can_manage_all_configs': True
+            })
+        else:
+            # Department-specific permissions
+            if 'config_tools' in permissions:
+                config_perms['can_manage_department_tools'] = True
+            
+            if 'config_providers' in permissions:
+                config_perms['can_manage_department_providers'] = True
+            
+            # Manager+ có extended permissions
+            if role in [UserRole.MANAGER.value, UserRole.DIRECTOR.value, UserRole.CEO.value]:
+                config_perms['can_manage_department_tools'] = True
+                config_perms['can_manage_department_providers'] = True
+            
+            # Set restrictions cho non-admin users
+            config_perms['restrictions'] = {
+                'department_only': True,
+                'requires_approval': role not in [UserRole.MANAGER.value, UserRole.DIRECTOR.value, UserRole.CEO.value],
+                'max_daily_changes': 10 if role == UserRole.EMPLOYEE.value else 50
+            }
+        
+        return config_perms
+    
     async def get_accessible_collections(self, user_id: str) -> List[str]:
         """
         Lấy danh sách collections user có thể truy cập

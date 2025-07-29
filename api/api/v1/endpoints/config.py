@@ -1,7 +1,4 @@
-"""
-Configuration Management API
-Quản lý cấu hình hệ thống với permission-based access control
-"""
+
 from fastapi import APIRouter, HTTPException, Depends, status
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -141,7 +138,7 @@ async def toggle_tool(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Bật/tắt tool
+    Bật/tắt tool - DATABASE-FIRST
     Permission: config_tools hoặc department manager
     """
     try:
@@ -153,19 +150,15 @@ async def toggle_tool(
                 detail=f"Không có quyền config tool {tool_name}"
             )
         
-        # Apply config change via config manager
-        change_data = {
-            "change_type": "tool_enabled" if enabled else "tool_disabled",
-            "component_name": tool_name,
-            "config": enabled
-        }
+        # Database-first approach
+        from services.tools.tool_service import tool_service
         
-        result = await config_manager.apply_config_change(change_data)
+        success = await tool_service.toggle_tool(db, tool_name, enabled)
         
-        if not result.get("success"):
+        if not success:
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.get("error", "Failed to apply config change")
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Tool {tool_name} không tồn tại trong database"
             )
         
         logger.info(f"User {user_context['user_id']} {'enabled' if enabled else 'disabled'} tool {tool_name}")
@@ -174,7 +167,7 @@ async def toggle_tool(
             "message": f"Tool {tool_name} đã được {'bật' if enabled else 'tắt'}",
             "tool_name": tool_name,
             "enabled": enabled,
-            "change_id": result.get("change_id"),
+            "source": "database",
             "timestamp": datetime.now().isoformat()
         }
         
@@ -200,7 +193,6 @@ async def toggle_provider(
     Permission: config_providers hoặc department manager
     """
     try:
-        # Check provider access permission
         has_access = await config_auth.verify_provider_config_access(provider_name, user_context)
         if not has_access:
             raise HTTPException(
@@ -245,40 +237,120 @@ async def toggle_provider(
 
 @router.get("/tools")
 async def list_available_tools(
-    user_context: Dict[str, Any] = Depends(verify_config_permission)
+    user_context: Dict[str, Any] = Depends(verify_config_permission),
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Lấy danh sách tools user có thể config
+    Lấy danh sách tools user có thể config - DATABASE-FIRST
     """
     try:
+        from services.tools.tool_service import tool_service
+        
         config_perms = user_context.get('config_permissions', {})
         department = user_context.get('department', '')
         
-        all_tools = tool_registry.get_all_tools()
-        
+        all_tools = await tool_service.get_all_tools(db)
         accessible_tools = {}
         
-        for tool_name, tool_def in all_tools.items():
+        for tool in all_tools:
+            can_access = False
             if config_perms.get('can_manage_all_tools'):
-                accessible_tools[tool_name] = tool_def
+                can_access = True
             elif config_perms.get('can_manage_department_tools'):
-                departments_allowed = tool_def.get('departments_allowed')
-                if not departments_allowed or department in departments_allowed:
-                    accessible_tools[tool_name] = tool_def
+                if tool.is_available_for_department(department):
+                    can_access = True
+            
+            if can_access:
+                accessible_tools[tool.name] = {
+                    "name": tool.name,
+                    "display_name": tool.display_name,
+                    "description": tool.description,
+                    "category": tool.category,
+                    "currently_enabled": tool.is_enabled,
+                    "can_toggle": True,
+                    "version": tool.version,
+                    "is_system": tool.is_system,
+                    "requirements": tool.requirements or {},
+                    "usage_limits": tool.usage_limits or {},
+                    "tool_config": tool.tool_config or {},
+                    "departments_allowed": tool.departments_allowed,
+                    "source": "database"
+                }
+        
+        enabled_count = sum(1 for tool in accessible_tools.values() if tool.get("currently_enabled", False))
         
         return {
             "tools": accessible_tools,
-            "total": len(accessible_tools),
+            "summary": {
+                "total_available": len(accessible_tools),
+                "enabled": enabled_count,
+                "disabled": len(accessible_tools) - enabled_count,
+                "categories": list(set([tool.get("category", "utility_tools") for tool in accessible_tools.values()])),
+                "source": "database"
+            },
             "user_permissions": config_perms,
             "department": department
         }
         
     except Exception as e:
-        logger.error(f"Error listing tools: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi lấy danh sách tools: {str(e)}"
-        )
+        logger.error(f"Error listing tools from database: {e}")
+        
+        # Fallback to registry if database fails
+        logger.warning("Database failed, using registry fallback")
+        try:
+            from config.settings import get_settings
+            
+            config_perms = user_context.get('config_permissions', {})
+            department = user_context.get('department', '')
+            settings = get_settings()
+            
+            all_tools = tool_registry.get_all_tools()
+            accessible_tools = {}
+            
+            for tool_name, tool_def in all_tools.items():
+                can_access = False
+                if config_perms.get('can_manage_all_tools'):
+                    can_access = True
+                elif config_perms.get('can_manage_department_tools'):
+                    departments_allowed = tool_def.get('departments_allowed')
+                    if not departments_allowed or department in departments_allowed:
+                        can_access = True
+                
+                if can_access:
+                    is_enabled = settings.is_tool_enabled(tool_name)
+                    accessible_tools[tool_name] = {
+                        "name": tool_name,
+                        "display_name": tool_def.get("display_name", tool_name),
+                        "description": tool_def.get("description", ""),
+                        "category": tool_def.get("category", "utility_tools"),
+                        "currently_enabled": is_enabled,
+                        "can_toggle": False,  # Không toggle được trong fallback mode
+                        "version": tool_def.get("version", "1.0.0"),
+                        "source": "registry_fallback",
+                        "warning": "Database unavailable"
+                    }
+            
+            enabled_count = sum(1 for tool in accessible_tools.values() if tool.get("currently_enabled", False))
+            
+            return {
+                "tools": accessible_tools,
+                "summary": {
+                    "total_available": len(accessible_tools),
+                    "enabled": enabled_count,
+                    "disabled": len(accessible_tools) - enabled_count,
+                    "source": "registry_fallback"
+                },
+                "warning": "Database unavailable, using registry fallback",
+                "user_permissions": config_perms,
+                "department": department
+            }
+            
+        except Exception as fallback_error:
+            logger.error(f"Both database and registry failed: {fallback_error}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Both database and fallback failed: {str(fallback_error)}"
+            )
 
 
 @router.get("/providers")

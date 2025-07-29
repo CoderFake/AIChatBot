@@ -23,38 +23,48 @@ async def lifespan(app: FastAPI):
     
     try:
         # 1. Initialize database connections
-        logger.info("📊 Initializing database connections...")
+        logger.info("Initializing database connections...")
         from config.database import init_db
         await init_db()
+        
+        # 1.5. Auto-sync registries to database (simple registry-based)
+        logger.info("🚀 Using registry-based configuration (no complex sync needed)")
         
         # 2. Initialize Milvus service (đã có)
         logger.info("🔍 Initializing Milvus service...")
         from services.vector.milvus_service import milvus_service
         await milvus_service.initialize()
         
-        # 3. Initialize LLM provider manager
+        # 3. Initialize LLM provider manager (database-first)
         logger.info("🧠 Initializing LLM providers...")
         from services.llm.provider_manager import llm_provider_manager
-        await llm_provider_manager.initialize()
+        from config.database import get_db_session
+        
+        # Pass database session to provider manager for database-first loading
+        db_session = next(get_db_session())
+        try:
+            await llm_provider_manager.initialize(db_session=db_session)
+        finally:
+            db_session.close()
         
         # 4. Initialize tool manager
-        logger.info("🛠️ Initializing tool manager...")
+        logger.info("Initializing tool manager...")
         from services.tools.tool_manager import tool_manager
         await tool_manager.initialize()
         
         # 5. Initialize intelligent orchestrator
-        logger.info("🎯 Initializing intelligent orchestrator...")
+        logger.info("Initializing intelligent orchestrator...")
         from services.orchestrator.intelligent_orchestrator import IntelligentOrchestrator
         orchestrator = IntelligentOrchestrator()
         # No explicit initialization needed - initialized on first use
         
         # 6. Initialize complete LangGraph workflow
-        logger.info("🔄 Initializing complete LangGraph workflow...")
+        logger.info("Initializing complete LangGraph workflow...")
         from workflows.langgraph.complete_workflow import complete_rag_workflow
         await complete_rag_workflow.initialize()
         
         # 7. Initialize streaming services
-        logger.info("🌊 Initializing streaming services...")
+        logger.info("Initializing streaming services...")
         from services.streaming.streaming_service import (
             streaming_orchestration_service,
             websocket_streaming_service
@@ -67,12 +77,12 @@ async def lifespan(app: FastAPI):
         milvus_healthy = await optimized_milvus_service.health_check()
         
         if not workflow_healthy:
-            logger.warning("⚠️ Workflow health check failed")
+            logger.warning("Workflow health check failed")
         if not milvus_healthy:
-            logger.warning("⚠️ Milvus health check failed")
+            logger.warning("Milvus health check failed")
         
         # 9. Log system configuration
-        logger.info("📋 System configuration:")
+        logger.info("System configuration:")
         logger.info(f"  • Environment: {settings.ENV}")
         logger.info(f"  • Enabled LLM providers: {settings.get_enabled_providers()}")
         logger.info(f"  • Enabled agents: {settings.get_enabled_agents()}")
@@ -82,7 +92,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"  • Streaming: Enabled")
         logger.info(f"  • Multi-language support: vi, en, ja, ko")
         
-        logger.info("✅ Complete Agentic RAG System started successfully!")
+        logger.info("Complete Agentic RAG System started successfully!")
         
         yield
         
@@ -91,7 +101,7 @@ async def lifespan(app: FastAPI):
         raise
     
     # Shutdown
-    logger.info("🔄 Shutting down Complete Agentic RAG System...")
+    logger.info("Shutting down Complete Agentic RAG System...")
     
     try:
         # Close database connections
@@ -103,52 +113,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}")
 
-# Create FastAPI app
 app = FastAPI(
     title="Complete Agentic RAG System",
     description="""
-    🚀 **Complete Agentic RAG System với Intelligent Orchestration**
-    
-    ## Tính năng chính:
-    
-    ### 🧠 Intelligent Orchestration
-    - LLM-driven agent selection (không hardcode)
-    - Dynamic task distribution
-    - Smart tool selection
-    - Conflict resolution giữa agents
-    
-    ### 🔍 Optimized Vector Search  
-    - Collection riêng cho từng agent
-    - Hybrid BM25 + Vector search
-    - Chunking tự động theo file size
-    - Reindexing tự động
-    
-    ### 🌊 Real-time Streaming
-    - Server-Sent Events (SSE)
-    - WebSocket support
-    - Progress tracking
-    - Batch processing
-    
-    ### 🌍 Multi-language Support
-    - Vietnamese (default)
-    - English, Japanese, Korean
-    - Language-specific response formatting
-    
-    ### 🔐 Permission System
-    - Department-level isolation
-    - Document access control
-    - Tool permissions
-    - Audit trail
-    
-    ## Workflow Steps:
-    1. **Query Analysis**: Phân tích và tinh chỉnh query
-    2. **Task Distribution**: Phân phối nhiệm vụ cho agents  
-    3. **Tool Selection**: Chọn tools phù hợp
-    4. **RAG Retrieval**: Tìm kiếm documents với permission check
-    5. **Document Evaluation**: Đánh giá và xếp hạng documents
-    6. **Agent Execution**: Thực hiện agents song song
-    7. **Conflict Resolution**: Giải quyết xung đột
-    8. **Response Assembly**: Tạo response cuối với evidence
+    Agentic RAG System 
     """,
     version="3.0.0",
     docs_url="/docs" if settings.DEBUG else None,
@@ -181,7 +149,6 @@ async def log_requests(request: Request, call_next):
     
     process_time = time.time() - start_time
     
-    # Log request completion với details
     status_emoji = "✅" if response.status_code < 400 else "❌"
     logger.info(
         f"{status_emoji} {request.method} {request.url.path} - "
@@ -189,13 +156,11 @@ async def log_requests(request: Request, call_next):
         f"Time: {process_time:.4f}s"
     )
     
-    # Add performance headers
     response.headers["X-Process-Time"] = str(process_time)
     response.headers["X-System-Version"] = "3.0.0"
     
     return response
 
-# Include routers
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(streaming_router, prefix="/api/v1/chat", tags=["Streaming"])
 
@@ -206,7 +171,6 @@ async def root():
         from workflows.langgraph.workflow_graph import rag_workflow
         from services.vector.milvus_service import milvus_service
         
-        # Get system status
         workflow_status = await rag_workflow.get_workflow_status()
         milvus_stats = milvus_service.get_collection_stats()
         
