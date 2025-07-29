@@ -1,259 +1,311 @@
-from typing import List, Optional, Dict, Any
-from sqlalchemy import Column, String, Boolean, Integer, Float, Text, Index, ForeignKey
+# api/models/database/document.py
+"""
+Document models with hierarchical folder structure and access control
+Supports private/public collections for Milvus
+"""
+from sqlalchemy import Column, String, Boolean, Integer, Text, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from models.database.types import RoleTypes, DocumentAccessLevel, DBDocumentPermissionLevel
 
 from models.database.base import BaseModel
-from models.database.types import check_document_access
-from utils.datetime_utils import CustomDateTime
+
+
+class DocumentFolder(BaseModel):
+    """
+    Hierarchical folder structure for documents
+    Recursive folder organization within departments
+    """
+    
+    __tablename__ = "document_folders"
+    
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Department ID"
+    )
+    
+    folder_name = Column(
+        String(255),
+        nullable=False,
+        comment="Folder name"
+    )
+    
+    folder_path = Column(
+        String(1000),
+        nullable=False,
+        index=True,
+        comment="Full folder path"
+    )
+    
+    parent_folder_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("document_folders.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Parent folder ID for recursive structure"
+    )
+    
+    access_level = Column(
+        String(20),
+        nullable=False,
+        default="public",
+        index=True,
+        comment="Access level: private, public"
+    )
+    
+    created_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="User who created this folder"
+    )
+    
+    # Relationships
+    department = relationship("Department")
+    parent_folder = relationship("DocumentFolder", remote_side="DocumentFolder.id")
+    documents = relationship("Document", back_populates="folder")
+    
+    __table_args__ = (
+        UniqueConstraint('department_id', 'folder_path', name='uq_dept_folder_path'),
+        Index('idx_folder_access', 'department_id', 'access_level'),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<DocumentFolder(path='{self.folder_path}', access='{self.access_level}')>"
+
+
+class DocumentCollection(BaseModel):
+    """
+    Milvus collections for vector storage
+    Separate private and public collections per department
+    """
+    
+    __tablename__ = "document_collections"
+    
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Department ID"
+    )
+    
+    collection_name = Column(
+        String(100),
+        nullable=False,
+        unique=True,
+        index=True,
+        comment="Milvus collection name"
+    )
+    
+    collection_type = Column(
+        String(20),
+        nullable=False,
+        index=True,
+        comment="Collection type: private_milvus, public_milvus"
+    )
+    
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether collection is active"
+    )
+    
+    vector_config = Column(
+        JSONB,
+        nullable=True,
+        comment="Vector configuration settings"
+    )
+    
+    document_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Number of documents in collection"
+    )
+    
+    # Relationships
+    department = relationship("Department", back_populates="document_collections")
+    documents = relationship("Document", back_populates="collection")
+    
+    __table_args__ = (
+        UniqueConstraint('department_id', 'collection_type', name='uq_dept_collection_type'),
+        Index('idx_collection_active', 'is_active'),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<DocumentCollection(name='{self.collection_name}', type='{self.collection_type}')>"
+
 
 class Document(BaseModel):
     """
-    Document model lưu metadata của tài liệu
-    Hỗ trợ phân quyền private/public theo department
+    Document metadata with folder structure and access control
+    Links to Milvus collections for vector storage
     """
     
     __tablename__ = "documents"
     
-    # Basic info
+    # Basic information
     filename = Column(
         String(500),
         nullable=False,
-        comment="Tên file gốc"
+        comment="Original filename"
     )
     
     title = Column(
         String(500),
         nullable=False,
         index=True,
-        comment="Tiêu đề tài liệu"
+        comment="Document title"
     )
     
     description = Column(
         Text,
         nullable=True,
-        comment="Mô tả tài liệu"
+        comment="Document description"
     )
     
-    # Ownership & Access
-    department = Column(
-        String(100),
+    # Relationships
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="Department sở hữu tài liệu"
+        comment="Department ID"
     )
     
-    access_level = Column(
-        String(50),
-        nullable=False,
-        default="public",
+    folder_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("document_folders.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
-        comment="public, private, internal, confidential, restricted"
+        comment="Folder ID for organization"
+    )
+    
+    collection_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("document_collections.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Milvus collection ID"
     )
     
     uploaded_by = Column(
-        String(36),
-        ForeignKey("users.id"),
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
         nullable=False,
         index=True,
-        comment="User upload tài liệu"
+        comment="User who uploaded document"
     )
     
-    # File info
+    # Access control
+    access_level = Column(
+        String(20),
+        nullable=False,
+        default="public",
+        index=True,
+        comment="Access level: private, public"
+    )
+    
+    # File information
     file_size = Column(
         Integer,
         nullable=False,
-        comment="Kích thước file (bytes)"
+        comment="File size in bytes"
     )
     
     file_type = Column(
         String(20),
         nullable=False,
         index=True,
-        comment="Loại file: pdf, docx, txt, md"
+        comment="File type: pdf, docx, txt, etc."
     )
     
-    content_hash = Column(
-        String(64),
+    storage_key = Column(
+        String(1000),
         nullable=False,
+        unique=True,
         index=True,
-        comment="SHA-256 hash để detect duplicate"
+        comment="MinIO/S3 storage key"
     )
     
-    language = Column(
-        String(10),
+    bucket_name = Column(
+        String(100),
         nullable=False,
-        default="vi",
-        index=True,
-        comment="Ngôn ngữ: vi, en, ja, ko"
+        comment="MinIO bucket name"
     )
     
-    # Processing info
+    # Processing status
     processing_status = Column(
-        String(50),
+        String(20),
         nullable=False,
         default="pending",
         index=True,
-        comment="pending, processing, completed, failed"
+        comment="Processing status: pending, processing, completed, failed"
+    )
+    
+    vector_status = Column(
+        String(20),
+        nullable=False,
+        default="pending",
+        index=True,
+        comment="Vector processing status: pending, processing, completed, failed"
+    )
+    
+    # Metadata
+    metadata = Column(
+        JSONB,
+        nullable=True,
+        comment="Additional document metadata"
     )
     
     chunk_count = Column(
         Integer,
         nullable=False,
         default=0,
-        comment="Số lượng chunks được tạo"
-    )
-    
-    vector_collection = Column(
-        String(100),
-        nullable=True,
-        index=True,
-        comment="Collection trong Milvus"
-    )
-    
-    # Storage paths
-    storage_path = Column(
-        String(1000),
-        nullable=True,
-        comment="Path trong MinIO"
-    )
-    
-    error_message = Column(
-        Text,
-        nullable=True,
-        comment="Lỗi processing nếu có"
-    )
-    
-    # Stats
-    access_count = Column(
-        Integer,
-        nullable=False,
-        default=0,
-        comment="Số lần được truy cập"
-    )
-    
-    last_accessed = Column(
-        nullable=True,
-        comment="Lần truy cập cuối"
-    )
-    
-    # Metadata & references
-    tags = Column(
-        JSONB,
-        nullable=True,
-        comment="Tags cho search"
-    )
-    
-    references = Column(
-        JSONB,
-        nullable=True,
-        comment="Thông tin tham khảo: source, url, author, date"
+        comment="Number of text chunks"
     )
     
     # Relationships
-    uploader = relationship("User", foreign_keys=[uploaded_by])
+    department = relationship("Department")
+    folder = relationship("DocumentFolder", back_populates="documents")
+    collection = relationship("DocumentCollection", back_populates="documents")
+    uploaded_by_user = relationship("User", back_populates="documents")
     
     __table_args__ = (
-        Index('idx_doc_dept_access', 'department', 'access_level'),
-        Index('idx_doc_status', 'processing_status'),
-        Index('idx_doc_type_lang', 'file_type', 'language'),
-        Index('idx_doc_hash', 'content_hash'),
-        Index('idx_doc_collection', 'vector_collection'),
+        Index('idx_doc_dept_access', 'department_id', 'access_level'),
+        Index('idx_doc_status', 'processing_status', 'vector_status'),
+        Index('idx_doc_type', 'file_type'),
+        Index('idx_doc_storage', 'bucket_name', 'storage_key'),
     )
     
-    def is_accessible_by_user(self, user_department: str, user_role: str) -> bool:
-        """Check xem user có thể access document không"""
-        return check_document_access(
-            access_level=self.access_level,
-            user_role=user_role,
-            user_department=user_department,
-            document_department=self.department
-        )
+    def get_storage_path(self) -> str:
+        """Get full storage path for MinIO/S3"""
+        return f"{self.bucket_name}/{self.storage_key}"
     
-    def record_access(self):
-        """Ghi nhận lần truy cập"""
-        self.last_accessed = CustomDateTime.now()
-        self.access_count += 1
+    def get_access_type(self) -> str:
+        """Get access type for Milvus collection routing"""
+        return DBDocumentPermissionLevel.PRIVATE.value if self.access_level == DocumentAccessLevel.PRIVATE.value else DBDocumentPermissionLevel.PUBLIC.value
     
-    def update_processing(self, status: str, chunk_count: int = None, error: str = None):
-        """Cập nhật trạng thái processing"""
-        self.processing_status = status
-        if chunk_count is not None:
-            self.chunk_count = chunk_count
-        if error:
-            self.error_message = error
-    
-    def get_reference_info(self) -> Dict[str, Any]:
-        """Lấy thông tin reference để citation"""
-        if not self.references:
-            return {
-                "title": self.title,
-                "source": "Internal Document",
-                "department": self.department,
-                "date": self.created_at.strftime("%Y-%m-%d") if self.created_at else None
-            }
+    def can_access(self, user_id: str, user_department_id: str, user_role: str) -> bool:
+        """Check if user can access this document"""
         
-        return self.references
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary"""
-        data = super().to_dict()
-        data.update({
-            'file_size_mb': round(self.file_size / (1024 * 1024), 2),
-            'is_completed': self.processing_status == "completed",
-            'reference_info': self.get_reference_info()
-        })
-        return data
-    
-    def __repr__(self) -> str:
-        return f"<Document(id={self.id}, title='{self.title}', dept='{self.department}')>"
-
-class DocumentAccessLog(BaseModel):
-    """
-    Simple access log cho documents
-    """
-    
-    __tablename__ = "document_access_logs"
-    
-    document_id = Column(
-        String(36),
-        ForeignKey("documents.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True
-    )
-    
-    user_id = Column(
-        String(36),
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True
-    )
-    
-    access_type = Column(
-        String(50),
-        nullable=False,
-        comment="VIEW, SEARCH, DOWNLOAD"
-    )
-    
-    query_used = Column(
-        Text,
-        nullable=True,
-        comment="Query search nếu có"
-    )
-    
-    ip_address = Column(
-        String(45),
-        nullable=True
-    )
-    
-    # Relationships
-    document = relationship("Document")
-    user = relationship("User")
-    
-    __table_args__ = (
-        Index('idx_access_doc_time', 'document_id', 'created_at'),
-        Index('idx_access_user_time', 'user_id', 'created_at'),
-    )
+        if str(self.department_id) != user_department_id:
+            if user_role not in [RoleTypes.ADMIN.value, RoleTypes.MAINTAINER.value]:
+                return False
+        
+        if self.access_level == DocumentAccessLevel.PRIVATE.value:
+            if str(self.uploaded_by) == user_id:
+                return True
+            if user_role in [RoleTypes.ADMIN.value, RoleTypes.MAINTAINER.value, RoleTypes.DEPT_ADMIN.value, RoleTypes.DEPT_MANAGER.value]:
+                return True
+            return False
+        
+        return True
     
     def __repr__(self) -> str:
-        return f"<DocumentAccessLog(doc={self.document_id}, user={self.user_id}, type='{self.access_type}')>"
+        return f"<Document(title='{self.title}', access='{self.access_level}')>"

@@ -1,69 +1,63 @@
 # api/models/database/permission.py
-
-from typing import List, Optional, Dict, Any
-from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index, UniqueConstraint
+"""
+Enhanced permission system with role-based access control
+Supports tenant, department, and user-level permissions
+"""
+from sqlalchemy import Column, String, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
 
+
 class Permission(BaseModel):
     """
-    Permission model định nghĩa các quyền trong hệ thống
+    Permission definitions for the system
+    Granular permissions for different actions and resources
     """
     
     __tablename__ = "permissions"
     
-    permission_name = Column(
+    permission_code = Column(
         String(100),
         nullable=False,
         unique=True,
         index=True,
-        comment="Tên permission duy nhất"
+        comment="Unique permission code"
     )
     
-    display_name = Column(
+    permission_name = Column(
         String(200),
         nullable=False,
-        comment="Tên hiển thị permission"
+        comment="Permission display name"
     )
     
     description = Column(
         Text,
         nullable=True,
-        comment="Mô tả chi tiết permission"
-    )
-    
-    category = Column(
-        String(50),
-        nullable=False,
-        index=True,
-        comment="Danh mục: DOCUMENT, TOOL, ADMIN, DEPARTMENT"
+        comment="Permission description"
     )
     
     resource_type = Column(
         String(50),
-        nullable=True,
-        comment="Loại resource: collection, tool, function"
+        nullable=False,
+        index=True,
+        comment="Resource type: document, tool, config, user"
     )
     
-    actions = Column(
-        JSONB,
-        nullable=True,
-        comment="Các actions được phép: read, write, delete, execute"
-    )
-    
-    conditions = Column(
-        JSONB,
-        nullable=True,
-        comment="Điều kiện áp dụng permission"
+    action = Column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="Action: read, write, delete, admin"
     )
     
     is_system = Column(
         Boolean,
         nullable=False,
         default=False,
-        comment="Permission hệ thống không thể xóa"
+        comment="System permission that cannot be deleted"
     )
     
     # Relationships
@@ -80,65 +74,67 @@ class Permission(BaseModel):
     )
     
     __table_args__ = (
-        Index('idx_permission_category', 'category'),
-        Index('idx_permission_resource', 'resource_type'),
+        Index('idx_permission_resource_action', 'resource_type', 'action'),
     )
     
     def __repr__(self) -> str:
-        return f"<Permission(name='{self.permission_name}', category='{self.category}')>"
+        return f"<Permission(code='{self.permission_code}', resource='{self.resource_type}')>"
+
 
 class Group(BaseModel):
     """
-    Group model cho phân quyền theo nhóm
+    Groups for organizing users and permissions
+    Department-based and role-based grouping
     """
     
     __tablename__ = "groups"
     
-    group_name = Column(
+    group_code = Column(
         String(100),
         nullable=False,
         unique=True,
         index=True,
-        comment="Tên group duy nhất"
+        comment="Unique group code"
     )
     
-    display_name = Column(
+    group_name = Column(
         String(200),
         nullable=False,
-        comment="Tên hiển thị group"
+        comment="Group display name"
     )
     
     description = Column(
         Text,
         nullable=True,
-        comment="Mô tả group"
+        comment="Group description"
     )
     
     group_type = Column(
         String(50),
         nullable=False,
         index=True,
-        comment="Loại group: DEPARTMENT, ROLE, CUSTOM"
+        comment="Group type: DEPARTMENT, ROLE, CUSTOM"
     )
     
-    department = Column(
-        String(100),
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
-        comment="Department liên quan (nếu có)"
+        comment="Department ID if department-specific group"
     )
     
     is_system = Column(
         Boolean,
         nullable=False,
         default=False,
-        comment="Group hệ thống không thể xóa"
+        comment="System group that cannot be deleted"
     )
     
     settings = Column(
         JSONB,
         nullable=True,
-        comment="Cài đặt group"
+        comment="Group settings"
     )
     
     # Relationships
@@ -155,55 +151,60 @@ class Group(BaseModel):
     )
     
     __table_args__ = (
-        Index('idx_group_type_dept', 'group_type', 'department'),
+        Index('idx_group_type_dept', 'group_type', 'department_id'),
     )
     
     def __repr__(self) -> str:
-        return f"<Group(name='{self.group_name}', type='{self.group_type}')>"
+        return f"<Group(code='{self.group_code}', type='{self.group_type}')>"
+
 
 class UserPermission(BaseModel):
     """
-    User permission mapping - quyền trực tiếp của user
+    Direct user permissions
+    Individual permissions assigned to users
     """
     
     __tablename__ = "user_permissions"
     
     user_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của user"
+        comment="User ID"
     )
     
     permission_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("permissions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của permission"
+        comment="Permission ID"
     )
     
     granted_by = Column(
-        String(36),
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
-        comment="User ID của người cấp quyền"
+        comment="User who granted this permission"
     )
     
     expires_at = Column(
+        DateTime(timezone=True),
         nullable=True,
-        comment="Thời điểm hết hạn quyền"
+        comment="Permission expiration timestamp"
     )
     
     conditions = Column(
         JSONB,
         nullable=True,
-        comment="Điều kiện áp dụng cho permission này"
+        comment="Conditions for this permission"
     )
     
     # Relationships
-    user = relationship("User", back_populates="permissions")
+    user = relationship("User", back_populates="permissions", foreign_keys=[user_id])
     permission = relationship("Permission", back_populates="user_permissions")
+    granted_by_user = relationship("User", foreign_keys=[granted_by])
     
     __table_args__ = (
         UniqueConstraint('user_id', 'permission_id', name='uq_user_permission'),
@@ -211,41 +212,44 @@ class UserPermission(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<UserPermission(user_id='{self.user_id}', permission='{self.permission.permission_name}')>"
+        return f"<UserPermission(user_id='{self.user_id}', permission_id='{self.permission_id}')>"
+
 
 class GroupPermission(BaseModel):
     """
-    Group permission mapping - quyền của group
+    Group permissions
+    Permissions assigned to groups
     """
     
     __tablename__ = "group_permissions"
     
     group_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("groups.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của group"
+        comment="Group ID"
     )
     
     permission_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("permissions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của permission"
+        comment="Permission ID"
     )
     
     granted_by = Column(
-        String(36),
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
-        comment="User ID của người cấp quyền"
+        comment="User who granted this permission"
     )
     
     conditions = Column(
         JSONB,
         nullable=True,
-        comment="Điều kiện áp dụng cho permission này"
+        comment="Conditions for this permission"
     )
     
     # Relationships
@@ -257,52 +261,57 @@ class GroupPermission(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<GroupPermission(group='{self.group.group_name}', permission='{self.permission.permission_name}')>"
+        return f"<GroupPermission(group_id='{self.group_id}', permission_id='{self.permission_id}')>"
+
 
 class UserGroupMembership(BaseModel):
     """
-    User group membership - thành viên của group
+    User group membership
+    Many-to-many relationship between users and groups
     """
     
     __tablename__ = "user_group_memberships"
     
     user_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của user"
+        comment="User ID"
     )
     
     group_id = Column(
-        String(36),
+        UUID(as_uuid=True),
         ForeignKey("groups.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="ID của group"
+        comment="Group ID"
     )
     
     added_by = Column(
-        String(36),
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
-        comment="User ID của người thêm vào group"
+        comment="User who added this membership"
     )
     
     role_in_group = Column(
         String(50),
         nullable=False,
         default="MEMBER",
-        comment="Vai trò trong group: MEMBER, ADMIN"
+        comment="Role in group: MEMBER, ADMIN"
     )
     
     expires_at = Column(
+        DateTime(timezone=True),
         nullable=True,
-        comment="Thời điểm hết hạn membership"
+        comment="Membership expiration timestamp"
     )
     
     # Relationships
-    user = relationship("User", back_populates="group_memberships")
+    user = relationship("User", back_populates="group_memberships", foreign_keys=[user_id])
     group = relationship("Group", back_populates="members")
+    added_by_user = relationship("User", foreign_keys=[added_by])
     
     __table_args__ = (
         UniqueConstraint('user_id', 'group_id', name='uq_user_group'),
@@ -310,51 +319,4 @@ class UserGroupMembership(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<UserGroupMembership(user_id='{self.user_id}', group='{self.group.group_name}')>"
-
-class ToolPermission(BaseModel):
-    """
-    Tool permission model - mapping giữa tool và permission
-    """
-    
-    __tablename__ = "tool_permissions"
-    
-    tool_id = Column(
-        String(36),
-        ForeignKey("tools.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="ID của tool"
-    )
-    
-    permission_id = Column(
-        String(36),
-        ForeignKey("permissions.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="Permission cần thiết để sử dụng tool"
-    )
-    
-    is_enabled = Column(
-        Boolean,
-        nullable=False,
-        default=True,
-        comment="Permission mapping có được bật không"
-    )
-    
-    conditions = Column(
-        JSONB,
-        nullable=True,
-        comment="Điều kiện bổ sung cho permission này"
-    )
-    
-    # Relationships
-    tool = relationship("Tool", back_populates="tool_permissions")
-    permission = relationship("Permission")
-    
-    __table_args__ = (
-        UniqueConstraint('tool_id', 'permission_id', name='uq_tool_permission'),
-    )
-    
-    def __repr__(self) -> str:
-        return f"<ToolPermission(tool='{self.tool.name}', permission='{self.permission.permission_name}', enabled={self.is_enabled})>"
+        return f"<UserGroupMembership(user_id='{self.user_id}', group_id='{self.group_id}')>"

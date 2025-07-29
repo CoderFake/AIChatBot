@@ -1,147 +1,142 @@
-"""
-Agent model - ĐƠN GIẢN, chỉ những field cần thiết
-"""
-from typing import Dict, Any, List
-from sqlalchemy import Column, String, Boolean, Text, Float, ForeignKey, Index
+from sqlalchemy import Column, String, Boolean, Text, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
 
 
 class Agent(BaseModel):
     """
-    Agent model simple - only the fields needed
+    Agent definition for multi-agent RAG system
+    Each department has exactly one agent
     """
     
     __tablename__ = "agents"
     
-    # Basic info
-    name = Column(
-        String(100),
+    agent_code = Column(
+        String(50),
         nullable=False,
         unique=True,
         index=True,
-        comment="Tên agent: hr_specialist, finance_specialist, etc."
+        comment="Unique agent code"
     )
     
-    display_name = Column(
-        String(200),
+    agent_name = Column(
+        String(100),
         nullable=False,
-        comment="Tên hiển thị"
-    )
-    
-    domain = Column(
-        String(50),
-        nullable=False,
-        index=True,
-        comment="Domain: hr, finance, it, general"
+        comment="Agent display name"
     )
     
     description = Column(
         Text,
-        nullable=True,
-        comment="Mô tả agent"
-    )
-    
-    # Status
-    is_enabled = Column(
-        Boolean,
         nullable=False,
-        default=False,  # SECURITY-FIRST: Mặc định TẮT
-        index=True,
-        comment="Agent có được bật không"
-    )
-    
-    # Configuration - ĐƠN GIẢN
-    capabilities = Column(
-        JSONB,
-        nullable=True,
-        comment="Danh sách capabilities: ['policy_analysis', 'compensation_queries']"
-    )
-    
-    confidence_threshold = Column(
-        Float,
-        nullable=False,
-        default=0.7,
-        comment="Ngưỡng confidence"
-    )
-    
-    # Provider
-    default_provider_id = Column(
-        String(36),
-        ForeignKey("providers.id"),
-        nullable=True,
-        index=True,
-        comment="Provider mặc định cho agent"
-    )
-    
-    default_model = Column(
-        String(100),
-        nullable=False,
-        default="gemini-2.0-flash",
-        comment="Model mặc định"
-    )
-    
-    # Relationships
-    provider = relationship("Provider", foreign_keys=[default_provider_id])
-    agent_tools = relationship("AgentTool", back_populates="agent", cascade="all, delete-orphan")
-    
-    __table_args__ = (
-        Index('idx_agent_domain_enabled', 'domain', 'is_enabled'),
-    )
-    
-    def get_capabilities_list(self) -> List[str]:
-        """Lấy list capabilities"""
-        return self.capabilities or []
-    
-    def get_enabled_tools(self) -> List[str]:
-        """Lấy tools đang enabled cho agent này"""
-        return [at.tool.name for at in self.agent_tools if at.is_enabled and at.tool.is_enabled]
-    
-    def __repr__(self) -> str:
-        return f"<Agent(name='{self.name}', domain='{self.domain}', enabled={self.is_enabled})>"
-
-
-class AgentTool(BaseModel):
-    """
-    Agent-Tool relationship - ĐƠNG GIẢN
-    1 Agent có NHIỀU Tools
-    """
-    
-    __tablename__ = "agent_tools"
-    
-    agent_id = Column(
-        String(36),
-        ForeignKey("agents.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="ID của agent"
-    )
-    
-    tool_id = Column(
-        String(36),
-        ForeignKey("tools.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        comment="ID của tool"
+        comment="Agent description and capabilities"
     )
     
     is_enabled = Column(
         Boolean,
         nullable=False,
         default=True,
-        comment="Tool có enabled cho agent này không"
+        comment="Whether agent is enabled"
+    )
+    
+    is_system = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="System agent that cannot be deleted"
+    )
+    
+    department_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+        comment="Department that owns this agent (1:1 relationship)"
+    )
+    
+    provider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("providers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Primary provider for this agent"
+    )
+    
+    model_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("provider_models.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Primary model for this agent"
     )
     
     # Relationships
-    agent = relationship("Agent", back_populates="agent_tools")
+    department = relationship("Department", back_populates="agent")
+    provider = relationship("Provider")
+    model = relationship("ProviderModel")
+    
+    tool_configs = relationship(
+        "AgentToolConfig",
+        back_populates="agent",
+        cascade="all, delete-orphan"
+    )
+    
+    __table_args__ = (
+        Index('idx_agent_enabled', 'is_enabled'),
+        Index('idx_agent_provider', 'provider_id'),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<Agent(code='{self.agent_code}', department_id='{self.department_id}')>"
+
+
+class AgentToolConfig(BaseModel):
+    """
+    Agent-tool mapping configuration
+    Which tools each agent can access
+    """
+    
+    __tablename__ = "agent_tool_configs"
+    
+    agent_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Agent ID"
+    )
+    
+    tool_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tools.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Tool ID"
+    )
+    
+    is_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether agent can use this tool"
+    )
+    
+    config_data = Column(
+        JSONB,
+        nullable=True,
+        comment="Agent-specific tool configuration"
+    )
+    
+    agent = relationship("Agent", back_populates="tool_configs")
     tool = relationship("Tool")
     
     __table_args__ = (
-        Index('idx_agent_tool_unique', 'agent_id', 'tool_id', unique=True),
+        UniqueConstraint('agent_id', 'tool_id', name='uq_agent_tool'),
         Index('idx_agent_tool_enabled', 'agent_id', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<AgentTool(agent_id={self.agent_id}, tool_id={self.tool_id}, enabled={self.is_enabled})>" 
+        return f"<AgentToolConfig(agent_id={self.agent_id}, tool_id={self.tool_id})>"
