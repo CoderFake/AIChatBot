@@ -1,91 +1,50 @@
 version: '3.8'
 
 services:
-  # Milvus Public 
-  milvus_public:
-    image: milvusdb/milvus:v2.6.0
-    container_name: milvus_public
-    restart: unless-stopped
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    environment:
-      - ETCD_ENDPOINTS=etcd:2379
-      - MINIO_ADDRESS=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-    volumes:
-      - milvus_public_data:/var/lib/milvus
-    depends_on:
-      - etcd
-      - minio
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - rag_network
-
-  # Milvus Private
-  milvus_private:
-    image: milvusdb/milvus:v2.6.0
-    container_name: milvus_private
-    restart: unless-stopped
-    ports:
-      - "19531:19530"
-      - "9092:9091"
-    environment:
-      - ETCD_ENDPOINTS=etcd:2379
-      - MINIO_ADDRESS=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-    volumes:
-      - milvus_private_data:/var/lib/milvus
-    depends_on:
-      - etcd
-      - minio
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - rag_network
-
-  # PostgreSQL
+  # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
-    container_name: postgres_rag
+    container_name: postgres
     restart: unless-stopped
     environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=en_US.UTF-8
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.UTF-8"
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40s
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # Redis
+  # Redis Cache
   redis:
     image: redis:7-alpine
-    container_name: redis_rag
+    container_name: redis
     restart: unless-stopped
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory ${REDIS_MAX_MEMORY:-512mb} --maxmemory-policy allkeys-lru ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory ${REDIS_MAX_MEMORY:-512mb} 
+      --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
     healthcheck:
       test: ["CMD", "redis-cli", "${REDIS_PASSWORD:+-a $REDIS_PASSWORD}", "ping"]
       interval: 30s
@@ -93,33 +52,43 @@ services:
       retries: 3
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # MinIO
+  # MinIO Object Storage
   minio:
     image: minio/minio:latest
-    container_name: minio_rag
+    container_name: minio
     restart: unless-stopped
     ports:
       - "${MINIO_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "${PROTOCOL}://${DOMAIN}:${MINIO_PORT}/minio/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # etcd
+  # etcd for Milvus
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
-    container_name: etcd_rag
+    container_name: etcd
     restart: unless-stopped
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -137,35 +106,106 @@ services:
     networks:
       - rag_network
 
-  # Zookeeper 
+  # Milvus Public Instance
+  milvus_public:
+    image: milvusdb/milvus:v2.6.0
+    container_name: milvus_public
+    restart: unless-stopped
+    ports:
+      - "${MILVUS_PUBLIC_PORT:-19530}:19530"
+      - "9091:9091"
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    volumes:
+      - milvus_public_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Milvus Private Instance
+  milvus_private:
+    image: milvusdb/milvus:v2.6.0
+    container_name: milvus_private
+    restart: unless-stopped
+    ports:
+      - "${MILVUS_PRIVATE_PORT:-19531}:19530"
+      - "9092:9091"
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    volumes:
+      - milvus_private_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Zookeeper
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
-    container_name: zookeeper_rag
+    container_name: zookeeper
     restart: unless-stopped
     environment:
-      - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOOKEEPER_TICK_TIME=2000
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
     volumes:
       - zookeeper_data:/var/lib/zookeeper/data
       - zookeeper_logs:/var/lib/zookeeper/log
     networks:
       - rag_network
 
+  # Kafka Message Queue
   kafka:
     image: confluentinc/cp-kafka:7.4.0
-    container_name: kafka_rag
+    container_name: kafka
     restart: unless-stopped
     ports:
       - "${KAFKA_PORT:-9092}:9092"
-      - "${KAFKA_HOST_PORT:-29092}:29092"
+      - "29092:29092"
     environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:${KAFKA_PORT:-9092},PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-29092}
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
     volumes:
       - kafka_data:/var/lib/kafka/data
     depends_on:
@@ -175,82 +215,163 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
     networks:
       - rag_network
+
+  # Ollama Local LLM (Optional)
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${OLLAMA_PORT:-11434}:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   environment:
+  #     - OLLAMA_HOST=0.0.0.0
+  #   networks:
+  #     - rag_network
+  #   profiles:
+  #     - ollama
+  #     - with-local-llm
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
+
   # Main API Application
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rag_api
+      target: ${ENV:-development}
+    container_name: api
     restart: unless-stopped
     ports:
       - "${APP_PORT:-8000}:8000"
-    env_file:
-      - .env
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - REDIS_URL=redis://${REDIS_PASSWORD:+:$REDIS_PASSWORD@}redis:6379/${REDIS_DB:-0}
-      - MILVUS_PUBLIC_URI=http://milvus_public:19530
-      - MILVUS_PRIVATE_URI=http://milvus_private:19530
-      - MINIO_ENDPOINT=minio:9000
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # Application Settings
+      - APP_NAME=${APP_NAME}
+      - APP_VERSION=${APP_VERSION}
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
+      - ENV=${ENV}
+      - TIMEZONE=${TIMEZONE}
+      
+      # Security
+      - SECRET_KEY=${SECRET_KEY}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}
+      - REFRESH_TOKEN_EXPIRE_DAYS=${REFRESH_TOKEN_EXPIRE_DAYS}
+      
+      # Database
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      
+      # Dual Milvus
+      - MILVUS_PUBLIC_URI=http://${MILVUS_PUBLIC_HOST}:19530
+      - MILVUS_PRIVATE_URI=http://${MILVUS_PRIVATE_HOST}:19530
+      - MILVUS_COLLECTION_PREFIX=${MILVUS_COLLECTION_PREFIX}
+      - MILVUS_VECTOR_DIM=${MILVUS_VECTOR_DIM}
+      
+      # MinIO Storage
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_SECURE=false
+      - STORAGE_BUCKET_PREFIX=${STORAGE_BUCKET_PREFIX}
+      
+      # Kafka
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_DOCUMENT_TOPIC=${KAFKA_DOCUMENT_TOPIC}
+      - KAFKA_CONSUMER_GROUP=${KAFKA_CONSUMER_GROUP}
+      
+      # BGE-M3 Embedding
+      - EMBEDDING_MODEL=${BGE_M3_MODEL}
+      - EMBEDDING_DIMENSIONS=${MILVUS_VECTOR_DIM}
+      - EMBEDDING_BATCH_SIZE=${BGE_M3_BATCH_SIZE}
+      - BGE_M3_USE_FP16=${BGE_M3_USE_FP16}
+      - BGE_M3_MAX_LENGTH=${BGE_M3_MAX_LENGTH}
+      
+      # MMR Configuration
+      - MMR_LAMBDA_DEFAULT=${MMR_LAMBDA_DEFAULT}
+      - MMR_TOP_K_DEFAULT=${MMR_TOP_K_DEFAULT}
+      
+      # Document Processing
+      - DOCLING_ENABLE_OCR=${DOCLING_ENABLE_OCR}
+      - DOCLING_ENABLE_TABLE_STRUCTURE=${DOCLING_ENABLE_TABLE_STRUCTURE}
+      - DOCLING_ENABLE_PICTURE=${DOCLING_ENABLE_PICTURE}
+      - LANGCHAIN_FALLBACK_ENABLED=${LANGCHAIN_FALLBACK_ENABLED}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB}
+      
+      # Workflow
+      - WORKFLOW_MAX_ITERATIONS=${WORKFLOW_MAX_ITERATIONS}
+      - WORKFLOW_TIMEOUT_SECONDS=${WORKFLOW_TIMEOUT_SECONDS}
+      - WORKFLOW_ENABLE_REFLECTION=${WORKFLOW_ENABLE_REFLECTION}
+      - WORKFLOW_ENABLE_SEMANTIC_ROUTING=${WORKFLOW_ENABLE_SEMANTIC_ROUTING}
+      
+      # Orchestrator
+      - ORCHESTRATOR_ENABLED=${ORCHESTRATOR_ENABLED}
+      - ORCHESTRATOR_STRATEGY=${ORCHESTRATOR_STRATEGY}
+      - ORCHESTRATOR_MAX_AGENTS_PER_QUERY=${ORCHESTRATOR_MAX_AGENTS_PER_QUERY}
+      - ORCHESTRATOR_CONFIDENCE_THRESHOLD=${ORCHESTRATOR_CONFIDENCE_THRESHOLD}
+      
+      # Ollama (if enabled)
+      - OLLAMA_BASE_URL=http://ollama:11434
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
+      
+      # CORS
+      - CORS_ORIGINS=${BASE_URL},${API_URL},http://localhost:3000
+      
     volumes:
       - ./logs:/app/logs
       - ./uploads:/app/uploads
       - document_storage:/app/documents
+      - ./api:/app:ro  
     depends_on:
-      - postgres
-      - redis
-      - milvus_public
-      - milvus_private
-      - kafka
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus_public:
+        condition: service_healthy
+      milvus_private:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      test: ["CMD", "curl", "-f", "${PROTOCOL}://${DOMAIN}:${MAIN_PORT}/api/v1/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
-  # Document Processing Worker
-  document_processor:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    container_name: rag_document_processor
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - REDIS_URL=redis://${REDIS_PASSWORD:+:$REDIS_PASSWORD@}redis:6379/${REDIS_DB:-0}
-      - MILVUS_PUBLIC_URI=http://milvus_public:19530
-      - MILVUS_PRIVATE_URI=http://milvus_private:19530
-      - MINIO_ENDPOINT=minio:9000
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - WORKER_TYPE=document_processor
-    volumes:
-      - ./logs:/app/logs
-      - document_storage:/app/documents
-    depends_on:
-      - api
-      - kafka
-    networks:
-      - rag_network
-
-  # Prometheus
+  # Prometheus Monitoring
   prometheus:
     image: prom/prometheus:latest
-    container_name: prometheus_rag
+    container_name: prometheus
     restart: unless-stopped
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -259,57 +380,55 @@ services:
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--storage.tsdb.retention.time=200h'
       - '--web.enable-lifecycle'
+      - '--web.external-url=${PROMETHEUS_URL}'
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # Grafana
+  # Grafana Dashboard
   grafana:
     image: grafana/grafana:latest
-    container_name: grafana_rag
+    container_name: grafana
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-10000}:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=${GRAFANA_URL}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     depends_on:
       - prometheus
     networks:
       - rag_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # nginx:
-  #   image: nginx:alpine
-  #   container_name: nginx_rag
-  #   restart: unless-stopped
-  #   ports:
-  #     - "${NGINX_HTTP_PORT:-80}:80"
-  #     - "${NGINX_HTTPS_PORT:-443}:443"
-  #   volumes:
-  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-  #     - ./nginx/ssl:/etc/nginx/ssl
-  #   depends_on:
-  #     - api
-  #   networks:
-  #     - rag_network
-  #   profiles:
-  #     - production
-
-# VOLUMES
+# Named Volumes
 volumes:
   postgres_data:
     driver: local
   redis_data:
     driver: local
-  milvus_public_data:
-    driver: local
-  milvus_private_data:
-    driver: local
   minio_data:
     driver: local
   etcd_data:
+    driver: local
+  milvus_public_data:
+    driver: local
+  milvus_private_data:
     driver: local
   kafka_data:
     driver: local
@@ -317,6 +436,8 @@ volumes:
     driver: local
   zookeeper_logs:
     driver: local
+  # ollama_data:
+  #   driver: local
   prometheus_data:
     driver: local
   grafana_data:
@@ -324,10 +445,13 @@ volumes:
   document_storage:
     driver: local
 
-# NETWORKS
+# Networks
 networks:
   rag_network:
     driver: bridge
     ipam:
       config:
         - subnet: 172.20.0.0/16
+    labels:
+      - "project=multi-agent-rag"
+      - "environment=${ENV:-development}"
