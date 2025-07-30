@@ -26,7 +26,7 @@ class AgentService:
         self.db = db_session
         self._agent_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_timestamp: Optional[datetime] = None
-        self._cache_ttl = 300  # 5 minutes cache TTL
+        self._cache_ttl = 300 
     
     def _is_cache_valid(self) -> bool:
         """Check if agent cache is still valid"""
@@ -41,15 +41,16 @@ class AgentService:
             self._agent_cache = {}
             
             for agent in agents:
-                self._agent_cache[agent.agent_code] = {
+                self._agent_cache[str(agent.id)] = {
                     "id": str(agent.id),
-                    "code": agent.agent_code,
                     "name": agent.agent_name,
                     "description": agent.description,
-                    "department": agent.department.department_name if agent.department else None,
-                    "department_code": agent.department.department_code if agent.department else None,
-                    "provider": agent.provider.provider_name if agent.provider else None,
-                    "model": agent.model.model_name if agent.model else None,
+                    "department_id": str(agent.department_id),
+                    "department_name": agent.department.department_name if agent.department else None,
+                    "provider_id": str(agent.provider_id) if agent.provider_id else None,
+                    "provider_name": agent.provider.provider_name if agent.provider else None,
+                    "model_id": str(agent.model_id) if agent.model_id else None,
+                    "model_name": agent.model.model_name if agent.model else None,
                     "is_enabled": agent.is_enabled,
                     "is_system": agent.is_system,
                     "tools": self._get_agent_tools(agent.id),
@@ -64,7 +65,7 @@ class AgentService:
             if not self._agent_cache:
                 self._agent_cache = {}
     
-    def _get_agent_tools(self, agent_id: str) -> List[str]:
+    def _get_agent_tools(self, agent_id: str) -> List[Dict[str, Any]]:
         """Get tools available for specific agent"""
         try:
             tool_configs = (
@@ -80,7 +81,17 @@ class AgentService:
                 .all()
             )
             
-            return [config.tool.tool_name for config in tool_configs if config.tool]
+            tools = []
+            for config in tool_configs:
+                if config.tool:
+                    tools.append({
+                        "tool_id": str(config.tool.id),
+                        "tool_name": config.tool.tool_name,
+                        "category": config.tool.category,
+                        "config_data": config.config_data or {}
+                    })
+            
+            return tools
             
         except Exception as e:
             logger.error(f"Failed to get tools for agent {agent_id}: {e}")
@@ -121,7 +132,7 @@ class AgentService:
                 self.db.query(Agent)
                 .join(Department, Agent.department_id == Department.id)
                 .filter(Agent.is_enabled == True)
-                .order_by(Agent.agent_code)
+                .order_by(Agent.agent_name)
                 .all()
             )
         except Exception as e:
@@ -138,64 +149,64 @@ class AgentService:
     def get_agents_for_selection(self) -> List[Dict[str, str]]:
         """
         Get agents list for Reflection + Semantic Router selection
-        Returns clean format with code, name, description for LLM processing
+        Returns clean format with id, name, description for LLM processing
         """
         if not self._is_cache_valid():
             self._refresh_cache()
         
         agents_for_selection = []
         
-        for agent_code, agent_data in self._agent_cache.items():
+        for agent_id, agent_data in self._agent_cache.items():
             if agent_data.get("is_enabled"):
                 agents_for_selection.append({
-                    "code": agent_code,
+                    "id": agent_id,
                     "name": agent_data.get("name", ""),
                     "description": agent_data.get("description", "")
                 })
         
         return agents_for_selection
     
-    def get_agent_by_code(self, agent_code: str) -> Optional[Dict[str, Any]]:
-        """Get specific agent by code"""
+    def get_agent_by_id(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific agent by ID"""
         if not self._is_cache_valid():
             self._refresh_cache()
         
-        return self._agent_cache.get(agent_code)
+        return self._agent_cache.get(agent_id)
     
-    def get_agents_by_department(self, department_code: str) -> Dict[str, Dict[str, Any]]:
-        """Get agents by department code"""
+    def get_agents_by_department(self, department_id: str) -> Dict[str, Dict[str, Any]]:
+        """Get agents by department ID"""
         if not self._is_cache_valid():
             self._refresh_cache()
         
         return {
-            code: agent for code, agent in self._agent_cache.items()
-            if agent.get("department_code") == department_code
+            agent_id: agent for agent_id, agent in self._agent_cache.items()
+            if agent.get("department_id") == department_id
         }
     
-    def get_agent_tools(self, agent_code: str) -> List[str]:
+    def get_agent_tools(self, agent_id: str) -> List[Dict[str, Any]]:
         """Get tools available for specific agent"""
-        agent = self.get_agent_by_code(agent_code)
+        agent = self.get_agent_by_id(agent_id)
         return agent.get("tools", []) if agent else []
     
-    def is_agent_enabled(self, agent_code: str) -> bool:
+    def is_agent_enabled(self, agent_id: str) -> bool:
         """Check if agent is enabled"""
-        agent = self.get_agent_by_code(agent_code)
+        agent = self.get_agent_by_id(agent_id)
         return agent.get("is_enabled", False) if agent else False
     
-    def get_agent_config(self, agent_code: str) -> Dict[str, Any]:
+    def get_agent_config(self, agent_id: str) -> Dict[str, Any]:
         """Get complete agent configuration from database"""
-        agent = self.get_agent_by_code(agent_code)
+        agent = self.get_agent_by_id(agent_id)
         if not agent:
             return {}
         
-        # Base configuration from database
         config = {
-            "provider": agent.get("provider"),
-            "model": agent.get("model"),
+            "provider_id": agent.get("provider_id"),
+            "provider_name": agent.get("provider_name"),
+            "model_id": agent.get("model_id"),
+            "model_name": agent.get("model_name"),
             "tools": agent.get("tools", [])
         }
         
-        # Extended configuration from config_data
         extended_config = agent.get("config_data", {})
         config.update(extended_config)
         
@@ -203,7 +214,6 @@ class AgentService:
     
     def create_agent(
         self,
-        agent_code: str,
         agent_name: str,
         description: str,
         department_id: str,
@@ -214,7 +224,6 @@ class AgentService:
         """Create new agent in database"""
         try:
             agent = Agent(
-                agent_code=agent_code,
                 agent_name=agent_name,
                 description=description,
                 department_id=department_id,
@@ -228,21 +237,20 @@ class AgentService:
             self.db.commit()
             self.db.refresh(agent)
             
-            # Invalidate cache
             self._cache_timestamp = None
             
-            logger.info(f"Created agent: {agent_code}")
+            logger.info(f"Created agent: {agent_name} with ID: {agent.id}")
             return agent
             
         except Exception as e:
-            logger.error(f"Failed to create agent {agent_code}: {e}")
+            logger.error(f"Failed to create agent {agent_name}: {e}")
             self.db.rollback()
             return None
     
-    def update_agent_status(self, agent_code: str, is_enabled: bool) -> bool:
+    def update_agent_status(self, agent_id: str, is_enabled: bool) -> bool:
         """Enable/disable agent"""
         try:
-            agent = self.db.query(Agent).filter(Agent.agent_code == agent_code).first()
+            agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
             if not agent:
                 return False
             
@@ -252,45 +260,44 @@ class AgentService:
             # Invalidate cache
             self._cache_timestamp = None
             
-            logger.info(f"Updated agent {agent_code} status to {is_enabled}")
+            logger.info(f"Updated agent {agent_id} status to {is_enabled}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to update agent {agent_code}: {e}")
+            logger.error(f"Failed to update agent {agent_id}: {e}")
             self.db.rollback()
             return False
     
-    def assign_tools_to_agent(self, agent_code: str, tool_names: List[str]) -> bool:
+    def assign_tools_to_agent(self, agent_id: str, tool_ids: List[str]) -> bool:
         """Assign tools to agent"""
         try:
-            agent = self.db.query(Agent).filter(Agent.agent_code == agent_code).first()
+            agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
             if not agent:
                 return False
             
             self.db.query(AgentToolConfig).filter(
-                AgentToolConfig.agent_id == agent.id
+                AgentToolConfig.agent_id == agent_id
             ).delete()
             
-            for tool_name in tool_names:
-                tool = self.db.query(Tool).filter(Tool.tool_name == tool_name).first()
+            for tool_id in tool_ids:
+                tool = self.db.query(Tool).filter(Tool.id == tool_id).first()
                 if tool:
                     config = AgentToolConfig(
-                        agent_id=agent.id,
-                        tool_id=tool.id,
+                        agent_id=agent_id,
+                        tool_id=tool_id,
                         is_enabled=True
                     )
                     self.db.add(config)
             
             self.db.commit()
-            
-            # Invalidate cache
+        
             self._cache_timestamp = None
             
-            logger.info(f"Assigned {len(tool_names)} tools to agent {agent_code}")
+            logger.info(f"Assigned {len(tool_ids)} tools to agent {agent_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to assign tools to agent {agent_code}: {e}")
+            logger.error(f"Failed to assign tools to agent {agent_id}: {e}")
             self.db.rollback()
             return False
     
@@ -318,7 +325,10 @@ class AgentService:
                     )
                     .count()
                 )
-                dept_stats[dept.department_code] = agent_count
+                dept_stats[str(dept.id)] = {
+                    "department_name": dept.department_name,
+                    "agent_count": agent_count
+                }
             
             return {
                 "total_agents": total_agents,

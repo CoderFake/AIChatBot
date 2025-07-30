@@ -141,26 +141,23 @@ class ReflectionSemanticRouterNode(AnalysisNode):
             messages = state.get("messages", [])
             user_context = state["user_context"]
             
-            # Get available agents from database
             async with get_db_context() as db:
                 agent_service = AgentService(db)
                 available_agents = agent_service.get_agents_for_selection()
             
-            # Perform reflection to clarify query
             clarified_query = await self._reflect_and_clarify(query, messages)
             
-            # Semantic routing to select agents
-            selected_agents, sub_queries = await self._semantic_routing(
+            selected_agent_ids, sub_queries = await self._semantic_routing(
                 clarified_query, available_agents, user_context
             )
             
             query_analysis = {
                 "clarified_query": clarified_query,
-                "confidence": 0.8,  # Could be calculated from LLM response
-                "query_domain": sub_queries.get("primary_domain", "general"),  # Dynamic from routing
-                "selected_agents": selected_agents,
+                "confidence": 0.8,
+                "query_domain": sub_queries.get("primary_domain", "general"),
+                "selected_agents": selected_agent_ids,
                 "sub_queries": sub_queries,
-                "reasoning": f"Selected {len(selected_agents)} agents via semantic routing based on query content and agent capabilities"
+                "reasoning": f"Selected {len(selected_agent_ids)} agents via semantic routing based on query content and agent capabilities"
             }
             
             return {
@@ -182,10 +179,9 @@ class ReflectionSemanticRouterNode(AnalysisNode):
         try:
             provider = await llm_provider_manager.get_provider()
             
-            # Build context from messages
             context = ""
             if messages:
-                recent_messages = messages[-5:]  # Last 5 messages
+                recent_messages = messages[-5:]
                 context = "\n".join([f"{msg.type}: {msg.content}" for msg in recent_messages])
             
             reflection_prompt = f"""
@@ -216,8 +212,8 @@ Reformulated Query:"""
         user_context: Dict
     ) -> tuple[List[str], Dict[str, str]]:
         """
-        Use LLM-based semantic routing to select appropriate agents
-        No hardcoded keywords - let LLM understand context and capabilities
+        Use LLM-based semantic routing to select appropriate agents by ID
+        Returns agent IDs instead of codes
         """
         try:
             if not available_agents:
@@ -225,9 +221,8 @@ Reformulated Query:"""
             
             provider = await llm_provider_manager.get_provider()
             
-            # Format agents for LLM with their full context
             agents_info = "\n".join([
-                f"- {agent['code']}: {agent['name']} - {agent['description']}"
+                f"- ID: {agent['id']}, Name: {agent['name']} - {agent['description']}"
                 for agent in available_agents
             ])
             
@@ -236,7 +231,7 @@ You are a semantic router that selects the most appropriate agents to answer use
 
 User Query: {query}
 
-Available Agents:
+Available Agents (use the ID to reference them):
 {agents_info}
 
 User Context:
@@ -247,14 +242,14 @@ Instructions:
 1. Analyze the query content and intent
 2. Select 1-3 most relevant agents based on their capabilities and descriptions
 3. Create specific sub-queries for each selected agent
-4. Use agent codes (not names) in the response
+4. Use agent IDs (not names) in the response
 
 Respond with valid JSON only:
 {{
-    "selected_agents": ["agent_code1", "agent_code2"],
+    "selected_agents": ["agent_id_1", "agent_id_2"],
     "sub_queries": {{
-        "agent_code1": "specific query for this agent",
-        "agent_code2": "specific query for this agent"
+        "agent_id_1": "specific query for this agent",
+        "agent_id_2": "specific query for this agent"
     }},
     "primary_domain": "detected_domain_from_query"
 }}
@@ -262,32 +257,28 @@ Respond with valid JSON only:
             
             response = await provider.ainvoke(routing_prompt)
             
-            # Parse JSON response
             import json
             result = json.loads(response.content.strip())
             
-            selected_agents = result.get("selected_agents", [])
+            selected_agent_ids = result.get("selected_agents", [])
             sub_queries = result.get("sub_queries", {})
             
-            # Validate selected agents exist
-            valid_agent_codes = [agent["code"] for agent in available_agents]
-            selected_agents = [agent for agent in selected_agents if agent in valid_agent_codes]
+            valid_agent_ids = [agent["id"] for agent in available_agents]
+            selected_agent_ids = [agent_id for agent_id in selected_agent_ids if agent_id in valid_agent_ids]
             
-            # Fallback if no valid selection
-            if not selected_agents and available_agents:
-                fallback_agent = available_agents[0]["code"]
-                selected_agents = [fallback_agent]
-                sub_queries = {fallback_agent: query}
+            if not selected_agent_ids and available_agents:
+                fallback_agent_id = available_agents[0]["id"]
+                selected_agent_ids = [fallback_agent_id]
+                sub_queries = {fallback_agent_id: query}
             
-            logger.info(f"Semantic routing selected: {selected_agents}")
-            return selected_agents, sub_queries
+            logger.info(f"Semantic routing selected agent IDs: {selected_agent_ids}")
+            return selected_agent_ids, sub_queries
             
         except Exception as e:
             logger.error(f"Semantic routing failed: {e}")
-            # Fallback to first available agent
             if available_agents:
-                fallback_agent = available_agents[0]["code"]
-                return [fallback_agent], {fallback_agent: query}
+                fallback_agent_id = available_agents[0]["id"]
+                return [fallback_agent_id], {fallback_agent_id: query}
             return [], {}
 
 
@@ -302,45 +293,40 @@ class AgentExecutionNode(ExecutionNode):
     
     async def execute(self, state: RAGState, config: RunnableConfig) -> Dict[str, Any]:
         """
-        Execute all selected agents in parallel
+        Execute all selected agents in parallel using agent IDs
         """
         try:
             query_analysis = state.get("query_analysis", {})
-            selected_agents = query_analysis.get("selected_agents", [])
+            selected_agent_ids = query_analysis.get("selected_agents", [])
             sub_queries = query_analysis.get("sub_queries", {})
             user_context = state["user_context"]
             
-            if not selected_agents:
-                # Direct execution without analysis
+            if not selected_agent_ids:
                 query = state["query"]
                 async with get_db_context() as db:
                     agent_service = AgentService(db)
                     available_agents = agent_service.get_agents_for_selection()
                 
                 if available_agents:
-                    fallback_agent = available_agents[0]["name"]
-                    selected_agents = [fallback_agent]
-                    sub_queries = {fallback_agent: query}
+                    fallback_agent_id = available_agents[0]["id"]
+                    selected_agent_ids = [fallback_agent_id]
+                    sub_queries = {fallback_agent_id: query}
             
-            # Execute agents in parallel
             agent_tasks = []
-            for agent_name in selected_agents:
-                sub_query = sub_queries.get(agent_name, state["query"])
-                task = self._execute_single_agent(agent_name, sub_query, user_context, config)
+            for agent_id in selected_agent_ids:
+                sub_query = sub_queries.get(agent_id, state["query"])
+                task = self._execute_single_agent(agent_id, sub_query, user_context, config)
                 agent_tasks.append(task)
             
-            # Wait for all agents to complete
             agent_results = await asyncio.gather(*agent_tasks, return_exceptions=True)
             
-            # Process results
             valid_responses = []
             for i, result in enumerate(agent_results):
                 if isinstance(result, Exception):
-                    logger.error(f"Agent {selected_agents[i]} failed: {result}")
+                    logger.error(f"Agent {selected_agent_ids[i]} failed: {result}")
                 else:
                     valid_responses.append(result)
             
-            # Determine next action based on results
             if len(valid_responses) > 1:
                 next_action = "conflict_resolution"
             else:
@@ -362,51 +348,57 @@ class AgentExecutionNode(ExecutionNode):
     
     async def _execute_single_agent(
         self, 
-        agent_name: str, 
+        agent_id: str, 
         query: str, 
         user_context: Dict, 
         config: RunnableConfig
     ) -> AgentResponse:
-        """Execute single agent with tools"""
+        """Execute single agent with tools using agent ID"""
         start_time = time.time()
         
         try:
-            # Get agent configuration
             async with get_db_context() as db:
                 agent_service = AgentService(db)
-                agent_config = agent_service.get_agent_config(agent_name)
-                agent_tools = agent_service.get_agent_tools(agent_name)
+                agent_config = agent_service.get_agent_config(agent_id)
+                agent_tools = agent_service.get_agent_tools(agent_id)
+                agent_info = agent_service.get_agent_by_id(agent_id)
             
-            # Check permissions and execute tools if needed
+            if not agent_info:
+                raise ValueError(f"Agent with ID {agent_id} not found")
+            
+            agent_name = agent_info.get("name", f"Agent-{agent_id}")
+            
             tool_results = {}
             sources = []
             
-            for tool_name in agent_tools:
-                if await self._can_use_tool(tool_name, user_context):
+            for tool_info in agent_tools:
+                tool_id = tool_info.get("tool_id")
+                tool_name = tool_info.get("tool_name")
+                
+                if await self._can_use_tool(tool_id, user_context):
                     try:
                         tool_result = await self._execute_tool(
-                            tool_name, query, user_context, agent_config
+                            tool_id, tool_name, query, user_context, agent_config
                         )
                         tool_results[tool_name] = tool_result
                         
-                        # Extract sources if this is RAG tool
                         if tool_name == "rag_search" and "sources" in tool_result:
                             sources.extend(tool_result["sources"])
                             
                     except Exception as e:
-                        logger.warning(f"Tool {tool_name} failed for agent {agent_name}: {e}")
+                        logger.warning(f"Tool {tool_name} (ID: {tool_id}) failed for agent {agent_id}: {e}")
             
-            # Generate response using agent's LLM
             response_content = await self._generate_agent_response(
-                agent_name, query, tool_results, agent_config
+                agent_id, agent_name, query, tool_results, agent_config
             )
             
             execution_time = time.time() - start_time
             
             return {
+                "agent_id": agent_id,
                 "agent_name": agent_name,
                 "content": response_content,
-                "confidence": 0.8,  # Placeholder
+                "confidence": 0.8,
                 "tools_used": list(tool_results.keys()),
                 "sources": sources,
                 "execution_time": execution_time,
@@ -415,10 +407,11 @@ class AgentExecutionNode(ExecutionNode):
             
         except Exception as e:
             execution_time = time.time() - start_time
-            logger.error(f"Agent {agent_name} execution failed: {e}")
+            logger.error(f"Agent {agent_id} execution failed: {e}")
             
             return {
-                "agent_name": agent_name,
+                "agent_id": agent_id,
+                "agent_name": f"Agent-{agent_id}",
                 "content": f"Error: {str(e)}",
                 "confidence": 0.0,
                 "tools_used": [],
@@ -427,33 +420,36 @@ class AgentExecutionNode(ExecutionNode):
                 "status": "failed"
             }
     
-    async def _can_use_tool(self, tool_name: str, user_context: Dict) -> bool:
-        """Check if user has permission to use tool"""
+    async def _can_use_tool(self, tool_id: str, user_context: Dict) -> bool:
+        """Check if user has permission to use tool by ID"""
         try:
             async with get_db_context() as db:
                 permission_service = PermissionService(db)
-                return True  
+                # Implement permission check logic based on tool ID
+                return True
         except Exception:
             return False
     
     async def _execute_tool(
         self, 
-        tool_name: str, 
+        tool_id: str,
+        tool_name: str,
         query: str, 
         user_context: Dict,
         agent_config: Dict
     ) -> Dict[str, Any]:
-        """Execute specific tool"""
+        """Execute specific tool by ID and name"""
         try:
             return await tool_manager.execute_tool(
-                tool_name, query, user_context, agent_config
+                tool_id, tool_name, query, user_context, agent_config
             )
         except Exception as e:
-            logger.error(f"Tool {tool_name} execution failed: {e}")
+            logger.error(f"Tool {tool_name} (ID: {tool_id}) execution failed: {e}")
             raise
     
     async def _generate_agent_response(
         self,
+        agent_id: str,
         agent_name: str,
         query: str,
         tool_results: Dict,
@@ -462,7 +458,7 @@ class AgentExecutionNode(ExecutionNode):
         """Generate final response using agent's LLM"""
         try:
             provider = await llm_provider_manager.get_provider(
-                agent_config.get("provider")
+                agent_config.get("provider_name")
             )
             
             context = ""
@@ -471,7 +467,7 @@ class AgentExecutionNode(ExecutionNode):
                     context += f"\n{tool_name}: {result['content']}"
             
             response_prompt = f"""
-As {agent_name}, answer the following query using the provided context.
+As {agent_name} (ID: {agent_id}), answer the following query using the provided context.
 
 Query: {query}
 
@@ -485,7 +481,7 @@ Please provide a comprehensive and helpful response based on the available infor
             return response.content.strip()
             
         except Exception as e:
-            logger.error(f"Response generation failed for {agent_name}: {e}")
+            logger.error(f"Response generation failed for agent {agent_id}: {e}")
             return f"I apologize, but I encountered an error while processing your request: {str(e)}"
 
 
@@ -522,4 +518,78 @@ class ConflictResolutionNode(BaseWorkflowNode):
                 "error_message": f"Conflict resolution failed: {str(e)}",
                 "next_action": "final_response",
                 "processing_status": "failed"
+            }
+    
+    async def _resolve_conflicts(self, agent_responses: List[Dict]) -> Dict[str, Any]:
+        """
+        Resolve conflicts between agent responses using IDs
+        """
+        try:
+            provider = await llm_provider_manager.get_provider()
+            
+            responses_text = ""
+            for i, response in enumerate(agent_responses):
+                agent_id = response.get("agent_id", f"unknown_{i}")
+                agent_name = response.get("agent_name", f"Agent_{i}")
+                content = response.get("content", "")
+                confidence = response.get("confidence", 0.0)
+                sources = response.get("sources", [])
+                
+                responses_text += f"""
+Agent {agent_name} (ID: {agent_id}) - Confidence: {confidence}
+Response: {content}
+Sources: {len(sources)} sources
+---
+"""
+            
+            conflict_resolution_prompt = f"""
+You have multiple agent responses that may conflict. Analyze them and provide the best synthesized answer.
+
+Agent Responses:
+{responses_text}
+
+Please:
+1. Identify any conflicts or contradictions
+2. Determine which response(s) are most reliable
+3. Synthesize the best answer combining the most accurate information
+4. Provide a confidence score for your synthesis
+
+Respond with JSON:
+{{
+    "final_answer": "synthesized response",
+    "winning_agents": ["agent_id_1", "agent_id_2"],
+    "conflict_level": "low|medium|high",
+    "resolution_method": "description of how conflict was resolved",
+    "confidence_score": 0.0-1.0,
+    "evidence_ranking": [
+        {{"agent_id": "agent_id", "score": 0.9, "reasoning": "why this response is reliable"}}
+    ]
+}}
+"""
+            
+            response = await provider.ainvoke(conflict_resolution_prompt)
+            
+            import json
+            result = json.loads(response.content.strip())
+            
+            logger.info(f"Conflict resolution completed with {result.get('conflict_level', 'unknown')} conflict level")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Conflict resolution processing failed: {e}")
+            if agent_responses:
+                first_response = agent_responses[0]
+                return {
+                    "final_answer": first_response.get("content", ""),
+                    "winning_agents": [first_response.get("agent_id", "")],
+                    "conflict_level": "unknown",
+                    "resolution_method": "fallback_first_response",
+                    "confidence_score": first_response.get("confidence", 0.5)
+                }
+            return {
+                "final_answer": "Unable to resolve conflicts between agent responses.",
+                "winning_agents": [],
+                "conflict_level": "high",
+                "resolution_method": "error_fallback",
+                "confidence_score": 0.0
             }

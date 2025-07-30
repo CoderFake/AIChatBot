@@ -1,10 +1,9 @@
-from sqlalchemy import Column, String, Boolean, Text, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
-
 
 class Agent(BaseModel):
     """
@@ -13,14 +12,6 @@ class Agent(BaseModel):
     """
     
     __tablename__ = "agents"
-    
-    agent_code = Column(
-        String(50),
-        nullable=False,
-        unique=True,
-        index=True,
-        comment="Unique agent code"
-    )
     
     agent_name = Column(
         String(100),
@@ -90,7 +81,7 @@ class Agent(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<Agent(code='{self.agent_code}', department_id='{self.department_id}')>"
+        return f"<Agent(id='{self.id}', name='{self.agent_name}', department_id='{self.department_id}')>"
 
 
 class AgentToolConfig(BaseModel):
@@ -134,7 +125,6 @@ class AgentToolConfig(BaseModel):
     tool = relationship("Tool")
     
     __table_args__ = (
-        UniqueConstraint('agent_id', 'tool_id', name='uq_agent_tool'),
         Index('idx_agent_tool_enabled', 'agent_id', 'is_enabled'),
     )
     

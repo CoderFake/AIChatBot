@@ -100,13 +100,14 @@ class ConfigManager:
             tenant_providers = {}
             
             for provider, dept_config, department in result:
-                provider_key = f"{provider.provider_code}_{department.department_code}"
+                provider_key = f"{provider.id}_{department.id}"
                 
                 tenant_providers[provider_key] = {
-                    "provider_code": provider.provider_code,
+                    "provider_id": str(provider.id),
                     "provider_name": provider.provider_name,
-                    "department_code": department.department_code,
+                    "department_id": str(department.id),
                     "department_name": department.department_name,
+                    "config_id": str(dept_config.id),
                     "is_enabled": dept_config.is_enabled,
                     "api_key": dept_config.api_key,
                     "config_data": dept_config.config_data or {},
@@ -157,18 +158,21 @@ class ConfigManager:
                 agent_tools = []
                 for tool_config, tool in tool_result:
                     agent_tools.append({
-                        "tool_code": tool.tool_code,
+                        "tool_id": str(tool.id),
                         "tool_name": tool.tool_name,
                         "category": tool.category,
+                        "config_id": str(tool_config.id),
                         "config_data": tool_config.config_data or {}
                     })
                 
-                tenant_agents[agent.agent_code] = {
-                    "agent_code": agent.agent_code,
+                tenant_agents[str(agent.id)] = {
+                    "agent_id": str(agent.id),
                     "agent_name": agent.agent_name,
                     "description": agent.description,
-                    "department_code": department.department_code,
+                    "department_id": str(department.id),
                     "department_name": department.department_name,
+                    "provider_id": str(agent.provider_id) if agent.provider_id else None,
+                    "model_id": str(agent.model_id) if agent.model_id else None,
                     "is_enabled": agent.is_enabled,
                     "is_system": agent.is_system,
                     "tools": agent_tools,
@@ -205,15 +209,17 @@ class ConfigManager:
             tenant_tools = {}
             
             for tool, dept_config, department in result:
-                tool_key = f"{tool.tool_code}_{department.department_code}"
+                tool_key = f"{tool.id}_{department.id}"
                 
                 tenant_tools[tool_key] = {
-                    "tool_code": tool.tool_code,
+                    "tool_id": str(tool.id),
                     "tool_name": tool.tool_name,
                     "description": tool.description,
                     "category": tool.category,
-                    "department_code": department.department_code,
+                    "implementation_class": tool.implementation_class,
+                    "department_id": str(department.id),
                     "department_name": department.department_name,
+                    "config_id": str(dept_config.id),
                     "is_enabled": dept_config.is_enabled,
                     "base_config": tool.base_config or {},
                     "config_data": dept_config.config_data or {},
@@ -282,7 +288,6 @@ class ConfigManager:
         
         cache_key = await cache_manager.get_tenant_cache_key(tenant_id, "providers")
         
-        # Try cache first using get_or_set pattern
         return await cache_manager.get_or_set(
             cache_key,
             self._load_providers_from_db,

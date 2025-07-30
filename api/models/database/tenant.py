@@ -1,10 +1,5 @@
-# api/models/database/tenant.py
-"""
-Tenant model for multi-tenancy support
-Each tenant can have multiple departments and users
-"""
 from typing import List, Dict, Any, Optional
-from sqlalchemy import Column, String, Boolean, Text, Index, Integer, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, String, Boolean, Text, Index, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import text
@@ -19,14 +14,6 @@ class Tenant(BaseModel):
     """
     
     __tablename__ = "tenants"
-    
-    tenant_code = Column(
-        String(50),
-        nullable=False,
-        unique=True,
-        index=True,
-        comment="Unique tenant code"
-    )
     
     tenant_name = Column(
         String(200),
@@ -66,19 +53,17 @@ class Tenant(BaseModel):
         cascade="all, delete-orphan"
     )
     
-
     __table_args__ = (
         Index('idx_tenant_active', 'is_active'),
     )
     
     def __repr__(self) -> str:
-        return f"<Tenant(code='{self.tenant_code}', name='{self.tenant_name}')>"
+        return f"<Tenant(id='{self.id}', name='{self.tenant_name}')>"
 
 
 class Department(BaseModel):
     """
     Department model for managing departments within tenant
-    Hierarchical structure with parent-child relationships
     """
     
     __tablename__ = "departments"
@@ -89,13 +74,6 @@ class Department(BaseModel):
         nullable=False,
         index=True,
         comment="Tenant ID"
-    )
-    
-    department_code = Column(
-        String(50),
-        nullable=False,
-        index=True,
-        comment="Department code"
     )
     
     department_name = Column(
@@ -148,9 +126,8 @@ class Department(BaseModel):
     )
     
     __table_args__ = (
-        UniqueConstraint('tenant_id', 'department_code', name='uq_tenant_department'),
         Index('idx_department_active', 'tenant_id', 'is_active'),
     )
     
     def __repr__(self) -> str:
-        return f"<Department(code='{self.department_code}', name='{self.department_name}')>"
+        return f"<Department(id='{self.id}', name='{self.department_name}')>"

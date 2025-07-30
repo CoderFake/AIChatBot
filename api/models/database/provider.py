@@ -1,13 +1,6 @@
-# api/models/database/provider.py
-"""
-Provider and model management for LLM providers
-Department level configurations with API keys
-"""
-from typing import Dict, Any, Optional
-from sqlalchemy import Column, String, Boolean, Text, Integer, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, String, Boolean, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
 
@@ -19,14 +12,6 @@ class Provider(BaseModel):
     """
     
     __tablename__ = "providers"
-    
-    provider_code = Column(
-        String(50),
-        nullable=False,
-        unique=True,
-        index=True,
-        comment="Unique provider code (openai, anthropic, google)"
-    )
     
     provider_name = Column(
         String(100),
@@ -65,7 +50,7 @@ class Provider(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<Provider(code='{self.provider_code}', name='{self.provider_name}')>"
+        return f"<Provider(id='{self.id}', name='{self.provider_name}')>"
 
 
 class ProviderModel(BaseModel):
@@ -81,13 +66,6 @@ class ProviderModel(BaseModel):
         nullable=False,
         index=True,
         comment="Provider ID"
-    )
-    
-    model_code = Column(
-        String(100),
-        nullable=False,
-        index=True,
-        comment="Model code (gpt-4, claude-3-opus)"
     )
     
     model_name = Column(
@@ -119,12 +97,11 @@ class ProviderModel(BaseModel):
     provider = relationship("Provider", back_populates="models")
     
     __table_args__ = (
-        UniqueConstraint('provider_id', 'model_code', name='uq_provider_model'),
         Index('idx_provider_model_enabled', 'provider_id', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<ProviderModel(provider_id={self.provider_id}, model_code='{self.model_code}')>"
+        return f"<ProviderModel(id='{self.id}', provider_id={self.provider_id}, model_name='{self.model_name}')>"
 
 
 class DepartmentProviderConfig(BaseModel):
@@ -177,14 +154,12 @@ class DepartmentProviderConfig(BaseModel):
         comment="User who configured this provider"
     )
     
-    # Relationships
     department = relationship("Department", back_populates="provider_configs")
     provider = relationship("Provider", back_populates="department_configs")
     
     __table_args__ = (
-        UniqueConstraint('department_id', 'provider_id', name='uq_dept_provider'),
         Index('idx_dept_provider_enabled', 'department_id', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<DepartmentProviderConfig(dept_id={self.department_id}, provider_id={self.provider_id})>"
+        return f"<DepartmentProviderConfig(id='{self.id}', dept_id={self.department_id}, provider_id={self.provider_id})>"
