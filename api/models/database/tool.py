@@ -1,13 +1,7 @@
-# api/models/database/tool.py
-"""
-Tool management models
-Global tools with department-level configurations
-"""
 from typing import Dict, Any, Optional
-from sqlalchemy import Column, String, Boolean, Text, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
 
@@ -19,14 +13,6 @@ class Tool(BaseModel):
     """
     
     __tablename__ = "tools"
-    
-    tool_code = Column(
-        String(100),
-        nullable=False,
-        unique=True,
-        index=True,
-        comment="Unique tool code"
-    )
     
     tool_name = Column(
         String(200),
@@ -87,7 +73,7 @@ class Tool(BaseModel):
     )
     
     def __repr__(self) -> str:
-        return f"<Tool(code='{self.tool_code}', name='{self.tool_name}')>"
+        return f"<Tool(id='{self.id}', name='{self.tool_name}')>"
 
 
 class DepartmentToolConfig(BaseModel):
@@ -145,9 +131,8 @@ class DepartmentToolConfig(BaseModel):
     tool = relationship("Tool", back_populates="department_configs")
     
     __table_args__ = (
-        UniqueConstraint('department_id', 'tool_id', name='uq_dept_tool'),
         Index('idx_dept_tool_enabled', 'department_id', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<DepartmentToolConfig(dept_id={self.department_id}, tool_id={self.tool_id})>"
+        return f"<DepartmentToolConfig(id='{self.id}', dept_id={self.department_id}, tool_id={self.tool_id})>"
