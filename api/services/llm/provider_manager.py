@@ -578,7 +578,6 @@ class LLMProviderManager:
             provider_configs = {}
             
             for db_provider in db_providers:
-                # Convert database Provider to LLMProviderConfig format
                 provider_configs[db_provider.name] = {
                     "name": db_provider.name,
                     "display_name": db_provider.display_name,
@@ -590,7 +589,7 @@ class LLMProviderManager:
                     "source": "database"
                 }
             
-            logger.info(f"📦 Loaded {len(provider_configs)} providers from database")
+            logger.info(f"Loaded {len(provider_configs)} providers from database")
             return provider_configs
             
         except Exception as e:
@@ -606,11 +605,9 @@ class LLMProviderManager:
             provider_configs = {}
             
             for provider_name, registry_def in registry_providers.items():
-                # Check if enabled in settings
                 settings_config = self.settings.llm_providers.get(provider_name)
                 is_enabled = settings_config and settings_config.enabled if settings_config else False
                 
-                # Merge registry definition with settings
                 provider_configs[provider_name] = {
                     "name": provider_name,
                     "display_name": registry_def["display_name"],
@@ -620,13 +617,12 @@ class LLMProviderManager:
                     "default_model": registry_def["default_model"],
                     "config": {
                         **registry_def["provider_config"],
-                        # Merge API keys from settings if available
                         "api_keys": settings_config.config.get("api_keys", []) if settings_config else []
                     },
                     "source": "registry_fallback"
                 }
             
-            logger.warning(f"🔄 Loaded {len(provider_configs)} providers from registry fallback")
+            logger.warning(f"Loaded {len(provider_configs)} providers from registry fallback")
             return provider_configs
             
         except Exception as e:
@@ -646,7 +642,6 @@ class LLMProviderManager:
     async def _initialize_provider(self, provider_name: str, config: Dict[str, Any] = None) -> bool:
         """Initialize specific provider from config"""
         try:
-            # If no config provided, fallback to old behavior
             if config is None:
                 provider_config = self.settings.llm_providers.get(provider_name)
                 if not provider_config or not provider_config.enabled:
@@ -654,22 +649,18 @@ class LLMProviderManager:
                     return False
                 llm_config = provider_config
             else:
-                # New database-first approach
                 if not config.get("is_enabled", False):
                     logger.info(f"Provider {provider_name} is disabled")
                     return False
                 llm_config = self._convert_to_llm_provider_config(config)
             
-            # Get provider class from registry
             provider_class = self.PROVIDER_CLASSES.get(provider_name)
             if not provider_class:
                 logger.warning(f"Unknown provider type: {provider_name}. Available: {list(self.PROVIDER_CLASSES.keys())}")
                 return False
             
-            # Create provider instance
             provider = provider_class(llm_config)
             
-            # Initialize provider
             success = await provider.initialize()
             
             if success:
@@ -696,11 +687,9 @@ class LLMProviderManager:
         for provider_name, provider_config in self.settings.llm_providers.items():
             issues = []
             
-            # Check if provider type is supported
             if provider_name not in self.PROVIDER_CLASSES:
                 issues.append(f"Unsupported provider type: {provider_name}")
             
-            # Check required config fields
             config = provider_config.config
             if provider_name in ["gemini", "mistral", "meta", "anthropic"]:
                 if not config.get("api_keys") or not any(key.strip() for key in config.get("api_keys", [])):
@@ -710,7 +699,6 @@ class LLMProviderManager:
                 if not config.get("base_url"):
                     issues.append("Missing base_url for Ollama")
             
-            # Check models
             if not provider_config.models:
                 issues.append("No models configured")
             

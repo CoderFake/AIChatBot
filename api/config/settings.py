@@ -5,8 +5,7 @@ Environment-based configuration with validation
 """
 from typing import Dict, List, Any, Optional
 from functools import lru_cache
-from pathlib import Path
-
+import torch
 from pydantic import BaseSettings, Field, validator
 from pydantic.dataclasses import dataclass
 
@@ -42,21 +41,23 @@ class MilvusConfig:
     """Milvus vector database configuration"""
     public_uri: str = "http://milvus_public:19530"
     private_uri: str = "http://milvus_private:19530"
-    collection_prefix: str = "rag_system"
+    collection_prefix: str = "rag"
     vector_dim: int = 1024
     metric_type: str = "IP"
     index_type: str = "HNSW"
     index_params: Dict[str, Any] = Field(default_factory=lambda: {"M": 16, "efConstruction": 200})
     search_params: Dict[str, Any] = Field(default_factory=lambda: {"ef": 64})
 
+
 @dataclass
 class StorageConfig:
     """MinIO/S3 storage configuration"""
-    endpoint: str = "localhost:9000"
+    endpoint: str = "minio:9000"
     access_key: str = "minioadmin"
     secret_key: str = "minioadmin"
     secure: bool = False
-    bucket_prefix: str = "rag-system"
+    bucket_prefix: str = "rag"
+
 
 @dataclass
 class EmbeddingConfig:
@@ -88,24 +89,25 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://user:password@localhost:5432/multi_agent_rag"
     
     # Redis
-    REDIS_URL: str = "redis://localhost:6379/0"
-    REDIS_HOST: str = "localhost"
+    REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: Optional[str] = None
     
     # Milvus
-    MILVUS_PUBLIC_HOST: str = "localhost"
+    MILVUS_PUBLIC_HOST: str = "milvus_public"
     MILVUS_PUBLIC_PORT: int = 19530
-    MILVUS_PRIVATE_HOST: str = "localhost" 
+    MILVUS_PRIVATE_HOST: str = "milvus_private" 
     MILVUS_PRIVATE_PORT: int = 19531
-    MILVUS_COLLECTION: str = "rag_documents"
+    MILVUS_COLLECTION_PREFIX: str = "rag"
     
     # Embedding
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
-    EMBEDDING_MODEL_DEVICE: str = "cpu"
     EMBEDDING_DIMENSIONS: int = 1024
     EMBEDDING_BATCH_SIZE: int = 12
+
+    # Device
+    DEVICE: str = "cpu"
     
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
@@ -204,18 +206,22 @@ class Settings(BaseSettings):
             return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
     
+    @lru_cache(maxsize=1)
+    def get_device(self) -> str:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        """Get device"""
+        return device
+    
     def get_enabled_providers(self) -> List[str]:
         """Get list of enabled LLM providers"""
         return [name for name, config in self.llm_providers.items() if config.enabled]
     
     def get_enabled_agents(self) -> Dict[str, Any]:
         """Get enabled agents (loaded from database)"""
-        # This will be populated by database service
         return {}
     
     def get_enabled_tools(self) -> Dict[str, Any]:
         """Get enabled tools (loaded from database)"""
-        # This will be populated by database service
         return {}
     
     class Config:

@@ -1,4 +1,3 @@
-# api/config/database.py
 """
 Database configuration with SQLAlchemy async support
 Multi-tenant database setup with connection pooling
@@ -47,7 +46,6 @@ class DatabaseManager:
                 future=True
             )
             
-            # Add connection event listeners
             @event.listens_for(self.engine.sync_engine, "connect")
             def set_sqlite_pragma(dbapi_connection, connection_record):
                 if "postgresql" in str(dbapi_connection):
@@ -98,7 +96,6 @@ class DatabaseManager:
             await self.engine.dispose()
             logger.info("Database connections closed")
 
-# Global database manager instance
 db_manager = DatabaseManager()
 
 async def init_db():
@@ -152,11 +149,9 @@ class DatabaseHealthCheck:
             
             if is_connected:
                 async with get_db_context() as session:
-                    # Test basic query
                     result = await session.execute(text("SELECT version()"))
                     version = result.scalar()
                     
-                    # Check active connections
                     pool = db_manager.engine.pool
                     
                     return {
