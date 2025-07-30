@@ -67,7 +67,6 @@ class Tenant(BaseModel):
     )
     
 
-    
     __table_args__ = (
         Index('idx_tenant_active', 'is_active'),
     )

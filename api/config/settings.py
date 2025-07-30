@@ -1,13 +1,11 @@
-# api/config/settings.py
-"""
-Application settings with comprehensive configuration management
-Environment-based configuration with validation
-"""
+import os
 from typing import Dict, List, Any, Optional
 from functools import lru_cache
+
 import torch
-from pydantic import BaseSettings, Field, validator
+from pydantic import BaseSettings, Field, validator, root_validator
 from pydantic.dataclasses import dataclass
+
 
 @dataclass
 class LLMProviderConfig:
@@ -18,6 +16,7 @@ class LLMProviderConfig:
     default_model: str = ""
     config: Dict[str, Any] = Field(default_factory=dict)
 
+
 @dataclass
 class WorkflowConfig:
     """LangGraph workflow configuration"""
@@ -27,6 +26,7 @@ class WorkflowConfig:
     enable_semantic_routing: bool = True
     checkpointer_type: str = "memory"
 
+
 @dataclass
 class OrchestratorConfig:
     """Orchestrator configuration"""
@@ -35,6 +35,7 @@ class OrchestratorConfig:
     max_agents_per_query: int = 3
     confidence_threshold: float = 0.7
     conflict_resolution_enabled: bool = True
+
 
 @dataclass
 class MilvusConfig:
@@ -68,6 +69,33 @@ class EmbeddingConfig:
     max_length: int = 8192
     use_fp16: bool = False
 
+
+@dataclass
+class TenantCacheConfig:
+    """Tenant-specific cache configuration for Redis"""
+    tenant_id: str
+    
+    def get_provider_cache_key(self) -> str:
+        """Get Redis key for tenant providers cache"""
+        return f"tenant:{self.tenant_id}:providers"
+    
+    def get_agent_cache_key(self) -> str:
+        """Get Redis key for tenant agents cache"""
+        return f"tenant:{self.tenant_id}:agents"
+    
+    def get_tool_cache_key(self) -> str:
+        """Get Redis key for tenant tools cache"""
+        return f"tenant:{self.tenant_id}:tools"
+    
+    def get_workflow_cache_key(self) -> str:
+        """Get Redis key for tenant workflow config cache"""
+        return f"tenant:{self.tenant_id}:workflows"
+    
+    def get_permission_cache_key(self) -> str:
+        """Get Redis key for tenant permissions cache"""
+        return f"tenant:{self.tenant_id}:permissions"
+
+
 class Settings(BaseSettings):
     """Application settings with comprehensive configuration"""
     
@@ -98,7 +126,7 @@ class Settings(BaseSettings):
     MILVUS_PUBLIC_HOST: str = "milvus_public"
     MILVUS_PUBLIC_PORT: int = 19530
     MILVUS_PRIVATE_HOST: str = "milvus_private" 
-    MILVUS_PRIVATE_PORT: int = 19531
+    MILVUS_PRIVATE_PORT: int = 19530
     MILVUS_COLLECTION_PREFIX: str = "rag"
     
     # Embedding
@@ -112,32 +140,43 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
     
-    # Kafka (for document processing)
+    # Kafka
     KAFKA_BOOTSTRAP_SERVERS: List[str] = ["localhost:9092"]
     KAFKA_DOCUMENT_TOPIC: str = "document_processing"
     KAFKA_CONSUMER_GROUP: str = "document_processors"
     
-    # LLM Providers
+    # Configuration Objects
     llm_providers: Dict[str, LLMProviderConfig] = Field(default_factory=dict)
-    
-    # Workflow
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
-    
-    # Orchestrator  
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
-    
-    # Milvus
     milvus: MilvusConfig = Field(default_factory=MilvusConfig)
-    
-    # Storage
     storage: StorageConfig = Field(default_factory=StorageConfig)
-    
-    # Embedding
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    
+    @root_validator(pre=True)
+    def update_configs_from_env(cls, values):
+        """Update configuration objects from environment variables"""
+        milvus_config = values.get('milvus', MilvusConfig())
+        if values.get('MILVUS_PUBLIC_HOST') and values.get('MILVUS_PUBLIC_PORT'):
+            milvus_config.public_uri = f"http://{values['MILVUS_PUBLIC_HOST']}:{values['MILVUS_PUBLIC_PORT']}"
+        if values.get('MILVUS_PRIVATE_HOST') and values.get('MILVUS_PRIVATE_PORT'):
+            milvus_config.private_uri = f"http://{values['MILVUS_PRIVATE_HOST']}:{values['MILVUS_PRIVATE_PORT']}"
+        values['milvus'] = milvus_config
+        
+        embedding_config = values.get('embedding', EmbeddingConfig())
+        if values.get('EMBEDDING_MODEL'):
+            embedding_config.model_name = values['EMBEDDING_MODEL']
+        if values.get('EMBEDDING_DIMENSIONS'):
+            milvus_config.vector_dim = values['EMBEDDING_DIMENSIONS']
+        if values.get('EMBEDDING_BATCH_SIZE'):
+            embedding_config.batch_size = values['EMBEDDING_BATCH_SIZE']
+        values['embedding'] = embedding_config
+        
+        return values
     
     @validator('llm_providers', pre=True, always=True)
     def setup_default_providers(cls, v):
-        """Setup default LLM provider configurations"""
+        """Setup default LLM provider configurations (API keys loaded from tenant cache in Redis)"""
         if not v:
             v = {}
         
@@ -149,12 +188,11 @@ class Settings(BaseSettings):
                 default_model="gemini-2.0-flash",
                 config={
                     "timeout": 60,
-                    "max_retries": 3,
-                    "api_keys": []
+                    "max_retries": 3
                 }
             ),
             "ollama": LLMProviderConfig(
-                name="ollama", 
+                name="ollama",
                 enabled=False,
                 models=["llama3.1:8b", "llama3.1:70b", "llama3.2:1b", "mistral-nemo:12b"],
                 default_model="llama3.1:8b",
@@ -168,11 +206,10 @@ class Settings(BaseSettings):
                 name="anthropic",
                 enabled=False,
                 models=["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"],
-                default_model="claude-3-5-sonnet-20241022", 
+                default_model="claude-3-5-sonnet-20241022",
                 config={
                     "base_url": "https://api.anthropic.com/v1",
-                    "timeout": 120,
-                    "api_keys": []
+                    "timeout": 120
                 }
             ),
             "mistral": LLMProviderConfig(
@@ -181,9 +218,8 @@ class Settings(BaseSettings):
                 models=["mistral-large-latest", "mistral-small-latest"],
                 default_model="mistral-large-latest",
                 config={
-                    "base_url": "https://api.mistral.ai/v1", 
-                    "timeout": 90,
-                    "api_keys": []
+                    "base_url": "https://api.mistral.ai/v1",
+                    "timeout": 90
                 }
             )
         }
@@ -208,34 +244,52 @@ class Settings(BaseSettings):
     
     @lru_cache(maxsize=1)
     def get_device(self) -> str:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        """Get device"""
-        return device
+        """Get computation device (CPU/GPU)"""
+        if torch.cuda.is_available() and self.DEVICE != "cpu":
+            return "cuda"
+        return "cpu"
     
     def get_enabled_providers(self) -> List[str]:
-        """Get list of enabled LLM providers"""
+        """Get list of enabled LLM providers (loaded from tenant cache at runtime)"""
         return [name for name, config in self.llm_providers.items() if config.enabled]
     
     def get_enabled_agents(self) -> Dict[str, Any]:
-        """Get enabled agents (loaded from database)"""
+        """Get enabled agents (loaded from tenant cache at runtime)"""
         return {}
     
     def get_enabled_tools(self) -> Dict[str, Any]:
-        """Get enabled tools (loaded from database)"""
+        """Get enabled tools (loaded from tenant cache at runtime)"""
         return {}
+    
+    def get_tenant_cache_config(self, tenant_id: str) -> TenantCacheConfig:
+        """Get tenant-specific cache configuration"""
+        return TenantCacheConfig(tenant_id=tenant_id)
+    
+    def get_cache_invalidation_pattern(self, tenant_id: str) -> str:
+        """Get Redis pattern to invalidate all tenant cache"""
+        return f"tenant:{tenant_id}:*"
+    
+    def is_production(self) -> bool:
+        """Check if running in production environment"""
+        return self.ENV.lower() == "production"
+    
+    def is_development(self) -> bool:
+        """Check if running in development environment"""
+        return self.ENV.lower() == "development"
     
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
-        
-        fields = {
-            'llm_providers': {
-                'env': 'LLM_PROVIDERS_JSON'
-            }
-        }
+
 
 @lru_cache()
 def get_settings() -> Settings:
     """Get cached settings instance"""
     return Settings()
+
+
+def reload_settings() -> Settings:
+    """Reload settings (clear cache and create new instance)"""
+    get_settings.cache_clear()
+    return get_settings()
