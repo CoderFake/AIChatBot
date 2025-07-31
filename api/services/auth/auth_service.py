@@ -2,7 +2,7 @@
 
 class AuthService:
     """
-    JWT gitlab, user/password token management
+    Anonymous and JWT user/password token management
     - Login
     - Logout
     - Refresh token
