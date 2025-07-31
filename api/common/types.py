@@ -1,6 +1,6 @@
 """
-Common types và enums cho toàn bộ hệ thống
-Single source of truth để tránh duplicate và đảm bảo consistency
+Common types and enums for the entire system
+Single source of truth to avoid duplicates and ensure consistency
 """
 from enum import Enum
 
@@ -14,6 +14,7 @@ class AccessLevel(Enum):
 class DBDocumentPermissionLevel(Enum):
     PUBLIC = "milvus_public"
     PRIVATE = "milvus_private"
+
 
 class UserRole(Enum):
     """Enum define user roles"""
