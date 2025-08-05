@@ -2,7 +2,6 @@
 Tool Manager Service
 Database-driven tool management with ID-based operations
 """
-
 from typing import Dict, Any, List, Optional
 from sqlalchemy import and_
 from datetime import datetime
@@ -10,6 +9,7 @@ import json
 
 from models.database.tool import Tool, DepartmentToolConfig
 from models.database.tenant import Department
+from api.tools.tool_registry import tool_registry
 from utils.logging import get_logger
 from config.database import get_db_context
 
@@ -18,7 +18,8 @@ logger = get_logger(__name__)
 
 class ToolManager:
     """
-    Database-driven tool manager using IDs instead of codes
+    Runtime tool manager that receives tools from tool_registry and syncs with database
+    Handles tool instances and runtime operations
     """
     
     def __init__(self):
@@ -75,9 +76,12 @@ class ToolManager:
                     for dept_config in dept_configs:
                         department_configs[str(dept_config.department_id)] = {
                             "config_id": str(dept_config.id),
+                            "department_name": dept_config.department.department_name,
                             "is_enabled": dept_config.is_enabled,
                             "config_data": dept_config.config_data or {},
-                            "usage_limits": dept_config.usage_limits or {}
+                            "usage_limits": dept_config.usage_limits or {},
+                            "configured_by": str(dept_config.configured_by) if dept_config.configured_by else None,
+                            "configured_at": dept_config.configured_at
                         }
                     
                     self._tool_cache[str(tool.id)] = {
@@ -93,7 +97,7 @@ class ToolManager:
                     }
                 
                 self._cache_timestamp = datetime.now()
-                logger.info(f"Tool cache refreshed with {len(self._tool_cache)} tools")
+                logger.info(f"Tool cache refreshed with {len(self._tool_cache)} enabled tools")
                 
         except Exception as e:
             logger.error(f"Failed to refresh tool cache: {e}")
@@ -101,251 +105,255 @@ class ToolManager:
                 self._tool_cache = {}
     
     async def _initialize_tool_instances(self):
-        """Initialize tool instances based on implementation classes"""
+        """Initialize tool instances from registry based on database configuration"""
         try:
+            tool_registry.initialize()
+            
             for tool_id, tool_info in self._tool_cache.items():
+                tool_name = tool_info.get("tool_name")
                 implementation_class = tool_info.get("implementation_class")
                 
                 if implementation_class:
                     try:
-                        module_path, class_name = implementation_class.rsplit('.', 1)
-                        module = __import__(module_path, fromlist=[class_name])
-                        tool_class = getattr(module, class_name)
+                        tool_instance = tool_registry.get_tool(tool_name)
                         
-                        base_config = tool_info.get("base_config", {})
-                        tool_instance = tool_class(base_config)
-                        
-                        self._tool_instances[tool_id] = tool_instance
-                        logger.debug(f"Initialized tool instance for {tool_info['tool_name']} (ID: {tool_id})")
-                        
+                        if tool_instance:
+                            self._tool_instances[tool_id] = {
+                                "instance": tool_instance,
+                                "tool_name": tool_name,
+                                "category": tool_info.get("category"),
+                                "base_config": tool_info.get("base_config", {}),
+                                "department_configs": tool_info.get("department_configs", {})
+                            }
+                            logger.debug(f"Initialized tool instance: {tool_name}")
+                        else:
+                            logger.warning(f"Tool instance not found in registry: {tool_name}")
+                            
                     except Exception as e:
-                        logger.warning(f"Failed to initialize tool {tool_info['tool_name']} (ID: {tool_id}): {e}")
-                else:
-                    logger.debug(f"No implementation class for tool {tool_info['tool_name']} (ID: {tool_id})")
-            
+                        logger.error(f"Failed to initialize tool instance {tool_name}: {e}")
+                        
             logger.info(f"Initialized {len(self._tool_instances)} tool instances")
             
         except Exception as e:
             logger.error(f"Failed to initialize tool instances: {e}")
     
-    async def get_available_tools(self, department_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    
+    async def get_available_tools(self, department_id: Optional[str] = None) -> Dict[str, Any]:
         """Get available tools, optionally filtered by department"""
         if not self._is_cache_valid():
             await self._refresh_tool_cache()
         
         if not department_id:
-            return self._tool_cache.copy()
+            return {
+                tool_id: {
+                    "tool_name": info["tool_name"],
+                    "description": info["description"],
+                    "category": info["category"],
+                    "instance": self._tool_instances.get(tool_id, {}).get("instance")
+                }
+                for tool_id, info in self._tool_cache.items()
+                if tool_id in self._tool_instances
+            }
         
-        department_tools = {}
+        available_tools = {}
         for tool_id, tool_info in self._tool_cache.items():
+            if tool_id not in self._tool_instances:
+                continue
+            
             dept_configs = tool_info.get("department_configs", {})
-            if department_id in dept_configs and dept_configs[department_id].get("is_enabled"):
-                department_tools[tool_id] = tool_info.copy()
+            base_config = tool_info.get("base_config", {})
+            
+            is_available = False
+            tool_config = {}
+            
+            if department_id in dept_configs:
+                dept_config = dept_configs[department_id]
+                if dept_config.get("is_enabled"):
+                    is_available = True
+                    tool_config = dept_config.get("config_data", {})
+            elif not base_config.get("department_configurable", False):
+                is_available = True
+                tool_config = base_config
+            
+            if is_available:
+                available_tools[tool_id] = {
+                    "tool_name": tool_info["tool_name"],
+                    "description": tool_info["description"],
+                    "category": tool_info["category"],
+                    "config": tool_config,
+                    "instance": self._tool_instances[tool_id]["instance"]
+                }
         
-        return department_tools
+        return available_tools
     
-    async def get_tool_by_id(self, tool_id: str) -> Optional[Dict[str, Any]]:
-        """Get specific tool by ID"""
+    async def get_tool_instance(self, tool_id: str, department_id: Optional[str] = None) -> Optional[Any]:
+        """Get a specific tool instance if available for department"""
         if not self._is_cache_valid():
             await self._refresh_tool_cache()
         
-        return self._tool_cache.get(tool_id)
-    
-    async def get_tool_config(self, tool_id: str, department_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get complete tool configuration for specific department"""
-        tool_info = await self.get_tool_by_id(tool_id)
-        if not tool_info:
-            return {}
+        if tool_id not in self._tool_instances:
+            return None
         
-        config = {
-            "tool_id": tool_id,
-            "tool_name": tool_info["tool_name"],
-            "category": tool_info["category"],
-            "base_config": tool_info.get("base_config", {})
-        }
+        tool_info = self._tool_cache.get(tool_id)
+        if not tool_info:
+            return None
         
         if department_id:
             dept_configs = tool_info.get("department_configs", {})
+            base_config = tool_info.get("base_config", {})
+            
             if department_id in dept_configs:
                 dept_config = dept_configs[department_id]
-                config.update({
-                    "config_data": dept_config.get("config_data", {}),
-                    "usage_limits": dept_config.get("usage_limits", {}),
-                    "is_enabled": dept_config.get("is_enabled", False)
-                })
+                if not dept_config.get("is_enabled"):
+                    return None
+            elif base_config.get("department_configurable", False):
+                return None
         
-        return config
+        return self._tool_instances[tool_id]["instance"]
+    
+    async def get_tool_by_name(self, tool_name: str, department_id: Optional[str] = None) -> Optional[Any]:
+        """Get tool instance by name"""
+        if not self._is_cache_valid():
+            await self._refresh_tool_cache()
+        
+        for tool_id, tool_info in self._tool_cache.items():
+            if tool_info.get("tool_name") == tool_name:
+                return await self.get_tool_instance(tool_id, department_id)
+        
+        return None
+    
+    async def get_tools_by_category(self, category: str, department_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get all tools in a specific category for a department"""
+        available_tools = await self.get_available_tools(department_id)
+        
+        return {
+            tool_id: tool_info
+            for tool_id, tool_info in available_tools.items()
+            if tool_info.get("category") == category
+        }
     
     async def execute_tool(
         self,
         tool_id: str,
-        tool_name: str,
-        query: str,
-        user_context: Dict[str, Any],
-        agent_config: Dict[str, Any]
+        department_id: str,
+        user_id: str,
+        **kwargs
     ) -> Dict[str, Any]:
-        """Execute tool by ID"""
+        """Execute a tool with proper access control"""
         try:
-            if not self._initialized:
-                await self.initialize()
-            
-            department_id = user_context.get("department_id")
-            tool_config = await self.get_tool_config(tool_id, department_id)
-            
-            if not tool_config:
-                raise ValueError(f"Tool {tool_id} not found or not configured")
-            
-            tool_instance = self._tool_instances.get(tool_id)
+
+            tool_instance = await self.get_tool_instance(tool_id, department_id)
             if not tool_instance:
-                raise ValueError(f"Tool instance for {tool_id} not available")
+                return {
+                    "success": False,
+                    "error": "Tool not available or not enabled for department"
+                }
             
-            if not tool_config.get("is_enabled", False):
-                raise ValueError(f"Tool {tool_name} is not enabled for this department")
+            tool_info = self._tool_cache.get(tool_id, {})
+            tool_name = tool_info.get("tool_name", "unknown")
             
-            execution_context = {
-                "query": query,
-                "user_context": user_context,
-                "agent_config": agent_config,
-                "tool_config": tool_config
-            }
+            logger.info(f"Executing tool {tool_name} for user {user_id} in department {department_id}")
             
-            if hasattr(tool_instance, 'execute'):
-                result = await tool_instance.execute(execution_context)
-            elif hasattr(tool_instance, '__call__'):
-                result = await tool_instance(execution_context)
+            if hasattr(tool_instance, 'run'):
+                result = tool_instance.run(**kwargs)
+            elif hasattr(tool_instance, 'invoke'):
+                result = tool_instance.invoke(kwargs)
             else:
-                raise ValueError(f"Tool {tool_name} does not have execute method")
+                return {
+                    "success": False,
+                    "error": "Tool does not have a valid execution method"
+                }
             
-            logger.info(f"Tool {tool_name} (ID: {tool_id}) executed successfully")
-            return result
+            logger.info(f"Tool {tool_name} executed successfully")
+            
+            return {
+                "success": True,
+                "result": result,
+                "tool_name": tool_name,
+                "executed_by": user_id,
+                "department_id": department_id
+            }
             
         except Exception as e:
-            logger.error(f"Tool execution failed for {tool_name} (ID: {tool_id}): {e}")
+            logger.error(f"Tool execution failed: {e}")
             return {
-                "error": str(e),
-                "tool_id": tool_id,
-                "tool_name": tool_name,
-                "status": "failed"
+                "success": False,
+                "error": str(e)
             }
     
-    async def is_tool_available(self, tool_id: str, department_id: Optional[str] = None) -> bool:
-        """Check if tool is available for use"""
-        tool_config = await self.get_tool_config(tool_id, department_id)
-        return bool(tool_config and tool_config.get("is_enabled", False))
-    
-    async def get_tools_by_category(self, category: str, department_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-        """Get tools filtered by category"""
-        available_tools = await self.get_available_tools(department_id)
-        
-        return {
-            tool_id: tool_info for tool_id, tool_info in available_tools.items()
-            if tool_info.get("category") == category
-        }
-    
-    async def create_tool(
+    async def execute_tool_async(
         self,
-        tool_name: str,
-        description: str,
-        category: str,
-        implementation_class: Optional[str] = None,
-        base_config: Optional[Dict[str, Any]] = None,
-        is_system: bool = False
-    ) -> Optional[str]:
-        """Create new tool in database"""
+        tool_id: str,
+        department_id: str,
+        user_id: str,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Execute a tool asynchronously"""
         try:
-            async with get_db_context() as db:
-                tool = Tool(
-                    tool_name=tool_name,
-                    description=description,
-                    category=category,
-                    implementation_class=implementation_class,
-                    base_config=base_config or {},
-                    is_system=is_system,
-                    is_enabled=True
-                )
-                
-                db.add(tool)
-                db.commit()
-                db.refresh(tool)
-                
-                self._cache_timestamp = None
-                
-                logger.info(f"Created tool: {tool_name} with ID: {tool.id}")
-                return str(tool.id)
-                
+            tool_instance = await self.get_tool_instance(tool_id, department_id)
+            if not tool_instance:
+                return {
+                    "success": False,
+                    "error": "Tool not available or not enabled for department"
+                }
+            
+            tool_info = self._tool_cache.get(tool_id, {})
+            tool_name = tool_info.get("tool_name", "unknown")
+            
+            logger.info(f"Executing tool {tool_name} async for user {user_id} in department {department_id}")
+            
+            if hasattr(tool_instance, 'arun'):
+                result = await tool_instance.arun(**kwargs)
+            elif hasattr(tool_instance, 'ainvoke'):
+                result = await tool_instance.ainvoke(kwargs)
+            elif hasattr(tool_instance, 'run'):
+                result = tool_instance.run(**kwargs)
+            else:
+                return {
+                    "success": False,
+                    "error": "Tool does not have a valid execution method"
+                }
+            
+            logger.info(f"Tool {tool_name} executed async successfully")
+            
+            return {
+                "success": True,
+                "result": result,
+                "tool_name": tool_name,
+                "executed_by": user_id,
+                "department_id": department_id
+            }
+            
         except Exception as e:
-            logger.error(f"Failed to create tool {tool_name}: {e}")
-            return None
-    
-    async def update_tool_status(self, tool_id: str, is_enabled: bool) -> bool:
-        """Enable/disable tool"""
-        try:
-            async with get_db_context() as db:
-                tool = db.query(Tool).filter(Tool.id == tool_id).first()
-                if not tool:
-                    return False
-                
-                tool.is_enabled = is_enabled
-                db.commit()
-                
-                self._cache_timestamp = None
-                
-                logger.info(f"Updated tool {tool_id} status to {is_enabled}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to update tool {tool_id}: {e}")
-            return False
+            logger.error(f"Async tool execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
     
     async def configure_tool_for_department(
         self,
         tool_id: str,
         department_id: str,
-        is_enabled: bool = True,
-        config_data: Optional[Dict[str, Any]] = None,
-        usage_limits: Optional[Dict[str, Any]] = None
+        config_data: Dict[str, Any],
+        usage_limits: Optional[Dict[str, Any]] = None,
+        configured_by: str = None
     ) -> bool:
-        """Configure tool for specific department"""
+        """Configure tool for department (handled by ToolService, but cache needs refresh)"""
         try:
-            async with get_db_context() as db:
-                existing_config = (
-                    db.query(DepartmentToolConfig)
-                    .filter(
-                        and_(
-                            DepartmentToolConfig.tool_id == tool_id,
-                            DepartmentToolConfig.department_id == department_id
-                        )
-                    )
-                    .first()
-                )
-                
-                if existing_config:
-                    existing_config.is_enabled = is_enabled
-                    existing_config.config_data = config_data or {}
-                    existing_config.usage_limits = usage_limits or {}
-                else:
-                    new_config = DepartmentToolConfig(
-                        tool_id=tool_id,
-                        department_id=department_id,
-                        is_enabled=is_enabled,
-                        config_data=config_data or {},
-                        usage_limits=usage_limits or {}
-                    )
-                    db.add(new_config)
-                
-                db.commit()
-                
-                self._cache_timestamp = None
-                
-                logger.info(f"Configured tool {tool_id} for department {department_id}")
-                return True
-                
+            await self._refresh_tool_cache()
+            await self._initialize_tool_instances()
+            
+            logger.info(f"Tool {tool_id} configuration refreshed for department {department_id}")
+            return True
+            
         except Exception as e:
-            logger.error(f"Failed to configure tool {tool_id} for department {department_id}: {e}")
+            logger.error(f"Failed to refresh tool configuration {tool_id} for department {department_id}: {e}")
             return False
     
+    
     async def get_tool_stats(self) -> Dict[str, Any]:
-        """Get tool statistics"""
+        """Get tool statistics for monitoring"""
         try:
             if not self._is_cache_valid():
                 await self._refresh_tool_cache()
@@ -362,13 +370,24 @@ class ToolManager:
             
             initialized_instances = len(self._tool_instances)
             
+            dept_usage = {}
+            for tool_info in self._tool_cache.values():
+                dept_configs = tool_info.get("department_configs", {})
+                for dept_id, dept_config in dept_configs.items():
+                    dept_name = dept_config.get("department_name", f"Dept {dept_id}")
+                    if dept_name not in dept_usage:
+                        dept_usage[dept_name] = 0
+                    dept_usage[dept_name] += 1
+            
             return {
                 "total_tools": total_tools,
                 "enabled_tools": enabled_tools,
                 "disabled_tools": total_tools - enabled_tools,
                 "category_stats": category_stats,
                 "initialized_instances": initialized_instances,
-                "cache_status": "valid" if self._is_cache_valid() else "invalid"
+                "department_usage": dept_usage,
+                "cache_status": "valid" if self._is_cache_valid() else "invalid",
+                "initialized": self._initialized
             }
             
         except Exception as e:
@@ -378,7 +397,7 @@ class ToolManager:
     def invalidate_cache(self):
         """Force cache refresh on next request"""
         self._cache_timestamp = None
-        logger.info("Tool cache invalidated")
+        logger.info("Tool manager cache invalidated")
     
     async def health_check(self) -> bool:
         """Check tool manager health"""
@@ -387,7 +406,12 @@ class ToolManager:
                 return False
             
             await self._refresh_tool_cache()
-            return True
+            
+            registry_available = tool_registry.is_tool_available("calculator")
+            
+            instances_available = len(self._tool_instances) > 0
+            
+            return registry_available and instances_available
             
         except Exception as e:
             logger.error(f"Tool manager health check failed: {e}")

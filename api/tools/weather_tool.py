@@ -1,179 +1,299 @@
-import asyncio
+"""
+Weather Tool implementation
+"""
+import json
+import requests
+from typing import Dict, Any, Optional, Type
+from langchain_core.tools import BaseTool
+from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
+from pydantic import BaseModel, Field
 import aiohttp
-from typing import Dict, Any
-from langchain_core.tools import tool
+import asyncio
+from api.models.models import WeatherInput
 from utils.logging import get_logger
-from utils.datetime_utils import CustomDateTime as datetime
 
 logger = get_logger(__name__)
 
 
-@tool
-async def weather_tool(location: str) -> str:
+class WeatherTool(BaseTool):
     """
-    Get current weather information for a specific location.
-    Returns temperature, conditions, humidity, and other weather data.
+    Weather tool for getting current weather and forecasts
+    Uses OpenWeatherMap API (requires API key in environment or config)
+    """
+    name = "weather"
+    description = "Gets current weather conditions and forecasts for a specified location."
+    args_schema: Type[BaseModel] = WeatherInput
     
-    Args:
-        location: City name or location (e.g., "Hanoi", "Ho Chi Minh City", "New York")
+    def __init__(self, api_key: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.api_key = api_key
+        self.base_url = "https://api.openweathermap.org/data/2.5"
+        logger.info("Initialized weather tool")
         
-    Returns:
-        String containing current weather information
-    """
-    try:
-        weather_data = await _get_weather_data(location)
-        
-        if not weather_data:
-            return f"Could not retrieve weather data for {location}. Please check the location name."
-        
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        weather_info = f"""Current Weather for {location}:
-        Time: {current_time}
-
-        Temperature: {weather_data.get('temperature', 'N/A')}°C
-        Condition: {weather_data.get('condition', 'N/A')}
-        Humidity: {weather_data.get('humidity', 'N/A')}%
-        Wind Speed: {weather_data.get('wind_speed', 'N/A')} km/h
-        Pressure: {weather_data.get('pressure', 'N/A')} hPa
-        Visibility: {weather_data.get('visibility', 'N/A')} km
-
-        Description: {weather_data.get('description', 'N/A')}"""
-        
-        logger.info(f"Successfully retrieved weather for {location}")
-        return weather_info
-        
-    except Exception as e:
-        logger.error(f"Weather lookup failed for {location}: {e}")
-        return f"Failed to get weather information for {location}: {str(e)}"
-
-
-@tool
-async def weather_forecast_tool(location: str, days: str = "3") -> str:
-    """
-    Get weather forecast for a specific location for the next few days.
-    
-    Args:
-        location: City name or location
-        days: Number of days for forecast (1-5, default: 3)
-        
-    Returns:
-        String containing weather forecast information
-    """
-    try:
-        days_int = int(days) if days.isdigit() else 3
-        days_int = min(max(days_int, 1), 5)  
-        
-        forecast_data = await _get_forecast_data(location, days_int)
-        
-        if not forecast_data:
-            return f"Could not retrieve weather forecast for {location}."
-        
-        forecast_info = f"Weather Forecast for {location} ({days_int} days):\n\n"
-        
-        for i, day_data in enumerate(forecast_data[:days_int]):
-            date = day_data.get('date', f'Day {i+1}')
-            temp_max = day_data.get('temp_max', 'N/A')
-            temp_min = day_data.get('temp_min', 'N/A')
-            condition = day_data.get('condition', 'N/A')
-            description = day_data.get('description', 'N/A')
+        if not self.api_key:
+            import os
+            self.api_key = os.getenv("OPENWEATHERMAP_API_KEY")
             
-            forecast_info += f"""Day {i+1} ({date}):
-                Temperature: {temp_min}°C - {temp_max}°C
-                Condition: {condition}
-                Description: {description}
+        if not self.api_key:
+            logger.warning("No OpenWeatherMap API key found. Weather tool may not work.")
 
-            """
-        
-        logger.info(f"Successfully retrieved {days_int}-day forecast for {location}")
-        return forecast_info
-        
-    except Exception as e:
-        logger.error(f"Weather forecast failed for {location}: {e}")
-        return f"Failed to get weather forecast for {location}: {str(e)}"
-
-
-async def _get_weather_data(location: str) -> Dict[str, Any]:
-    """
-    Get current weather data from a free weather service.
-    In production, this would use a real weather API with proper API key.
-    """
-    try:
-        url = f"http://wttr.in/{location}?format=j1"
-        
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    current = data.get('current_condition', [{}])[0]
-                    
-                    return {
-                        'temperature': current.get('temp_C', 'N/A'),
-                        'condition': current.get('weatherDesc', [{}])[0].get('value', 'N/A'),
-                        'humidity': current.get('humidity', 'N/A'),
-                        'wind_speed': current.get('windspeedKmph', 'N/A'),
-                        'pressure': current.get('pressure', 'N/A'),
-                        'visibility': current.get('visibility', 'N/A'),
-                        'description': current.get('weatherDesc', [{}])[0].get('value', 'N/A')
-                    }
-        
+    def _parse_coordinates(self, location: str) -> Optional[tuple]:
+        """Parse coordinates from location string"""
+        try:
+            if ',' in location:
+                parts = location.split(',')
+                if len(parts) == 2:
+                    lat = float(parts[0].strip())
+                    lon = float(parts[1].strip())
+                    return (lat, lon)
+        except ValueError:
+            pass
         return None
-        
-    except Exception as e:
-        logger.error(f"Error fetching weather data: {e}")
-        return {
-            'temperature': '25',
-            'condition': 'Partly Cloudy',
-            'humidity': '65',
-            'wind_speed': '10',
-            'pressure': '1013',
-            'visibility': '10',
-            'description': 'Weather data temporarily unavailable'
-        }
 
+    def _build_weather_url(self, location: str, units: str, endpoint: str = "weather") -> str:
+        """Build API URL for weather request"""
+        coords = self._parse_coordinates(location)
+        
+        if coords:
+            lat, lon = coords
+            url = f"{self.base_url}/{endpoint}?lat={lat}&lon={lon}&appid={self.api_key}&units={units}"
+        else:
+            url = f"{self.base_url}/{endpoint}?q={location}&appid={self.api_key}&units={units}"
+        
+        return url
 
-async def _get_forecast_data(location: str, days: int) -> List[Dict[str, Any]]:
-    """
-    Get weather forecast data from a free weather service.
-    """
-    try:
-        url = f"http://wttr.in/{location}?format=j1"
+    def _format_temperature(self, temp: float, units: str) -> str:
+        """Format temperature with appropriate unit"""
+        if units == "metric":
+            return f"{temp:.1f}°C"
+        elif units == "imperial":
+            return f"{temp:.1f}°F"
+        else:  # kelvin
+            return f"{temp:.1f}K"
+
+    def _format_current_weather(self, data: dict, units: str) -> str:
+        """Format current weather data"""
+        try:
+            location = data.get("name", "Unknown")
+            country = data.get("sys", {}).get("country", "")
+            if country:
+                location += f", {country}"
+            
+            main = data.get("main", {})
+            weather = data.get("weather", [{}])[0]
+            wind = data.get("wind", {})
+            
+            temp = main.get("temp", 0)
+            feels_like = main.get("feels_like", 0)
+            humidity = main.get("humidity", 0)
+            pressure = main.get("pressure", 0)
+            
+            description = weather.get("description", "").title()
+            wind_speed = wind.get("speed", 0)
+            
+            if units == "metric":
+                wind_unit = "m/s"
+            elif units == "imperial":
+                wind_unit = "mph"
+            else:
+                wind_unit = "m/s"
+            
+            result = f"Current weather in {location}:\n"
+            result += f"Temperature: {self._format_temperature(temp, units)}\n"
+            result += f"Feels like: {self._format_temperature(feels_like, units)}\n"
+            result += f"Condition: {description}\n"
+            result += f"Humidity: {humidity}%\n"
+            result += f"Pressure: {pressure} hPa\n"
+            result += f"Wind speed: {wind_speed} {wind_unit}"
+            
+            wind_deg = wind.get("deg")
+            if wind_deg is not None:
+                result += f" ({self._wind_direction(wind_deg)})"
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error formatting weather data: {e}")
+            return "Error: Unable to format weather data"
+
+    def _wind_direction(self, degrees: float) -> str:
+        """Convert wind degrees to direction"""
+        directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                     "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        index = int((degrees + 11.25) / 22.5) % 16
+        return directions[index]
+
+    def _format_forecast(self, data: dict, units: str, days: int) -> str:
+        """Format forecast data"""
+        try:
+            city = data.get("city", {}).get("name", "Unknown")
+            country = data.get("city", {}).get("country", "")
+            if country:
+                city += f", {country}"
+            
+            forecasts = data.get("list", [])
+            
+            result = f"Weather forecast for {city}:\n\n"
+            
+            daily_forecasts = {}
+            for forecast in forecasts[:days * 8]: 
+                date = forecast.get("dt_txt", "").split(" ")[0]
+                if date not in daily_forecasts:
+                    daily_forecasts[date] = []
+                daily_forecasts[date].append(forecast)
+            
+            for date, day_forecasts in list(daily_forecasts.items())[:days]:
+                result += f"📅 {date}:\n"
+                
+                temps = [f.get("main", {}).get("temp", 0) for f in day_forecasts]
+                min_temp = min(temps)
+                max_temp = max(temps)
+                
+                conditions = [f.get("weather", [{}])[0].get("description", "") for f in day_forecasts]
+                main_condition = max(set(conditions), key=conditions.count).title()
+                
+                result += f"  Temperature: {self._format_temperature(min_temp, units)} - {self._format_temperature(max_temp, units)}\n"
+                result += f"  Condition: {main_condition}\n"
+                
+                result += "  Hourly details:\n"
+                for forecast in day_forecasts[:4]: 
+                    time = forecast.get("dt_txt", "").split(" ")[1][:5]
+                    temp = forecast.get("main", {}).get("temp", 0)
+                    desc = forecast.get("weather", [{}])[0].get("description", "").title()
+                    result += f"    {time}: {self._format_temperature(temp, units)}, {desc}\n"
+                
+                result += "\n"
+            
+            return result.strip()
+            
+        except Exception as e:
+            logger.error(f"Error formatting forecast data: {e}")
+            return "Error: Unable to format forecast data"
+
+    def _get_weather(self, location: str, units: str, forecast_days: int) -> str:
+        """Get weather data from API"""
+        if not self.api_key:
+            return "Error: OpenWeatherMap API key not configured"
         
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
+        try:
+            if forecast_days > 0:
+                url = self._build_weather_url(location, units, "forecast")
+                response = requests.get(url, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    return self._format_forecast(data, units, min(forecast_days, 5))
+                elif response.status_code == 401:
+                    return "Error: Invalid API key"
+                elif response.status_code == 404:
+                    return f"Error: Location '{location}' not found"
+                else:
+                    return f"Error: Weather API returned status {response.status_code}"
                     
-                    weather_list = data.get('weather', [])
-                    forecast_data = []
-                    
-                    for i, day_data in enumerate(weather_list[:days]):
-                        date = day_data.get('date', '')
-                        
-                        forecast_data.append({
-                            'date': date,
-                            'temp_max': day_data.get('maxtempC', 'N/A'),
-                            'temp_min': day_data.get('mintempC', 'N/A'),
-                            'condition': day_data.get('hourly', [{}])[0].get('weatherDesc', [{}])[0].get('value', 'N/A'),
-                            'description': day_data.get('hourly', [{}])[0].get('weatherDesc', [{}])[0].get('value', 'N/A')
-                        })
-                    
-                    return forecast_data
+        except requests.exceptions.Timeout:
+            return "Error: Weather API request timed out"
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Weather API request error: {e}")
+            return "Error: Unable to connect to weather service"
+        except Exception as e:
+            logger.error(f"Weather tool error: {e}")
+            return f"Error: {str(e)}"
+
+    async def _get_weather_async(self, location: str, units: str, forecast_days: int) -> str:
+        """Get weather data from API asynchronously"""
+        if not self.api_key:
+            return "Error: OpenWeatherMap API key not configured"
         
-        return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                if forecast_days > 0:
+                    url = self._build_weather_url(location, units, "forecast")
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return self._format_forecast(data, units, min(forecast_days, 5))
+                        elif response.status == 401:
+                            return "Error: Invalid API key"
+                        elif response.status == 404:
+                            return f"Error: Location '{location}' not found"
+                        else:
+                            return f"Error: Weather API returned status {response.status}"
+                else:
+                    url = self._build_weather_url(location, units, "weather")
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return self._format_current_weather(data, units)
+                        elif response.status == 401:
+                            return "Error: Invalid API key"
+                        elif response.status == 404:
+                            return f"Error: Location '{location}' not found"
+                        else:
+                            return f"Error: Weather API returned status {response.status}"
+                            
+        except asyncio.TimeoutError:
+            return "Error: Weather API request timed out"
+        except aiohttp.ClientError as e:
+            logger.error(f"Weather API async request error: {e}")
+            return "Error: Unable to connect to weather service"
+        except Exception as e:
+            logger.error(f"Weather tool async error: {e}")
+            return f"Error: {str(e)}"
+
+    def _run(
+        self,
+        location: str,
+        units: str = "metric",
+        forecast_days: int = 0,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        """
+        Execute weather query synchronously
         
-    except Exception as e:
-        logger.error(f"Error fetching forecast data: {e}")
-        mock_forecast = []
-        for i in range(days):
-            mock_forecast.append({
-                'date': f'2024-01-{i+1:02d}',
-                'temp_max': '28',
-                'temp_min': '22',
-                'condition': 'Partly Cloudy',
-                'description': 'Forecast data temporarily unavailable'
-            })
-        return mock_forecast
+        Args:
+            location: Location to get weather for
+            units: Temperature units (metric/imperial/kelvin)
+            forecast_days: Number of forecast days (0-5)
+            run_manager: Optional callback manager for tool run
+            
+        Returns:
+            Formatted weather information
+        """
+        logger.info(f"Getting weather for location: {location}")
+        
+        if not location.strip():
+            return "Error: Location is required"
+        
+        result = self._get_weather(location, units, forecast_days)
+        logger.info(f"Weather query completed for {location}")
+        
+        return result
+
+    async def _arun(
+        self,
+        location: str,
+        units: str = "metric",
+        forecast_days: int = 0,
+        run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
+    ) -> str:
+        """
+        Execute weather query asynchronously
+        
+        Args:
+            location: Location to get weather for
+            units: Temperature units (metric/imperial/kelvin)
+            forecast_days: Number of forecast days (0-5)
+            run_manager: Optional async callback manager for tool run
+            
+        Returns:
+            Formatted weather information
+        """
+        logger.info(f"Getting weather async for location: {location}")
+        
+        if not location.strip():
+            return "Error: Location is required"
+        
+        result = await self._get_weather_async(location, units, forecast_days)
+        logger.info(f"Weather async query completed for {location}")
+        
+        return result
