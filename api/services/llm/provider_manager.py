@@ -79,14 +79,9 @@ class GeminiProvider(BaseLLMProvider):
         
         for attempt in range(max_retries):
             try:
-                # Use current API key
                 current_key = self._api_keys[self._current_key_index]
                 genai.configure(api_key=current_key)
-                
-                # Create model instance
                 llm_model = genai.GenerativeModel(model_name)
-                
-                # Generate response
                 response = await llm_model.generate_content_async(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
@@ -106,7 +101,6 @@ class GeminiProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Gemini API call failed with key {self._current_key_index}: {e}")
                 
-                # Rotate to next key
                 self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
                 
                 if attempt == max_retries - 1:
@@ -135,7 +129,6 @@ class OllamaProvider(BaseLLMProvider):
         try:
             import httpx
             
-            # Test connection and get available models
             async with httpx.AsyncClient() as client:
                 response = await client.get(f"{self._base_url}/api/tags")
                 if response.status_code == 200:
@@ -392,7 +385,6 @@ class MetaProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Meta API call failed with key {self._current_key_index}: {e}")
                 
-                # Rotate to next key
                 self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
                 
                 if attempt == max_retries - 1:
@@ -424,7 +416,6 @@ class AnthropicProvider(BaseLLMProvider):
                 logger.error("No Anthropic API keys provided")
                 return False
             
-            # Test connection with first API key
             import httpx
             
             headers = {
@@ -433,7 +424,6 @@ class AnthropicProvider(BaseLLMProvider):
                 "anthropic-version": "2023-06-01"
             }
             
-            # Test with a simple request
             payload = {
                 "model": self.config.default_model,
                 "max_tokens": 10,
@@ -469,15 +459,13 @@ class AnthropicProvider(BaseLLMProvider):
         
         for attempt in range(max_retries):
             try:
-                # Use current API key
                 current_key = self._api_keys[self._current_key_index]
                 headers = {
                     "x-api-key": current_key,
                     "Content-Type": "application/json",
                     "anthropic-version": "2023-06-01"
                 }
-                
-                # Prepare request payload
+            
                 payload = {
                     "model": model_name,
                     "max_tokens": kwargs.get("max_tokens", self.config.config.get("max_tokens", 4096)),
@@ -509,7 +497,6 @@ class AnthropicProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Anthropic API call failed with key {self._current_key_index}: {e}")
                 
-                # Rotate to next key
                 self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
                 
                 if attempt == max_retries - 1:

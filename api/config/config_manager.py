@@ -31,7 +31,7 @@ logger = get_logger(__name__)
 class ConfigManager:
     """
     Database-driven configuration manager with tenant-based Redis caching
-    Delegates caching operations to CacheManager and RedisService
+    Supports multiple API keys with rotation for providers
     """
     
     def __init__(self):
@@ -82,7 +82,10 @@ class ConfigManager:
         tenant_id: str, 
         db_session: AsyncSession
     ) -> Dict[str, Any]:
-        """Load tenant provider configurations from database"""
+        """
+        Load tenant provider configurations from database
+        Updated to support multiple API keys with rotation
+        """
         try:
             result = await db_session.execute(
                 select(Provider, DepartmentProviderConfig, Department)
@@ -102,16 +105,13 @@ class ConfigManager:
             for provider, dept_config, department in result:
                 provider_key = f"{provider.id}_{department.id}"
                 
+                cache_data = dept_config.get_cache_data()
+                
                 tenant_providers[provider_key] = {
-                    "provider_id": str(provider.id),
                     "provider_name": provider.provider_name,
-                    "department_id": str(department.id),
                     "department_name": department.department_name,
-                    "config_id": str(dept_config.id),
-                    "is_enabled": dept_config.is_enabled,
-                    "api_key": dept_config.api_key,
-                    "config_data": dept_config.config_data or {},
                     "base_config": provider.base_config or {},
+                    **cache_data, 
                     "last_updated": CustomDateTime.now().isoformat()
                 }
             
@@ -135,7 +135,8 @@ class ConfigManager:
                 .where(
                     and_(
                         Department.tenant_id == tenant_id,
-                        Agent.is_enabled == True
+                        Agent.is_enabled == True,
+                        Department.is_active == True
                     )
                 )
             )
@@ -143,39 +144,17 @@ class ConfigManager:
             tenant_agents = {}
             
             for agent, department in result:
-                tool_result = await db_session.execute(
-                    select(AgentToolConfig, Tool)
-                    .join(Tool, AgentToolConfig.tool_id == Tool.id)
-                    .where(
-                        and_(
-                            AgentToolConfig.agent_id == agent.id,
-                            AgentToolConfig.is_enabled == True,
-                            Tool.is_enabled == True
-                        )
-                    )
-                )
+                agent_key = f"{agent.id}_{department.id}"
                 
-                agent_tools = []
-                for tool_config, tool in tool_result:
-                    agent_tools.append({
-                        "tool_id": str(tool.id),
-                        "tool_name": tool.tool_name,
-                        "category": tool.category,
-                        "config_id": str(tool_config.id),
-                        "config_data": tool_config.config_data or {}
-                    })
-                
-                tenant_agents[str(agent.id)] = {
+                tenant_agents[agent_key] = {
                     "agent_id": str(agent.id),
                     "agent_name": agent.agent_name,
-                    "description": agent.description,
                     "department_id": str(department.id),
                     "department_name": department.department_name,
-                    "provider_id": str(agent.provider_id) if agent.provider_id else None,
-                    "model_id": str(agent.model_id) if agent.model_id else None,
-                    "is_enabled": agent.is_enabled,
-                    "is_system": agent.is_system,
-                    "tools": agent_tools,
+                    "description": agent.description,
+                    "capabilities": agent.capabilities or {},
+                    "system_prompt": agent.system_prompt,
+                    "model_config": agent.model_config or {},
                     "last_updated": CustomDateTime.now().isoformat()
                 }
             
@@ -214,16 +193,13 @@ class ConfigManager:
                 tenant_tools[tool_key] = {
                     "tool_id": str(tool.id),
                     "tool_name": tool.tool_name,
-                    "description": tool.description,
-                    "category": tool.category,
-                    "implementation_class": tool.implementation_class,
+                    "tool_type": tool.tool_type,
                     "department_id": str(department.id),
                     "department_name": department.department_name,
                     "config_id": str(dept_config.id),
                     "is_enabled": dept_config.is_enabled,
                     "base_config": tool.base_config or {},
                     "config_data": dept_config.config_data or {},
-                    "usage_limits": dept_config.usage_limits or {},
                     "last_updated": CustomDateTime.now().isoformat()
                 }
             
@@ -234,315 +210,243 @@ class ConfigManager:
             logger.error(f"Failed to load tenant tools from DB: {e}")
             return {}
     
-    async def load_tenant_permissions_from_db(
-        self, 
-        tenant_id: str, 
-        db_session: AsyncSession
-    ) -> Dict[str, Any]:
-        """Load tenant permission configurations from database"""
+    async def update_provider_key_rotation(
+        self,
+        tenant_id: str,
+        provider_id: str,
+        department_id: str,
+        new_key_index: int,
+        db_session: Optional[AsyncSession] = None
+    ) -> bool:
+        """
+        Update provider API key rotation index in both database and cache
+        """
         try:
-            user_result = await db_session.execute(
-                select(User)
-                .where(User.tenant_id == tenant_id)
-            )
-            
-            tenant_permissions = {}
-            
-            for user in user_result.scalars():
-                user_perms_result = await db_session.execute(
-                    select(UserPermission)
-                    .where(UserPermission.user_id == user.id)
+            if db_session:
+                result = await db_session.execute(
+                    select(DepartmentProviderConfig)
+                    .join(Department, DepartmentProviderConfig.department_id == Department.id)
+                    .where(
+                        and_(
+                            Department.tenant_id == tenant_id,
+                            DepartmentProviderConfig.provider_id == provider_id,
+                            DepartmentProviderConfig.department_id == department_id
+                        )
+                    )
                 )
                 
-                user_permissions = [
-                    {
-                        "permission_id": str(perm.permission_id),
-                        "granted_by": str(perm.granted_by) if perm.granted_by else None,
-                        "expires_at": perm.expires_at.isoformat() if perm.expires_at else None,
-                        "conditions": perm.conditions or {}
-                    }
-                    for perm in user_perms_result.scalars()
-                ]
-                
-                tenant_permissions[str(user.id)] = {
-                    "user_id": str(user.id),
-                    "username": user.username,
-                    "email": user.email,
-                    "role": user.role,
-                    "department_id": str(user.department_id),
-                    "is_active": user.is_active,
-                    "permissions": user_permissions,
-                    "last_updated": CustomDateTime.now().isoformat()
-                }
+                dept_config = result.scalar_one_or_none()
+                if dept_config:
+                    dept_config.current_key_index = new_key_index
+                    await db_session.commit()
+                    
+                    await self._update_provider_cache(tenant_id, provider_id, department_id, dept_config)
+                    
+                    logger.info(f"Updated key rotation for provider {provider_id} in department {department_id}")
+                    return True
             
-            logger.info(f"Loaded permissions for {len(tenant_permissions)} users in tenant {tenant_id}")
-            return tenant_permissions
+            return False
             
         except Exception as e:
-            logger.error(f"Failed to load tenant permissions from DB: {e}")
-            return {}
+            logger.error(f"Failed to update provider key rotation: {e}")
+            return False
+    
+    async def _update_provider_cache(
+        self,
+        tenant_id: str,
+        provider_id: str,
+        department_id: str,
+        dept_config: DepartmentProviderConfig
+    ):
+        """
+        Update specific provider configuration in cache
+        """
+        try:
+            await self._ensure_initialized()
+            
+            provider_key = f"{provider_id}_{department_id}"
+            cache_key = f"tenant:{tenant_id}:providers"
+            
+            cached_providers = await cache_manager.get_dict(cache_key) or {}
+            
+            if provider_key in cached_providers:
+                cache_data = dept_config.get_cache_data()
+                cached_providers[provider_key].update(cache_data)
+                cached_providers[provider_key]["last_updated"] = CustomDateTime.now().isoformat()
+                
+                await cache_manager.set_dict(
+                    cache_key,
+                    cached_providers
+                )
+                
+                logger.debug(f"Updated provider cache for {provider_key}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update provider cache: {e}")
     
     async def get_tenant_providers(self, tenant_id: str) -> Dict[str, Any]:
-        """Get tenant providers from cache or load from database"""
-        await self._ensure_initialized()
-        
-        cache_key = await cache_manager.get_tenant_cache_key(tenant_id, "providers")
-        
-        return await cache_manager.get_or_set(
-            cache_key,
-            self._load_providers_from_db,
-            ttl=None,  # No expiration
-            tenant_id=tenant_id
-        )
+        """
+        Get tenant providers with caching
+        Returns providers with current API key rotation state
+        """
+        try:
+            await self._ensure_initialized()
+            
+            cache_key = f"tenant:{tenant_id}:providers"
+            
+            cached_providers = await cache_manager.get_dict(cache_key)
+            if cached_providers:
+                logger.debug(f"Retrieved {len(cached_providers)} providers from cache for tenant {tenant_id}")
+                return cached_providers
+            
+            async with get_db_context() as db_session:
+                providers = await self.load_tenant_providers_from_db(tenant_id, db_session)
+                
+                if providers:
+                    await cache_manager.set_dict(
+                        cache_key,
+                        providers
+                    )
+                
+                return providers
+            
+        except Exception as e:
+            logger.error(f"Failed to get tenant providers: {e}")
+            return {}
     
     async def get_tenant_agents(self, tenant_id: str) -> Dict[str, Any]:
-        """Get tenant agents from cache or load from database"""
-        await self._ensure_initialized()
-        
-        cache_key = await cache_manager.get_tenant_cache_key(tenant_id, "agents")
-        
-        return await cache_manager.get_or_set(
-            cache_key,
-            self._load_agents_from_db,
-            ttl=None,  # No expiration
-            tenant_id=tenant_id
-        )
+        """
+        Get tenant agents with caching
+        """
+        try:
+            await self._ensure_initialized()
+            
+            cache_key = f"tenant:{tenant_id}:agents"
+            
+            cached_agents = await cache_manager.get_dict(cache_key)
+            if cached_agents:
+                logger.debug(f"Retrieved {len(cached_agents)} agents from cache for tenant {tenant_id}")
+                return cached_agents
+            
+            async with get_db_context() as db_session:
+                agents = await self.load_tenant_agents_from_db(tenant_id, db_session)
+                
+                if agents:
+                    await cache_manager.set_dict(
+                        cache_key,
+                        agents
+                    )
+                
+                return agents
+            
+        except Exception as e:
+            logger.error(f"Failed to get tenant agents: {e}")
+            return {}
     
     async def get_tenant_tools(self, tenant_id: str) -> Dict[str, Any]:
-        """Get tenant tools from cache or load from database"""
-        await self._ensure_initialized()
-        
-        cache_key = await cache_manager.get_tenant_cache_key(tenant_id, "tools")
-        
-        return await cache_manager.get_or_set(
-            cache_key,
-            self._load_tools_from_db,
-            ttl=None,  # No expiration
-            tenant_id=tenant_id
-        )
-    
-    async def get_tenant_permissions(self, tenant_id: str) -> Dict[str, Any]:
-        """Get tenant permissions from cache or load from database"""
-        await self._ensure_initialized()
-        
-        cache_key = await cache_manager.get_tenant_cache_key(tenant_id, "permissions")
-        
-        return await cache_manager.get_or_set(
-            cache_key,
-            self._load_permissions_from_db,
-            ttl=None,  # No expiration
-            tenant_id=tenant_id
-        )
-    
-    async def _load_providers_from_db(self, tenant_id: str) -> Dict[str, Any]:
-        """Helper method for loading providers from database"""
-        async with get_db_context() as db:
-            return await self.load_tenant_providers_from_db(tenant_id, db)
-    
-    async def _load_agents_from_db(self, tenant_id: str) -> Dict[str, Any]:
-        """Helper method for loading agents from database"""
-        async with get_db_context() as db:
-            return await self.load_tenant_agents_from_db(tenant_id, db)
-    
-    async def _load_tools_from_db(self, tenant_id: str) -> Dict[str, Any]:
-        """Helper method for loading tools from database"""
-        async with get_db_context() as db:
-            return await self.load_tenant_tools_from_db(tenant_id, db)
-    
-    async def _load_permissions_from_db(self, tenant_id: str) -> Dict[str, Any]:
-        """Helper method for loading permissions from database"""
-        async with get_db_context() as db:
-            return await self.load_tenant_permissions_from_db(tenant_id, db)
-    
-    async def invalidate_tenant_cache(self, tenant_id: str) -> int:
-        """Invalidate all cache for specific tenant"""
-        await self._ensure_initialized()
-        
+        """
+        Get tenant tools with caching
+        """
         try:
-            deleted_count = await cache_manager.invalidate_tenant_cache(tenant_id)
-            logger.info(f"Invalidated {deleted_count} cache keys for tenant {tenant_id}")
-            return deleted_count
+            await self._ensure_initialized()
+            
+            cache_key = f"tenant:{tenant_id}:tools"
+            
+            cached_tools = await cache_manager.get_dict(cache_key)
+            if cached_tools:
+                logger.debug(f"Retrieved {len(cached_tools)} tools from cache for tenant {tenant_id}")
+                return cached_tools
+            
+            async with get_db_context() as db_session:
+                tools = await self.load_tenant_tools_from_db(tenant_id, db_session)
+                
+                if tools:
+                    await cache_manager.set_dict(
+                        cache_key,
+                        tools
+                    )
+                
+                return tools
+            
+        except Exception as e:
+            logger.error(f"Failed to get tenant tools: {e}")
+            return {}
+    
+    async def invalidate_tenant_cache(self, tenant_id: str):
+        """
+        Invalidate all cached data for a tenant
+        """
+        try:
+            await self._ensure_initialized()
+            
+            cache_patterns = [
+                f"tenant:{tenant_id}:providers",
+                f"tenant:{tenant_id}:agents",
+                f"tenant:{tenant_id}:tools",
+                f"tenant:{tenant_id}:workflows",
+                f"tenant:{tenant_id}:permissions"
+            ]
+            
+            for pattern in cache_patterns:
+                await cache_manager.delete(pattern)
+            
+            logger.info(f"Invalidated cache for tenant {tenant_id}")
             
         except Exception as e:
             logger.error(f"Failed to invalidate tenant cache: {e}")
-            return 0
     
-    async def refresh_tenant_cache(
-        self, 
-        tenant_id: str,
-        cache_types: Optional[List[str]] = None
-    ):
+    async def get_tenant_cache_key(self, tenant_id: str, cache_type: str) -> str:
+        """Get Redis key for tenant cache"""
+        return f"tenant:{tenant_id}:{cache_type}"
+    
+    async def refresh_tenant_cache(self, tenant_id: str):
         """
-        Refresh tenant cache from database
-        cache_types: ['providers', 'agents', 'tools', 'permissions'] or None for all
+        Refresh all tenant cache by loading fresh data from database
         """
-        await self._ensure_initialized()
-        
-        if cache_types is None:
-            cache_types = ['providers', 'agents', 'tools', 'permissions']
-        
-        for cache_type in cache_types:
-            try:
-                cache_key = await cache_manager.get_tenant_cache_key(tenant_id, cache_type)
-                
-                # Delete existing cache
-                await cache_manager.delete(cache_key)
-                
-                # Reload from database
-                if cache_type == 'providers':
-                    await self.get_tenant_providers(tenant_id)
-                elif cache_type == 'agents':
-                    await self.get_tenant_agents(tenant_id)
-                elif cache_type == 'tools':
-                    await self.get_tenant_tools(tenant_id)
-                elif cache_type == 'permissions':
-                    await self.get_tenant_permissions(tenant_id)
-                
-                logger.info(f"Refreshed {cache_type} cache for tenant {tenant_id}")
-                
-            except Exception as e:
-                logger.error(f"Failed to refresh {cache_type} cache for tenant {tenant_id}: {e}")
-    
-    async def initialize_all_tenant_caches(self):
-        """Initialize cache for all tenants on startup"""
         try:
-            async with get_db_context() as db:
-                # Get all active tenants
-                result = await db.execute(select(Tenant).where(Tenant.is_active == True))
-                tenants = result.scalars().all()
+            await self._ensure_initialized()
+            
+            async with get_db_context() as db_session:
+                providers = await self.load_tenant_providers_from_db(tenant_id, db_session)
+                if providers:
+                    await cache_manager.set_dict(
+                        f"tenant:{tenant_id}:providers",
+                        providers
+                    )
                 
-                logger.info(f"Initializing cache for {len(tenants)} tenants")
+                agents = await self.load_tenant_agents_from_db(tenant_id, db_session)
+                if agents:
+                    await cache_manager.set_dict(
+                        f"tenant:{tenant_id}:agents",
+                        agents
+                    )
                 
-                # Load cache for each tenant concurrently
-                tasks = []
-                for tenant in tenants:
-                    task = self._initialize_tenant_cache(str(tenant.id))
-                    tasks.append(task)
-                
-                await asyncio.gather(*tasks, return_exceptions=True)
-                
-                logger.info(f"Completed cache initialization for all tenants")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize tenant caches: {e}")
-            raise
-    
-    async def _initialize_tenant_cache(self, tenant_id: str):
-        """Initialize cache for single tenant"""
-        try:
-            # Load all cache types for this tenant
-            await asyncio.gather(
-                self.get_tenant_providers(tenant_id),
-                self.get_tenant_agents(tenant_id),
-                self.get_tenant_tools(tenant_id),
-                self.get_tenant_permissions(tenant_id),
-                return_exceptions=True
-            )
-            logger.debug(f"Initialized cache for tenant {tenant_id}")
+                tools = await self.load_tenant_tools_from_db(tenant_id, db_session)
+                if tools:
+                    await cache_manager.set_dict(
+                        f"tenant:{tenant_id}:tools",
+                        tools
+                    )
+            
+            logger.info(f"Refreshed all cache for tenant {tenant_id}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize cache for tenant {tenant_id}: {e}")
+            logger.error(f"Failed to refresh tenant cache: {e}")
     
-    async def get_tenant_config_summary(self, tenant_id: str) -> Dict[str, Any]:
-        """Get summary of tenant configuration"""
-        await self._ensure_initialized()
-        
-        try:
-            providers = await self.get_tenant_providers(tenant_id)
-            agents = await self.get_tenant_agents(tenant_id)
-            tools = await self.get_tenant_tools(tenant_id)
-            permissions = await self.get_tenant_permissions(tenant_id)
-            
-            return {
-                "tenant_id": tenant_id,
-                "providers": {
-                    "count": len(providers),
-                    "enabled": len([p for p in providers.values() if p.get("is_enabled")])
-                },
-                "agents": {
-                    "count": len(agents),
-                    "enabled": len([a for a in agents.values() if a.get("is_enabled")])
-                },
-                "tools": {
-                    "count": len(tools),
-                    "enabled": len([t for t in tools.values() if t.get("is_enabled")])
-                },
-                "users": {
-                    "count": len(permissions),
-                    "active": len([u for u in permissions.values() if u.get("is_active")])
-                },
-                "last_updated": CustomDateTime.now().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to get tenant config summary: {e}")
-            return {}
+    @property
+    def settings(self) -> Settings:
+        """Get current settings"""
+        return self._current_settings or Settings()
     
-    def get_current_config(self) -> Dict[str, Any]:
-        """Get current system configuration (non-tenant specific)"""
-        config = {}
-        
-        if hasattr(self._current_settings, 'workflow') and self._current_settings.workflow:
-            config["workflow"] = {
-                "max_iterations": self._current_settings.workflow.max_iterations,
-                "timeout_seconds": self._current_settings.workflow.timeout_seconds,
-                "enable_reflection": self._current_settings.workflow.enable_reflection,
-                "enable_semantic_routing": self._current_settings.workflow.enable_semantic_routing,
-                "checkpointer_type": self._current_settings.workflow.checkpointer_type
-            }
-        
-        if hasattr(self._current_settings, 'orchestrator') and self._current_settings.orchestrator:
-            config["orchestrator"] = {
-                "enabled": self._current_settings.orchestrator.enabled,
-                "strategy": self._current_settings.orchestrator.strategy,
-                "max_agents_per_query": self._current_settings.orchestrator.max_agents_per_query,
-                "confidence_threshold": self._current_settings.orchestrator.confidence_threshold
-            }
-        
-        config["system"] = {
-            "app_name": self._current_settings.APP_NAME,
-            "app_version": self._current_settings.APP_VERSION,
-            "environment": self._current_settings.ENV,
-            "debug": self._current_settings.DEBUG
-        }
-        
-        return config
-    
-    async def get_cache_stats(self) -> Dict[str, Any]:
-        """Get comprehensive cache statistics"""
-        await self._ensure_initialized()
-        
-        cache_stats = await cache_manager.get_cache_stats()
-        redis_health = await redis_client.health_check()
-        
+    async def get_monitoring_status(self) -> Dict[str, Any]:
+        """Get monitoring status"""
         return {
-            "cache_manager": cache_stats,
-            "redis_service": redis_health,
             "initialized": self._initialized,
-            "monitoring": self._monitoring
+            "monitoring": self._monitoring,
+            "last_update": self._last_update,
+            "cache_initialized": cache_manager.is_initialized if hasattr(cache_manager, 'is_initialized') else False,
+            "redis_initialized": redis_client.is_connected if hasattr(redis_client, 'is_connected') else False
         }
-    
-    async def start_monitoring(self):
-        """Start configuration monitoring"""
-        self._monitoring = True
-        logger.info("Configuration monitoring started")
-        
-        while self._monitoring:
-            try:
-                await asyncio.sleep(300)
-                
-                self._last_update = datetime.now()
-                logger.debug("Configuration monitoring heartbeat")
-                
-            except Exception as e:
-                logger.error(f"Configuration monitoring error: {e}")
-                await asyncio.sleep(60) 
-    
-    async def stop_monitoring(self):
-        """Stop configuration monitoring"""
-        self._monitoring = False
-        await redis_client.close()
-        logger.info("Configuration monitoring stopped")
 
 
 config_manager = ConfigManager()

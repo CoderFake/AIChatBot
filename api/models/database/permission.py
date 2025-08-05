@@ -1,4 +1,3 @@
-# api/models/database/permission.py
 """
 Enhanced permission system with role-based access control
 Supports tenant, department, and user-level permissions
