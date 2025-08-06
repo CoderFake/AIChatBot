@@ -1,156 +1,221 @@
-
-from typing import Optional, Dict, Any
-from fastapi import HTTPException, Header, Depends, status
+"""
+Authentication Middleware for FastAPI
+JWT-based authentication with role verification for Depends()
+"""
+from typing import Optional, Dict, Any, List
+from fastapi import HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database import get_db
-from services.auth.permission_service import PermissionService
-from utils.otp import otp_manager
-from common.types import UserRole, Department
+from config.database import get_db
+from config.settings import get_settings
+from common.types import UserRole
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+settings = get_settings()
+
+security = HTTPBearer()
 
 
-class ConfigAuthMiddleware:
-    """Middleware cho config management authentication"""
+class JWTAuth:
+    """
+    JWT authentication handler
+    """
     
-    def __init__(self):
-        pass
+    @staticmethod
+    def decode_token(token: str) -> Dict[str, Any]:
+        """
+        Decode and validate JWT token
+        """
+        try:
+            payload = jwt.decode(
+                token,
+                settings.JWT_SECRET_KEY,
+                algorithms=[settings.JWT_ALGORITHM]
+            )
+            return payload
+        except JWTError as e:
+            logger.error(f"JWT decode error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token"
+            )
     
-    async def verify_config_access(
-        self,
-        user_id: str = Header(..., alias="X-User-ID"),
-        otp_token: str = Header(..., alias="X-OTP-Token"),
+    @staticmethod
+    async def get_current_user(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """
-        Verify user has permission to config and OTP is valid
-        
-        Args:
-            user_id: User ID from header
-            otp_token: OTP token từ header
-            db: Database session
-            
-        Returns:
-            Dict contains user context and permissions   
+        Get current user from JWT token
+        Returns user context with role information
         """
         try:
-            if not otp_manager.verify_totp(otp_token):
-                logger.warning(f"Invalid OTP for user {user_id}")
+            token = credentials.credentials
+            payload = JWTAuth.decode_token(token)
+            
+            user_id = payload.get("user_id")
+            role = payload.get("role")
+            tenant_id = payload.get("tenant_id")
+            department_id = payload.get("department_id")
+            
+            if not user_id or not role:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid OTP token"
+                    detail="Invalid token payload"
                 )
             
-            permission_service = PermissionService(db)
-            user_context = await permission_service.get_user_all_permissions(user_id)
+            user_context = {
+                "user_id": user_id,
+                "role": role,
+                "tenant_id": tenant_id,
+                "department_id": department_id,
+                "email": payload.get("email"),
+                "username": payload.get("username")
+            }
             
-            if not user_context:
-                logger.warning(f"User {user_id} not found or inactive")
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found or inactive"
-                )
-            
-            config_perms = await permission_service.get_user_config_permissions(user_id)
-            user_context['config_permissions'] = config_perms
-            
-            logger.info(f"Config access verified for user {user_id} with role {user_context.get('role', '')}")
+            logger.debug(f"Authenticated user: {user_id} with role: {role}")
             return user_context
             
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Config auth verification failed: {e}")
+            logger.error(f"Authentication failed: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Authentication verification failed: {str(e)}"
+                detail="Authentication failed"
             )
+
+
+class RoleRequired:
+    """
+    Role-based access control for endpoints
+    """
     
-    async def verify_tool_config_access(
+    def __init__(self, allowed_roles: List[str]):
+        self.allowed_roles = allowed_roles
+    
+    async def __call__(
         self,
-        tool_name: str,
-        user_context: Dict[str, Any]
-    ) -> bool:
+        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user)
+    ) -> Dict[str, Any]:
         """
-        Verify user có quyền config specific tool
-        
-        Args:
-            tool_name: Tên tool cần config
-            user_context: User context từ verify_config_access
-            
-        Returns:
-            bool: True nếu có quyền
+        Verify user has required role
         """
-        config_perms = user_context.get('config_permissions', {})
-        department = user_context.get('department', '')
+        user_role = user_context.get("role")
         
-        if config_perms.get('can_manage_all_tools'):
-            return True
-      
-        if config_perms.get('can_manage_department_tools'):
-           
-            return True
+        if user_role not in self.allowed_roles:
+            logger.warning(
+                f"Access denied for user {user_context.get('user_id')} "
+                f"with role {user_role}. Required roles: {self.allowed_roles}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions. Required role: {', '.join(self.allowed_roles)}"
+            )
         
-        return False
-    
-    async def verify_provider_config_access(
+        return user_context
+
+
+# Maintenance Role Dependencies
+class RequireMaintainer:
+    """
+    Require MAINTAINER role
+    Can manage tenants and global tools
+    """
+    async def __call__(
         self,
-        provider_name: str,
-        user_context: Dict[str, Any]
-    ) -> bool:
-        """
-        Verify user has permission to config specific provider
-        
-        Args:
-            provider_name: Name of provider to config
-            user_context: User context from verify_config_access
-            
-        Returns:
-            bool: True if has permission
-        """ 
-        config_perms = user_context.get('config_permissions', {})
-        
-        if config_perms.get('can_manage_all_providers'):
-            return True
-        
-        if config_perms.get('can_manage_department_providers'):
-            return True
-        
-        return False
+        user_context: Dict[str, Any] = Depends(RoleRequired([UserRole.MAINTAINER.value]))
+    ) -> Dict[str, Any]:
+        logger.info(f"Maintainer access granted for user {user_context.get('user_id')}")
+        return user_context
 
 
-config_auth = ConfigAuthMiddleware()
-
-
-async def verify_config_permission(
-    user_id: str = Header(..., alias="X-User-ID"),
-    otp_token: str = Header(..., alias="X-OTP-Token"),
-    db: AsyncSession = Depends(get_db)
-) -> Dict[str, Any]:
+# Admin Role Dependencies
+class RequireAdmin:
     """
-    Dependency function to verify config permissions
-    Used in config endpoints
+    Require ADMIN role
+    Can manage departments, users, and department tools
     """
-    return await config_auth.verify_config_access(user_id, otp_token, db)
+    async def __call__(
+        self,
+        user_context: Dict[str, Any] = Depends(RoleRequired([UserRole.ADMIN.value]))
+    ) -> Dict[str, Any]:
+        logger.info(f"Admin access granted for user {user_context.get('user_id')}")
+        return user_context
 
 
-async def verify_admin_permission(
-    user_id: str = Header(..., alias="X-User-ID"),
-    otp_token: str = Header(..., alias="X-OTP-Token"),
-    db: AsyncSession = Depends(get_db)
-) -> Dict[str, Any]:
+# Department Admin Role Dependencies
+class RequireDeptAdmin:
     """
-    Dependency function only for admin full access 
+    Require DEPT_ADMIN role (or higher)
+    Can configure providers and tools for department
     """
-    user_context = await config_auth.verify_config_access(user_id, otp_token, db)
-    
-    config_perms = user_context.get('config_permissions', {})
-    if not config_perms.get('can_manage_all_configs'):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required"
-        )
-    
-    return user_context
+    async def __call__(
+        self,
+        user_context: Dict[str, Any] = Depends(RoleRequired([
+            UserRole.DEPT_ADMIN.value, 
+            UserRole.ADMIN.value
+        ]))
+    ) -> Dict[str, Any]:
+        if not user_context.get("department_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Department assignment required"
+            )
+        logger.info(f"Dept admin access granted for user {user_context.get('user_id')}")
+        return user_context
+
+
+# Department Manager Role Dependencies
+class RequireDeptManager:
+    """
+    Require DEPT_MANAGER role (or higher)
+    Can manage documents
+    """
+    async def __call__(
+        self,
+        user_context: Dict[str, Any] = Depends(RoleRequired([
+            UserRole.DEPT_MANAGER.value,
+            UserRole.DEPT_ADMIN.value,
+            UserRole.ADMIN.value
+        ]))
+    ) -> Dict[str, Any]:
+        if not user_context.get("department_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Department assignment required"
+            )
+        logger.info(f"Dept manager access granted for user {user_context.get('user_id')}")
+        return user_context
+
+
+# User Role Dependencies
+class RequireUser:
+    """
+    Require USER role (or any authenticated user)
+    Basic user permissions
+    """
+    async def __call__(
+        self,
+        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user)
+    ) -> Dict[str, Any]:
+        logger.info(f"User access granted for {user_context.get('user_id')}")
+        return user_context
+
+
+jwt_auth = JWTAuth()
+require_maintainer = RequireMaintainer()
+require_admin = RequireAdmin()
+require_dept_admin = RequireDeptAdmin()
+require_dept_manager = RequireDeptManager()
+require_user = RequireUser()
+
+GetCurrentUser = Depends(jwt_auth.get_current_user)
+MaintainerOnly = Depends(require_maintainer)
+AdminOnly = Depends(require_admin)
+DeptAdminOnly = Depends(require_dept_admin)
+DeptManagerOnly = Depends(require_dept_manager)
+AuthenticatedUser = Depends(require_user)

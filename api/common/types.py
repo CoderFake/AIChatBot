@@ -3,7 +3,7 @@ Common types and enums for the entire system
 Single source of truth to avoid duplicates and ensure consistency
 """
 from enum import Enum
-
+from typing import Set, List, Dict
 
 class AccessLevel(Enum):
     """Enum define access level for document""" 
@@ -123,3 +123,201 @@ class ConfigOperationType(str, Enum):
     CONFIG_UPDATE = "config_update"
     SYSTEM_RESTART = "system_restart"
     PERMISSIONS_CHANGE = "permissions_change"
+
+
+
+class Permission(Enum):
+    """All available permissions in the system"""
+    
+    # Maintainer permissions
+    TENANT_CREATE = "tenant.create"
+    TENANT_READ = "tenant.read"
+    TENANT_UPDATE = "tenant.update"
+    TENANT_DELETE_SOFT = "tenant.delete.soft"
+    TENANT_DELETE_HARD = "tenant.delete.hard"
+    TOOL_ENABLE_TENANT = "tool.enable.tenant"
+    TOOL_DISABLE_TENANT = "tool.disable.tenant"
+    
+    # Admin permissions
+    USER_GROUP_CREATE = "user.group.create"
+    USER_GROUP_READ = "user.group.read"
+    USER_GROUP_UPDATE = "user.group.update"
+    USER_GROUP_DELETE = "user.group.delete"
+    USER_PERMISSION_MANAGE = "user.permission.manage"
+    DEPT_CREATE = "department.create"
+    DEPT_READ = "department.read"
+    DEPT_UPDATE = "department.update"
+    DEPT_DELETE = "department.delete"
+    AGENT_CREATE = "agent.create"
+    AGENT_READ = "agent.read"
+    AGENT_UPDATE = "agent.update"
+    AGENT_DELETE = "agent.delete"
+    TOOL_ENABLE_DEPT = "tool.enable.department"
+    TOOL_DISABLE_DEPT = "tool.disable.department"
+    INVITE_DEPT_ADMIN = "invite.dept.admin"
+    INVITE_DEPT_MANAGER = "invite.dept.manager"
+    
+    # Dept Admin permissions
+    PROVIDER_CONFIG = "provider.configure"
+    TOOL_CONFIG_DEPT = "tool.configure.department"
+    
+    # Dept Manager permissions
+    DOCUMENT_PRIVATE_CREATE = "document.private.create"
+    DOCUMENT_PRIVATE_READ = "document.private.read"
+    DOCUMENT_PRIVATE_UPDATE = "document.private.update"
+    DOCUMENT_PRIVATE_DELETE = "document.private.delete"
+    DOCUMENT_PUBLIC_CREATE = "document.public.create"
+    DOCUMENT_PUBLIC_READ = "document.public.read"
+    DOCUMENT_PUBLIC_UPDATE = "document.public.update"
+    DOCUMENT_PUBLIC_DELETE = "document.public.delete"
+    CHAT_PRIVATE = "chat.private"
+    CHAT_PUBLIC = "chat.public"
+    
+    # User permissions
+    AUTH_LOGIN = "auth.login"
+    AUTH_LOGOUT = "auth.logout"
+    CHAT_PUBLIC_ONLY = "chat.public.only"
+
+
+class RolePermissions:
+    """
+    Define default permissions for each role
+    """
+    
+    MAINTAINER_PERMISSIONS = {
+        Permission.TENANT_CREATE,
+        Permission.TENANT_READ,
+        Permission.TENANT_UPDATE,
+        Permission.TENANT_DELETE_SOFT,
+        Permission.TENANT_DELETE_HARD,
+        Permission.TOOL_ENABLE_TENANT,
+        Permission.TOOL_DISABLE_TENANT,
+    }
+    
+    ADMIN_PERMISSIONS = {
+        Permission.USER_GROUP_CREATE,
+        Permission.USER_GROUP_READ,
+        Permission.USER_GROUP_UPDATE,
+        Permission.USER_GROUP_DELETE,
+        Permission.USER_PERMISSION_MANAGE,
+        Permission.DEPT_CREATE,
+        Permission.DEPT_READ,
+        Permission.DEPT_UPDATE,
+        Permission.DEPT_DELETE,
+        Permission.AGENT_CREATE,
+        Permission.AGENT_READ,
+        Permission.AGENT_UPDATE,
+        Permission.AGENT_DELETE,
+        Permission.TOOL_ENABLE_DEPT,
+        Permission.TOOL_DISABLE_DEPT,
+        Permission.INVITE_DEPT_ADMIN,
+        Permission.INVITE_DEPT_MANAGER,
+        # Inherit Dept Admin permissions
+        Permission.PROVIDER_CONFIG,
+        Permission.TOOL_CONFIG_DEPT,
+        # Inherit Dept Manager permissions
+        Permission.DOCUMENT_PRIVATE_CREATE,
+        Permission.DOCUMENT_PRIVATE_READ,
+        Permission.DOCUMENT_PRIVATE_UPDATE,
+        Permission.DOCUMENT_PRIVATE_DELETE,
+        Permission.DOCUMENT_PUBLIC_CREATE,
+        Permission.DOCUMENT_PUBLIC_READ,
+        Permission.DOCUMENT_PUBLIC_UPDATE,
+        Permission.DOCUMENT_PUBLIC_DELETE,
+        Permission.CHAT_PRIVATE,
+        Permission.CHAT_PUBLIC,
+    }
+    
+    DEPT_ADMIN_PERMISSIONS = {
+        Permission.PROVIDER_CONFIG,
+        Permission.TOOL_CONFIG_DEPT,
+        Permission.INVITE_DEPT_MANAGER,
+        # Inherit Dept Manager permissions
+        Permission.DOCUMENT_PRIVATE_CREATE,
+        Permission.DOCUMENT_PRIVATE_READ,
+        Permission.DOCUMENT_PRIVATE_UPDATE,
+        Permission.DOCUMENT_PRIVATE_DELETE,
+        Permission.DOCUMENT_PUBLIC_CREATE,
+        Permission.DOCUMENT_PUBLIC_READ,
+        Permission.DOCUMENT_PUBLIC_UPDATE,
+        Permission.DOCUMENT_PUBLIC_DELETE,
+        Permission.CHAT_PRIVATE,
+        Permission.CHAT_PUBLIC,
+    }
+    
+    DEPT_MANAGER_PERMISSIONS = {
+        Permission.DOCUMENT_PRIVATE_CREATE,
+        Permission.DOCUMENT_PRIVATE_READ,
+        Permission.DOCUMENT_PRIVATE_UPDATE,
+        Permission.DOCUMENT_PRIVATE_DELETE,
+        Permission.DOCUMENT_PUBLIC_CREATE,
+        Permission.DOCUMENT_PUBLIC_READ,
+        Permission.DOCUMENT_PUBLIC_UPDATE,
+        Permission.DOCUMENT_PUBLIC_DELETE,
+        Permission.CHAT_PRIVATE,
+        Permission.CHAT_PUBLIC,
+    }
+    
+    USER_PERMISSIONS = {
+        Permission.AUTH_LOGIN,
+        Permission.AUTH_LOGOUT,
+        Permission.CHAT_PUBLIC_ONLY,
+    }
+    
+    @classmethod
+    def get_permissions_for_role(cls, role: UserRole) -> Set[Permission]:
+        """
+        Get all permissions for a specific role
+        """
+        role_map = {
+            UserRole.MAINTAINER: cls.MAINTAINER_PERMISSIONS,
+            UserRole.ADMIN: cls.ADMIN_PERMISSIONS,
+            UserRole.DEPT_ADMIN: cls.DEPT_ADMIN_PERMISSIONS,
+            UserRole.DEPT_MANAGER: cls.DEPT_MANAGER_PERMISSIONS,
+            UserRole.USER: cls.USER_PERMISSIONS,
+        }
+        return role_map.get(role, set())
+    
+    @classmethod
+    def get_permission_values_for_role(cls, role: UserRole) -> List[str]:
+        """
+        Get permission string values for a role
+        """
+        permissions = cls.get_permissions_for_role(role)
+        return [perm.value for perm in permissions]
+
+
+class DefaultGroupNames:
+    """
+    Default group names for tenant
+    """
+    ADMIN = "Administrators"
+    DEPT_ADMIN = "Department Administrators"
+    DEPT_MANAGER = "Department Managers"
+    USER = "Users"
+    
+    DESCRIPTIONS = {
+        ADMIN: "Full administrative access within tenant",
+        DEPT_ADMIN: "Department-level administrative access",
+        DEPT_MANAGER: "Department document and chat management",
+        USER: "Basic user access with public chat only"
+    }
+
+
+class DefaultProviderConfig:
+    """
+    Default provider configuration
+    """
+    PROVIDER_NAME = "gemini"
+    DEFAULT_MODEL = "gemini-1.5-flash"
+    DEFAULT_TEMPERATURE = 0.7
+    DEFAULT_MAX_TOKENS = 2048
+    
+    @classmethod
+    def get_default_config(cls) -> Dict:
+        return {
+            "provider": cls.PROVIDER_NAME,
+            "model": cls.DEFAULT_MODEL,
+            "temperature": cls.DEFAULT_TEMPERATURE,
+            "max_tokens": cls.DEFAULT_MAX_TOKENS
+        }

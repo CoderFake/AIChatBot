@@ -1,15 +1,23 @@
-"""
-Permission Service for RAG system with department-based access control
-"""
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, delete
 from sqlalchemy.orm import joinedload
+from datetime import datetime
+import uuid
 
-from models.database.user import User
+from models.database.user import User, UserGroup, GroupPermission
 from models.database.document import Document, DocumentCollection
-from models.database.tenant import Department
-from common.types import AccessLevel, UserRole, DBDocumentPermissionLevel
+from models.database.tenant import Tenant, Department
+from models.database.tool import Tool, TenantToolConfig
+from models.database.provider import LLMProvider, TenantProviderConfig
+from common.types import (
+    AccessLevel,
+    UserRole,
+    RolePermissions,
+    DefaultGroupNames,
+    DefaultProviderConfig,
+    DBDocumentPermissionLevel
+)
 from config.settings import get_settings
 from utils.logging import get_logger
 from core.exceptions import PermissionDeniedError, NotFoundError
@@ -17,6 +25,377 @@ from core.exceptions import PermissionDeniedError, NotFoundError
 logger = get_logger(__name__)
 settings = get_settings()
 
+
+class PermissionService:
+    """
+    Service for managing permissions and tenant configurations
+    """
+    
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def create_tenant_with_defaults(
+        self,
+        tenant_name: str,
+        created_by: str,
+        config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Create new tenant with default permissions and configurations
+        Sets up default groups, roles, and tool/provider access
+        """
+        try:
+            tenant = Tenant(
+                id=str(uuid.uuid4()),
+                tenant_name=tenant_name,
+                config=config or {},
+                is_active=True,
+                created_at=datetime.utcnow(),
+                created_by=created_by
+            )
+            self.db.add(tenant)
+            
+            default_groups = await self._create_default_groups(tenant.id)
+            
+            await self._setup_default_permissions(tenant.id, default_groups)
+            
+            await self._setup_default_tools(tenant.id)
+            
+            # Setup default provider (Gemini)
+            await self._setup_default_provider(tenant.id)
+            
+            await self.db.commit()
+            
+            logger.info(f"Created tenant {tenant_name} with defaults")
+            
+            return {
+                "tenant_id": tenant.id,
+                "tenant_name": tenant.tenant_name,
+                "groups": default_groups,
+                "status": "created"
+            }
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to create tenant with defaults: {e}")
+            raise
+    
+    async def _create_default_groups(self, tenant_id: str) -> Dict[str, str]:
+        """
+        Create default user groups for tenant
+        """
+        groups = {}
+        
+        admin_group = UserGroup(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            group_name=DefaultGroupNames.ADMIN,
+            description=DefaultGroupNames.DESCRIPTIONS[DefaultGroupNames.ADMIN],
+            created_at=datetime.utcnow()
+        )
+        self.db.add(admin_group)
+        groups["admin"] = admin_group.id
+        
+        dept_admin_group = UserGroup(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            group_name=DefaultGroupNames.DEPT_ADMIN,
+            description=DefaultGroupNames.DESCRIPTIONS[DefaultGroupNames.DEPT_ADMIN],
+            created_at=datetime.utcnow()
+        )
+        self.db.add(dept_admin_group)
+        groups["dept_admin"] = dept_admin_group.id
+        
+        dept_manager_group = UserGroup(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            group_name=DefaultGroupNames.DEPT_MANAGER,
+            description=DefaultGroupNames.DESCRIPTIONS[DefaultGroupNames.DEPT_MANAGER],
+            created_at=datetime.utcnow()
+        )
+        self.db.add(dept_manager_group)
+        groups["dept_manager"] = dept_manager_group.id
+        
+        user_group = UserGroup(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            group_name=DefaultGroupNames.USER,
+            description=DefaultGroupNames.DESCRIPTIONS[DefaultGroupNames.USER],
+            created_at=datetime.utcnow()
+        )
+        self.db.add(user_group)
+        groups["user"] = user_group.id
+        
+        return groups
+    
+    async def _setup_default_permissions(
+        self,
+        tenant_id: str,
+        groups: Dict[str, str]
+    ):
+        """
+        Setup default permissions for each group using RolePermissions
+        """
+        admin_permissions = RolePermissions.get_permission_values_for_role(UserRole.ADMIN)
+        for permission in admin_permissions:
+            perm = GroupPermission(
+                id=str(uuid.uuid4()),
+                group_id=groups["admin"],
+                permission_name=permission,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(perm)
+        
+        dept_admin_permissions = RolePermissions.get_permission_values_for_role(UserRole.DEPT_ADMIN)
+        for permission in dept_admin_permissions:
+            perm = GroupPermission(
+                id=str(uuid.uuid4()),
+                group_id=groups["dept_admin"],
+                permission_name=permission,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(perm)
+        
+        dept_manager_permissions = RolePermissions.get_permission_values_for_role(UserRole.DEPT_MANAGER)
+        for permission in dept_manager_permissions:
+            perm = GroupPermission(
+                id=str(uuid.uuid4()),
+                group_id=groups["dept_manager"],
+                permission_name=permission,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(perm)
+        
+        user_permissions = RolePermissions.get_permission_values_for_role(UserRole.USER)
+        for permission in user_permissions:
+            perm = GroupPermission(
+                id=str(uuid.uuid4()),
+                group_id=groups["user"],
+                permission_name=permission,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(perm)
+    
+    async def _setup_default_tools(self, tenant_id: str):
+        """
+        Setup default tool access for tenant (all disabled by default)
+        """
+        result = await self.db.execute(select(Tool))
+        tools = result.scalars().all()
+        
+        for tool in tools:
+            config = TenantToolConfig(
+                id=str(uuid.uuid4()),
+                tool_id=tool.id,
+                tenant_id=tenant_id,
+                is_enabled=False, 
+                config_data={},
+                created_at=datetime.utcnow()
+            )
+            self.db.add(config)
+    
+    async def _setup_default_provider(self, tenant_id: str):
+        """
+        Setup default LLM provider (Gemini) for tenant
+        """
+        result = await self.db.execute(
+            select(LLMProvider).where(
+                LLMProvider.provider_name == DefaultProviderConfig.PROVIDER_NAME
+            )
+        )
+        gemini_provider = result.scalar_one_or_none()
+        
+        if gemini_provider:
+            config = TenantProviderConfig(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                provider_id=gemini_provider.id,
+                is_enabled=True,
+                config_data=DefaultProviderConfig.get_default_config(),
+                is_default=True,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(config)
+    
+    async def get_user_permissions(
+        self,
+        user_id: str,
+        tenant_id: Optional[str] = None
+    ) -> Set[str]:
+        """
+        Get all permissions for a user based on their groups
+        """
+        try:
+            query = select(UserGroup).join(
+                User.groups
+            ).where(User.id == user_id)
+            
+            if tenant_id:
+                query = query.where(UserGroup.tenant_id == tenant_id)
+            
+            result = await self.db.execute(query)
+            user_groups = result.scalars().all()
+            
+            permissions = set()
+            for group in user_groups:
+                group_perms_result = await self.db.execute(
+                    select(GroupPermission).where(
+                        GroupPermission.group_id == group.id
+                    )
+                )
+                group_perms = group_perms_result.scalars().all()
+                
+                for perm in group_perms:
+                    permissions.add(perm.permission_name)
+            
+            return permissions
+            
+        except Exception as e:
+            logger.error(f"Failed to get user permissions: {e}")
+            return set()
+    
+    async def check_permission(
+        self,
+        user_id: str,
+        permission: str,
+        tenant_id: Optional[str] = None
+    ) -> bool:
+        """
+        Check if user has specific permission
+        """
+        user_permissions = await self.get_user_permissions(user_id, tenant_id)
+        return permission in user_permissions
+    
+    async def assign_user_to_group(
+        self,
+        user_id: str,
+        group_id: str
+    ):
+        """
+        Assign user to a group
+        """
+        try:
+            user_result = await self.db.execute(
+                select(User).where(User.id == user_id)
+            )
+            user = user_result.scalar_one_or_none()
+            
+            group_result = await self.db.execute(
+                select(UserGroup).where(UserGroup.id == group_id)
+            )
+            group = group_result.scalar_one_or_none()
+            
+            if user and group:
+                user.groups.append(group)
+                await self.db.commit()
+                logger.info(f"Assigned user {user_id} to group {group_id}")
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to assign user to group: {e}")
+            raise
+    
+    async def create_custom_group(
+        self,
+        tenant_id: str,
+        group_name: str,
+        description: str,
+        permissions: List[str]
+    ) -> str:
+        """
+        Create custom group with specific permissions
+        """
+        try:
+            group = UserGroup(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                group_name=group_name,
+                description=description,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(group)
+            
+            for permission_name in permissions:
+                perm = GroupPermission(
+                    id=str(uuid.uuid4()),
+                    group_id=group.id,
+                    permission_name=permission_name,
+                    created_at=datetime.utcnow()
+                )
+                self.db.add(perm)
+            
+            await self.db.commit()
+            logger.info(f"Created custom group {group_name} for tenant {tenant_id}")
+            
+            return group.id
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to create custom group: {e}")
+            raise
+    
+    async def update_group_permissions(
+        self,
+        group_id: str,
+        permissions: List[str]
+    ):
+        """
+        Update permissions for a group
+        """
+        try:
+            await self.db.execute(
+                delete(GroupPermission).where(
+                    GroupPermission.group_id == group_id
+                )
+            )
+            
+            for permission_name in permissions:
+                perm = GroupPermission(
+                    id=str(uuid.uuid4()),
+                    group_id=group_id,
+                    permission_name=permission_name,
+                    created_at=datetime.utcnow()
+                )
+                self.db.add(perm)
+            
+            await self.db.commit()
+            logger.info(f"Updated permissions for group {group_id}")
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to update group permissions: {e}")
+            raise
+    
+    async def get_user_all_permissions(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get complete user context with all permissions
+        Used by auth middleware
+        """
+        try:
+            result = await self.db.execute(
+                select(User).where(User.id == user_id)
+            )
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                return None
+            
+            permissions = await self.get_user_permissions(user_id, user.tenant_id)
+            
+            return {
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role,
+                "tenant_id": user.tenant_id,
+                "department_id": user.department_id,
+                "permissions": list(permissions),
+                "is_active": user.is_active
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get user context: {e}")
+            return None
 
 class RAGPermissionService:
     """
