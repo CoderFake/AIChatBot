@@ -1,7 +1,6 @@
-# api/services/auth/permission_service.py
 """
 Permission Service
-Manages permissions and tenant configurations using correct database models
+Manages permissions and tenant configurations
 """
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,11 +93,10 @@ class PermissionService:
             default_groups = {}
             
             groups_to_create = [
-                ("MAINTAINER", "System Maintainers", "ROLE"),
-                ("ADMIN", "Tenant Administrators", "ROLE"), 
-                ("DEPT_ADMIN", "Department Administrators", "ROLE"),
-                ("DEPT_MANAGER", "Department Managers", "ROLE"),
-                ("USER", "Regular Users", "ROLE")
+                ("ADMIN", DefaultGroupNames.ADMIN, "ROLE"), 
+                ("DEPT_ADMIN", DefaultGroupNames.DEPT_ADMIN, "ROLE"),
+                ("DEPT_MANAGER", DefaultGroupNames.DEPT_MANAGER, "ROLE"),
+                ("USER", DefaultGroupNames.USER, "ROLE")
             ]
             
             for group_code, group_name, group_type in groups_to_create:
@@ -106,7 +104,7 @@ class PermissionService:
                     id=str(uuid.uuid4()),
                     group_code=f"{tenant_id}_{group_code}",
                     group_name=group_name,
-                    description=f"Default {group_name} group for tenant",
+                    description=DefaultGroupNames.DESCRIPTIONS.get(group_name, f"Default {group_name} group"),
                     group_type=group_type,
                     is_system=True,
                     created_at=datetime.utcnow()
@@ -125,13 +123,13 @@ class PermissionService:
         """
         Setup default permissions for groups
         Uses Permission, GroupPermission models
+        MAINTAINER permissions are system-wide, not tenant-specific
         """
         try:
             result = await self.db.execute(select(Permission))
             all_permissions = {p.permission_code: p for p in result.scalars().all()}
             
             role_permissions = {
-                "MAINTAINER": RolePermissions.MAINTAINER_PERMISSIONS,
                 "ADMIN": RolePermissions.ADMIN_PERMISSIONS,
                 "DEPT_ADMIN": RolePermissions.DEPT_ADMIN_PERMISSIONS,
                 "DEPT_MANAGER": RolePermissions.DEPT_MANAGER_PERMISSIONS,
@@ -245,7 +243,6 @@ class PermissionService:
     ) -> bool:
         """
         Check if user has specific permission
-        Compatible with redesigned User model
         """
         try:
             result = await self.db.execute(
@@ -263,19 +260,15 @@ class PermissionService:
             if not user:
                 return False
             
-            # Check direct user permissions
-            if hasattr(user, 'permissions') and user.permissions:
-                user_permissions = {up.permission.permission_code for up in user.permissions if up.permission}
-                if permission_code in user_permissions:
-                    return True
+            user_permissions = {up.permission.permission_code for up in user.permissions if up.permission}
+            if permission_code in user_permissions:
+                return True
             
-            # Check group permissions
-            if hasattr(user, 'group_memberships') and user.group_memberships:
-                for membership in user.group_memberships:
-                    if membership.group and membership.group.permissions:
-                        group_permissions = {gp.permission.permission_code for gp in membership.group.permissions if gp.permission}
-                        if permission_code in group_permissions:
-                            return True
+            for membership in user.group_memberships:
+                if membership.group and membership.group.permissions:
+                    group_permissions = {gp.permission.permission_code for gp in membership.group.permissions if gp.permission}
+                    if permission_code in group_permissions:
+                        return True
             
             return False
             
@@ -286,7 +279,6 @@ class PermissionService:
     async def get_user_permissions(self, user_id: str) -> Set[str]:
         """
         Get all permissions for user
-        Compatible with redesigned User model
         """
         try:
             result = await self.db.execute(
@@ -306,19 +298,15 @@ class PermissionService:
             
             permissions = set()
             
-            # Direct user permissions
-            if hasattr(user, 'permissions') and user.permissions:
-                for up in user.permissions:
-                    if up.permission:
-                        permissions.add(up.permission.permission_code)
+            for up in user.permissions:
+                if up.permission:
+                    permissions.add(up.permission.permission_code)
             
-            # Group permissions
-            if hasattr(user, 'group_memberships') and user.group_memberships:
-                for membership in user.group_memberships:
-                    if membership.group and membership.group.permissions:
-                        for gp in membership.group.permissions:
-                            if gp.permission:
-                                permissions.add(gp.permission.permission_code)
+            for membership in user.group_memberships:
+                if membership.group and membership.group.permissions:
+                    for gp in membership.group.permissions:
+                        if gp.permission:
+                            permissions.add(gp.permission.permission_code)
             
             return permissions
             

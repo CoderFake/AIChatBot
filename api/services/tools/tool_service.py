@@ -1,3 +1,7 @@
+"""
+Tool Service
+Database-driven tool management for maintenance operations
+"""
 from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, update, delete
@@ -116,13 +120,14 @@ class ToolService:
                 
                 department_configs = {}
                 for dept_config, department in dept_configs_result:
-                    department_configs[str(department.id)] = {
+                    department_configs[str(dept_config.department_id)] = {
+                        "config_id": str(dept_config.id),
                         "department_name": department.department_name,
                         "is_enabled": dept_config.is_enabled,
                         "config_data": dept_config.config_data or {},
                         "usage_limits": dept_config.usage_limits or {},
                         "configured_by": str(dept_config.configured_by) if dept_config.configured_by else None,
-                        "configured_at": dept_config.configured_at
+                        "configured_at": dept_config.created_at
                     }
                 
                 self._tool_cache[str(tool.id)] = {
@@ -147,142 +152,104 @@ class ToolService:
             if not self._tool_cache:
                 self._tool_cache = {}
     
-    async def get_all_tools(self, include_disabled: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Get all tools from database with optional filtering"""
-        if not self._is_cache_valid():
-            await self._refresh_tool_cache()
-        
-        if include_disabled:
-            return self._tool_cache.copy()
-        else:
-            return {
-                tool_id: tool_info 
-                for tool_id, tool_info in self._tool_cache.items()
-                if tool_info.get("is_enabled", False)
-            }
+    async def get_all_tools(self) -> List[Dict[str, Any]]:
+        """
+        Get all tools with their configurations
+        """
+        try:
+            if not self._is_cache_valid():
+                await self._refresh_tool_cache()
+            
+            return list(self._tool_cache.values())
+            
+        except Exception as e:
+            logger.error(f"Failed to get all tools: {e}")
+            return []
     
     async def get_tool_by_id(self, tool_id: str) -> Optional[Dict[str, Any]]:
-        """Get specific tool by ID"""
-        if not self._is_cache_valid():
-            await self._refresh_tool_cache()
-        
-        return self._tool_cache.get(tool_id)
+        """
+        Get specific tool by ID
+        """
+        try:
+            if not self._is_cache_valid():
+                await self._refresh_tool_cache()
+            
+            return self._tool_cache.get(tool_id)
+            
+        except Exception as e:
+            logger.error(f"Failed to get tool by ID: {e}")
+            return None
     
-    async def get_tool_by_name(self, tool_name: str) -> Optional[Dict[str, Any]]:
-        """Get specific tool by name"""
-        if not self._is_cache_valid():
-            await self._refresh_tool_cache()
-        
-        for tool_info in self._tool_cache.values():
-            if tool_info.get("tool_name") == tool_name:
-                return tool_info
-        return None
-    
-    async def enable_tool(self, tool_id: str, enabled_by: str) -> bool:
-        """Enable a tool system-wide (maintenance operation)"""
+    async def enable_tool_globally(self, tool_id: str) -> bool:
+        """
+        Enable tool globally (affects all departments)
+        """
         try:
             result = await self.db.execute(
-                update(Tool)
-                .where(Tool.id == tool_id)
-                .values(
-                    is_enabled=True,
-                    updated_at=datetime.now()
-                )
-                .returning(Tool.tool_name)
+                select(Tool).where(Tool.id == tool_id)
             )
+            tool = result.scalar_one_or_none()
             
-            tool_name = result.scalar_one_or_none()
-            if tool_name:
-                await self.db.commit()
-                self.invalidate_cache()
-                logger.info(f"Tool enabled: {tool_name} (ID: {tool_id}) by {enabled_by}")
-                return True
-            else:
-                logger.warning(f"Tool not found for enabling: {tool_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to enable tool {tool_id}: {e}")
-            await self.db.rollback()
-            return False
-    
-    async def disable_tool(self, tool_id: str, disabled_by: str) -> bool:
-        """Disable a tool system-wide (maintenance operation)"""
-        try:
-            result = await self.db.execute(
-                update(Tool)
-                .where(Tool.id == tool_id)
-                .values(
-                    is_enabled=False,
-                    updated_at=datetime.now()
-                )
-                .returning(Tool.tool_name)
-            )
-            
-            tool_name = result.scalar_one_or_none()
-            if tool_name:
-                await self.db.commit()
-                self.invalidate_cache()
-                logger.info(f"Tool disabled: {tool_name} (ID: {tool_id}) by {disabled_by}")
-                return True
-            else:
-                logger.warning(f"Tool not found for disabling: {tool_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to disable tool {tool_id}: {e}")
-            await self.db.rollback()
-            return False
-    
-    async def update_tool_config(self, tool_id: str, base_config: Dict[str, Any], updated_by: str) -> bool:
-        """Update tool base configuration (maintenance operation)"""
-        try:
-            result = await self.db.execute(
-                update(Tool)
-                .where(Tool.id == tool_id)
-                .values(
-                    base_config=base_config,
-                    updated_at=datetime.now()
-                )
-                .returning(Tool.tool_name)
-            )
-            
-            tool_name = result.scalar_one_or_none()
-            if tool_name:
-                await self.db.commit()
-                self.invalidate_cache()
-                logger.info(f"Tool config updated: {tool_name} (ID: {tool_id}) by {updated_by}")
-                return True
-            else:
-                logger.warning(f"Tool not found for config update: {tool_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to update tool config {tool_id}: {e}")
-            await self.db.rollback()
-            return False
-    
-    
-    async def enable_tool_for_department(
-        self, 
-        tool_id: str, 
-        department_id: str, 
-        config_data: Optional[Dict[str, Any]] = None,
-        usage_limits: Optional[Dict[str, Any]] = None,
-        configured_by: str = None
-    ) -> bool:
-        """Enable tool for specific department"""
-        try:
-            tool_info = await self.get_tool_by_id(tool_id)
-            if not tool_info:
+            if not tool:
                 logger.warning(f"Tool not found: {tool_id}")
                 return False
             
-            if not tool_info.get("is_enabled"):
-                logger.warning(f"Tool is system-disabled: {tool_info.get('tool_name')}")
+            tool.is_enabled = True
+            tool.updated_at = datetime.now()
+            
+            await self.db.commit()
+            await self._refresh_tool_cache()
+            
+            logger.info(f"Tool enabled globally: {tool.tool_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to enable tool globally: {e}")
+            await self.db.rollback()
+            return False
+    
+    async def disable_tool_globally(self, tool_id: str) -> bool:
+        """
+        Disable tool globally (affects all departments)
+        """
+        try:
+            result = await self.db.execute(
+                select(Tool).where(Tool.id == tool_id)
+            )
+            tool = result.scalar_one_or_none()
+            
+            if not tool:
+                logger.warning(f"Tool not found: {tool_id}")
                 return False
             
-            existing_config = await self.db.execute(
+            tool.is_enabled = False
+            tool.updated_at = datetime.now()
+            
+            await self.db.commit()
+            await self._refresh_tool_cache()
+            
+            logger.info(f"Tool disabled globally: {tool.tool_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to disable tool globally: {e}")
+            await self.db.rollback()
+            return False
+    
+    async def configure_tool_for_department(
+        self,
+        tool_id: str,
+        department_id: str,
+        is_enabled: bool,
+        config_data: Optional[Dict[str, Any]] = None,
+        usage_limits: Optional[Dict[str, Any]] = None,
+        configured_by: Optional[str] = None
+    ) -> bool:
+        """
+        Configure tool for specific department
+        """
+        try:
+            result = await self.db.execute(
                 select(DepartmentToolConfig)
                 .where(
                     and_(
@@ -292,156 +259,144 @@ class ToolService:
                 )
             )
             
-            dept_config = existing_config.scalar_one_or_none()
+            dept_config = result.scalar_one_or_none()
             
             if dept_config:
-                dept_config.is_enabled = True
+                dept_config.is_enabled = is_enabled
                 dept_config.config_data = config_data or dept_config.config_data
                 dept_config.usage_limits = usage_limits or dept_config.usage_limits
-                dept_config.configured_by = configured_by
-                dept_config.configured_at = datetime.now()
+                dept_config.configured_by = configured_by or dept_config.configured_by
+                dept_config.updated_at = datetime.now()
             else:
                 dept_config = DepartmentToolConfig(
-                    tool_id=tool_id,
                     department_id=department_id,
-                    is_enabled=True,
+                    tool_id=tool_id,
+                    is_enabled=is_enabled,
                     config_data=config_data or {},
                     usage_limits=usage_limits or {},
-                    configured_by=configured_by,
-                    configured_at=datetime.now()
+                    configured_by=configured_by
                 )
                 self.db.add(dept_config)
             
             await self.db.commit()
-            self.invalidate_cache()
+            await self._refresh_tool_cache()
             
-            logger.info(f"Tool {tool_info.get('tool_name')} enabled for department {department_id}")
+            action = "enabled" if is_enabled else "disabled"
+            logger.info(f"Tool {action} for department: tool_id={tool_id}, dept_id={department_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to enable tool {tool_id} for department {department_id}: {e}")
+            logger.error(f"Failed to configure tool for department: {e}")
             await self.db.rollback()
             return False
     
-    async def disable_tool_for_department(self, tool_id: str, department_id: str, disabled_by: str) -> bool:
-        """Disable tool for specific department"""
-        try:
-            result = await self.db.execute(
-                update(DepartmentToolConfig)
-                .where(
-                    and_(
-                        DepartmentToolConfig.tool_id == tool_id,
-                        DepartmentToolConfig.department_id == department_id
-                    )
-                )
-                .values(
-                    is_enabled=False,
-                    configured_by=disabled_by,
-                    configured_at=datetime.now()
-                )
-            )
-            
-            if result.rowcount > 0:
-                await self.db.commit()
-                self.invalidate_cache()
-                logger.info(f"Tool {tool_id} disabled for department {department_id}")
-                return True
-            else:
-                logger.warning(f"Department tool config not found: tool={tool_id}, dept={department_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to disable tool {tool_id} for department {department_id}: {e}")
-            await self.db.rollback()
-            return False
-    
-    async def get_department_tools(self, department_id: str) -> Dict[str, Dict[str, Any]]:
-        """Get all enabled tools for a specific department"""
-        if not self._is_cache_valid():
-            await self._refresh_tool_cache()
-        
-        department_tools = {}
-        for tool_id, tool_info in self._tool_cache.items():
-            if not tool_info.get("is_enabled"):
-                continue
-            
-            dept_configs = tool_info.get("department_configs", {})
-            dept_config = dept_configs.get(department_id)
-            
-            if dept_config and dept_config.get("is_enabled"):
-                department_tools[tool_id] = {
-                    **tool_info,
-                    "department_config": dept_config
-                }
-            elif not dept_config and not tool_info.get("base_config", {}).get("department_configurable", False):
-                department_tools[tool_id] = tool_info
-        
-        return department_tools
-    
-    async def get_tool_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive tool statistics"""
+    async def get_department_tools(self, department_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all tools available for specific department
+        """
         try:
             if not self._is_cache_valid():
                 await self._refresh_tool_cache()
             
-            total_tools = len(self._tool_cache)
-            enabled_tools = len([t for t in self._tool_cache.values() if t.get("is_enabled")])
+            department_tools = []
             
-            categories = {}
-            for tool_info in self._tool_cache.values():
-                category = tool_info.get("category", "uncategorized")
-                categories[category] = categories.get(category, 0) + 1
-            
-            department_usage = {}
-            total_dept_configs = 0
-            
-            for tool_info in self._tool_cache.values():
-                dept_configs = tool_info.get("department_configs", {})
-                total_dept_configs += len(dept_configs)
+            for tool_id, tool_info in self._tool_cache.items():
+                if not tool_info.get("is_enabled", False):
+                    continue
                 
-                for dept_id, dept_config in dept_configs.items():
-                    if dept_config.get("is_enabled"):
-                        dept_name = dept_config.get("department_name", f"Department {dept_id}")
-                        department_usage[dept_name] = department_usage.get(dept_name, 0) + 1
+                dept_configs = tool_info.get("department_configs", {})
+                dept_config = dept_configs.get(department_id, {})
+                
+                tool_data = {
+                    "tool_id": tool_id,
+                    "tool_name": tool_info["tool_name"],
+                    "description": tool_info["description"],
+                    "category": tool_info["category"],
+                    "is_enabled_globally": tool_info["is_enabled"],
+                    "is_enabled_for_department": dept_config.get("is_enabled", False),
+                    "config_data": dept_config.get("config_data", {}),
+                    "usage_limits": dept_config.get("usage_limits", {}),
+                    "base_config": tool_info.get("base_config", {}),
+                    "configured_at": dept_config.get("configured_at")
+                }
+                
+                department_tools.append(tool_data)
             
-            registry_tools_count = len(tool_registry.get_all_tool_info())
-            registry_stats = tool_registry.get_registry_stats()
-            
-            return {
-                "total_tools": total_tools,
-                "enabled_tools": enabled_tools,
-                "disabled_tools": total_tools - enabled_tools,
-                "categories": categories,
-                "department_usage": department_usage,
-                "total_department_configs": total_dept_configs,
-                "registry_tools_count": registry_tools_count,
-                "registry_stats": registry_stats,
-                "cache_valid": self._is_cache_valid(),
-                "initialized": self._initialized
-            }
+            return department_tools
             
         except Exception as e:
-            logger.error(f"Failed to get tool statistics: {e}")
-            return {}
+            logger.error(f"Failed to get department tools: {e}")
+            return []
     
-    def invalidate_cache(self):
-        """Force cache refresh on next request"""
-        self._cache_timestamp = None
-        logger.info("Tool cache invalidated")
-    
-    async def health_check(self) -> bool:
-        """Check tool service health"""
+    async def delete_tool(self, tool_id: str) -> bool:
+        """
+        Delete tool (only non-system tools)
+        """
         try:
-            if not self._initialized:
+            result = await self.db.execute(
+                select(Tool).where(Tool.id == tool_id)
+            )
+            tool = result.scalar_one_or_none()
+            
+            if not tool:
+                logger.warning(f"Tool not found: {tool_id}")
                 return False
             
-            result = await self.db.execute(select(Tool).limit(1))
-            result.scalar_one_or_none()
+            if tool.is_system:
+                logger.warning(f"Cannot delete system tool: {tool.tool_name}")
+                return False
             
-            registry_available = tool_registry.is_tool_available("calculator")
+            await self.db.execute(
+                delete(DepartmentToolConfig).where(DepartmentToolConfig.tool_id == tool_id)
+            )
             
-            return registry_available
+            await self.db.delete(tool)
+            await self.db.commit()
+            await self._refresh_tool_cache()
+            
+            logger.info(f"Tool deleted: {tool.tool_name}")
+            return True
             
         except Exception as e:
-            logger.error(f"Tool service health check failed: {e}")
+            logger.error(f"Failed to delete tool: {e}")
+            await self.db.rollback()
             return False
+    
+    async def get_tool_usage_stats(self, tool_id: str) -> Dict[str, Any]:
+        """
+        Get tool usage statistics across departments
+        """
+        try:
+            if not self._is_cache_valid():
+                await self._refresh_tool_cache()
+            
+            tool_info = self._tool_cache.get(tool_id)
+            if not tool_info:
+                return {}
+            
+            dept_configs = tool_info.get("department_configs", {})
+            
+            stats = {
+                "tool_id": tool_id,
+                "tool_name": tool_info["tool_name"],
+                "total_departments": len(dept_configs),
+                "enabled_departments": sum(1 for config in dept_configs.values() if config.get("is_enabled", False)),
+                "disabled_departments": sum(1 for config in dept_configs.values() if not config.get("is_enabled", False)),
+                "department_details": dept_configs
+            }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to get tool usage stats: {e}")
+            return {}
+    
+    async def invalidate_cache(self):
+        """Force cache refresh"""
+        try:
+            await self._refresh_tool_cache()
+            logger.info("Tool service cache invalidated and refreshed")
+            
+        except Exception as e:
+            logger.error(f"Failed to invalidate cache: {e}")
+            raise
