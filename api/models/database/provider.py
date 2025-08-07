@@ -2,7 +2,6 @@ from sqlalchemy import Column, String, Boolean, ForeignKey, Index, Integer
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from typing import List, Optional, Dict, Any
-import json
 
 from models.database.base import BaseModel
 
@@ -86,8 +85,8 @@ class ProviderModel(BaseModel):
     is_enabled = Column(
         Boolean,
         nullable=False,
-        default=True,
-        comment="Whether model is enabled"
+        default=False,
+        comment="Only enabled one model will be used for processing"
     )
     
     model_config = Column(
@@ -268,3 +267,4 @@ class DepartmentProviderConfig(BaseModel):
             "config_data": self.config_data or {},
             "last_updated": self.updated_at.isoformat() if self.updated_at else None
         }
+    

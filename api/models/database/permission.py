@@ -5,7 +5,6 @@ Supports tenant, department, and user-level permissions
 from sqlalchemy import Column, String, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.sql import text
 
 from models.database.base import BaseModel
 

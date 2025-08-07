@@ -1,4 +1,3 @@
-from typing import Dict, Any, Optional
 from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID

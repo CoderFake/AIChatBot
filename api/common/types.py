@@ -160,6 +160,7 @@ class Permission(Enum):
     # Dept Admin permissions
     PROVIDER_CONFIG = "provider.configure"
     TOOL_CONFIG_DEPT = "tool.configure.department"
+    INVITE_DEPT_MANAGER = "invite.dept.manager"
     
     # Dept Manager permissions
     DOCUMENT_PRIVATE_CREATE = "document.private.create"

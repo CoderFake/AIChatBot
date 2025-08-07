@@ -1,4 +1,3 @@
-from typing import List, Optional, Dict, Any
 from sqlalchemy import Column, String, Boolean, Integer, Float, Text, Index, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -24,21 +23,21 @@ class ChatSession(BaseModel):
         nullable=False,
         default=True,
         index=True,
-        comment="True nếu là anonymous session"
+        comment="True if it is an anonymous session"
     )
     
     title = Column(
         String(500),
         nullable=True,
         index=True,
-        comment="Tiêu đề của chat session"
+        comment="Title of the chat session"
     )
 
     message_count = Column(
         Integer,
         nullable=False,
         default=0,
-        comment="Tổng số messages trong session"
+        comment="Total number of messages in the session"
     )
     
     last_activity = Column(

@@ -22,6 +22,7 @@ from models.database.tenant import Tenant, Department
 from models.database.provider import Provider, DepartmentProviderConfig
 from models.database.agent import Agent, AgentToolConfig
 from models.database.tool import Tool, DepartmentToolConfig
+from models.database.workflow_agent import WorkflowAgent
 from models.database.user import User
 from models.database.permission import UserPermission
 
@@ -210,6 +211,45 @@ class ConfigManager:
             logger.error(f"Failed to load tenant tools from DB: {e}")
             return {}
     
+    async def load_tenant_workflow_from_db(
+        self, 
+        tenant_id: str, 
+        db_session: AsyncSession
+    ) -> Dict[str, Any]:
+        """Load tenant workflow configuration from database"""
+        try:
+            result = await db_session.execute(
+                select(WorkflowAgent)
+                .where(WorkflowAgent.tenant_id == tenant_id)
+            )
+            
+            workflow_agent = result.scalar_one_or_none()
+            
+            if not workflow_agent:
+                logger.warning(f"No WorkflowAgent found for tenant {tenant_id}")
+                return {}
+            
+            workflow_config = {
+                "workflow_agent_id": str(workflow_agent.id),
+                "tenant_id": tenant_id,
+                "provider_name": workflow_agent.provider_name or "none",
+                "model_name": workflow_agent.model_name or "none", 
+                "api_key": workflow_agent.api_key,  # Will be None initially
+                "is_active": workflow_agent.is_active,
+                "model_config": workflow_agent.model_config or {},
+                "max_iterations": workflow_agent.max_iterations,
+                "timeout_seconds": workflow_agent.timeout_seconds,
+                "confidence_threshold": workflow_agent.confidence_threshold,
+                "last_updated": CustomDateTime.now().isoformat()
+            }
+            
+            logger.info(f"Loaded workflow config for tenant {tenant_id}")
+            return {"workflow": workflow_config}
+            
+        except Exception as e:
+            logger.error(f"Failed to load tenant workflow from DB: {e}")
+            return {}
+    
     async def update_provider_key_rotation(
         self,
         tenant_id: str,
@@ -372,6 +412,35 @@ class ConfigManager:
             logger.error(f"Failed to get tenant tools: {e}")
             return {}
     
+    async def get_tenant_workflow(self, tenant_id: str) -> Dict[str, Any]:
+        """
+        Get tenant workflow configuration with caching
+        """
+        try:
+            await self._ensure_initialized()
+            
+            cache_key = f"tenant:{tenant_id}:workflows"
+            
+            cached_workflow = await cache_manager.get_dict(cache_key)
+            if cached_workflow:
+                logger.debug(f"Retrieved workflow config from cache for tenant {tenant_id}")
+                return cached_workflow
+            
+            async with get_db_context() as db_session:
+                workflow = await self.load_tenant_workflow_from_db(tenant_id, db_session)
+                
+                if workflow:
+                    await cache_manager.set_dict(
+                        cache_key,
+                        workflow
+                    )
+                
+                return workflow
+            
+        except Exception as e:
+            logger.error(f"Failed to get tenant workflow: {e}")
+            return {}
+    
     async def invalidate_tenant_cache(self, tenant_id: str):
         """
         Invalidate all cached data for a tenant
@@ -427,8 +496,15 @@ class ConfigManager:
                         f"tenant:{tenant_id}:tools",
                         tools
                     )
+                
+                workflow = await self.load_tenant_workflow_from_db(tenant_id, db_session)
+                if workflow:
+                    await cache_manager.set_dict(
+                        f"tenant:{tenant_id}:workflows",
+                        workflow
+                    )
             
-            logger.info(f"Refreshed all cache for tenant {tenant_id}")
+            logger.info(f"Refreshed all cache for tenant {tenant_id} (providers, agents, tools, workflow)")
             
         except Exception as e:
             logger.error(f"Failed to refresh tenant cache: {e}")

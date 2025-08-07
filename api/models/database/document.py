@@ -1,4 +1,3 @@
-# api/models/database/document.py
 """
 Document models with hierarchical folder structure and access control
 Supports private/public collections for Milvus

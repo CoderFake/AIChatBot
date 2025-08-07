@@ -12,7 +12,6 @@ import json
 
 from models.database.agent import Agent, AgentToolConfig
 from models.database.tenant import Department  
-from models.database.provider import Provider, ProviderModel
 from models.database.tool import Tool
 from utils.logging import get_logger
 
