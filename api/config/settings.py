@@ -86,11 +86,7 @@ class TenantCacheConfig:
     def get_tool_cache_key(self) -> str:
         """Get Redis key for tenant tools cache"""
         return f"tenant:{self.tenant_id}:tools"
-    
-    def get_workflow_cache_key(self) -> str:
-        """Get Redis key for tenant workflow config cache"""
-        return f"tenant:{self.tenant_id}:workflows"
-    
+  
     def get_permission_cache_key(self) -> str:
         """Get Redis key for tenant permissions cache"""
         return f"tenant:{self.tenant_id}:permissions"
@@ -110,6 +106,8 @@ class Settings(BaseSettings):
     
     # Security
     SECRET_KEY: str = "your-secret-key-change-in-production"
+    JWT_SECRET_KEY: str = "your-jwt-secret-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
@@ -268,6 +266,15 @@ class Settings(BaseSettings):
     def get_cache_invalidation_pattern(self, tenant_id: str) -> str:
         """Get Redis pattern to invalidate all tenant cache"""
         return f"tenant:{tenant_id}:*"
+    
+    def get_jwt_settings_for_user_type(self, user_role: str) -> Dict[str, Any]:
+        """Get JWT settings based on user role"""
+        return {
+            "secret_key": self.JWT_SECRET_KEY,
+            "algorithm": self.JWT_ALGORITHM,
+            "access_token_expire_minutes": self.ACCESS_TOKEN_EXPIRE_MINUTES,
+            "refresh_token_expire_days": self.REFRESH_TOKEN_EXPIRE_DAYS
+        }
     
     def is_production(self) -> bool:
         """Check if running in production environment"""

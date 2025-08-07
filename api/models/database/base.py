@@ -1,4 +1,3 @@
-# api/models/database/base.py
 """
 Enhanced base model with comprehensive mixins
 Provides common functionality for all database models

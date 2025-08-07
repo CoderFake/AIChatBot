@@ -130,3 +130,49 @@ class AgentToolConfig(BaseModel):
     
     def __repr__(self) -> str:
         return f"<AgentToolConfig(agent_id={self.agent_id}, tool_id={self.tool_id})>"
+    
+
+class WorkflowAgent(BaseModel):
+    """
+    Workflow orchestration agents
+    One per tenant for managing multi-agent workflows
+    """
+    
+    __tablename__ = "workflow_agents"
+
+    workflow_agent_name = Column(
+        String(200),
+        nullable=False,
+        comment="Workflow Agent name"
+    )
+
+    tenant_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Tenant ID"
+    )
+    
+    provider_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("providers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Provider ID"
+    )
+
+    # Relationships
+    tenant = relationship("Tenant", back_populates="workflow_agent")
+    provider = relationship("Provider", back_populates="workflow_agent")
+    
+    __table_args__ = (
+        # Indexes for performance optimization
+        Index('idx_workflow_agent_tenant', 'tenant_id'),
+        Index('idx_workflow_agent_provider', 'provider_id'),
+        Index('idx_workflow_agent_enabled', 'is_deleted'),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<WorkflowAgent(id='{self.id}', name='{self.workflow_agent_name}', tenant_id='{self.tenant_id}')>"
+    

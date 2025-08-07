@@ -1,6 +1,7 @@
 """
 Permission Service
-Manages permissions, tenant configurations, and user operations
+Core permission management: create default groups and validate user permissions
+Does NOT handle CRUD operations for tenant/tools - those belong to respective services
 """
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,18 +11,16 @@ from datetime import datetime
 import uuid
 
 from models.database.user import User
-from models.database.permission import Permission, Group, UserPermission, GroupPermission, UserGroupMembership
-from models.database.tenant import Tenant, Department
-from models.database.tool import Tool, DepartmentToolConfig
-from models.database.provider import Provider, DepartmentProviderConfig
-from models.database.agent import Agent
+from models.database.permission import (
+    Permission, 
+    Group, 
+    UserPermission, 
+    GroupPermission, 
+    UserGroupMembership
+)
 from common.types import (
-    AccessLevel,
-    UserRole,
     RolePermissions,
-    DefaultGroupNames,
-    DefaultProviderConfig,
-    DBDocumentPermissionLevel
+    DefaultGroupNames
 )
 from config.settings import get_settings
 from utils.logging import get_logger
@@ -32,463 +31,681 @@ settings = get_settings()
 
 class PermissionService:
     """
-    Service for managing permissions and tenant configurations
+    Core permission management service with two main responsibilities:
+    1. Create default groups for new tenants (called by TenantService)
+    2. Validate user permissions for API access (called by Middleware)
     """
     
     def __init__(self, db: AsyncSession):
         self.db = db
     
-    # ==================== TENANT OPERATIONS ====================
+    # ==================== DEFAULT GROUPS CREATION ====================
     
-    async def create_tenant_with_defaults(
-        self,
-        tenant_name: str,
-        created_by: str,
-        config: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Create new tenant with default permissions and configurations
-        Sets up default groups, roles, and tool/provider access
-        """
-        try:
-            tenant = Tenant(
-                id=str(uuid.uuid4()),
-                tenant_name=tenant_name,
-                config=config or {},
-                is_active=True,
-                created_at=datetime.utcnow(),
-                created_by=created_by
-            )
-            self.db.add(tenant)
-            
-            default_groups = await self._create_default_groups(tenant.id)
-            await self._setup_default_permissions(tenant.id, default_groups)
-            await self._setup_default_tools(tenant.id)
-            await self._setup_default_provider(tenant.id)
-            
-            await self.db.commit()
-            logger.info(f"Created tenant {tenant_name} with defaults")
-            
-            return {
-                "tenant_id": tenant.id,
-                "tenant_name": tenant.tenant_name,
-                "groups": default_groups,
-                "status": "created"
-            }
-            
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to create tenant: {e}")
-            raise
-    
-    async def soft_delete_tenant(self, tenant_id: str, deleted_by: str) -> bool:
-        """
-        Soft delete tenant (set is_active = False)
-        """
-        try:
-            result = await self.db.execute(
-                update(Tenant)
-                .where(Tenant.id == tenant_id)
-                .values(
-                    is_active=False,
-                    updated_at=datetime.utcnow(),
-                    updated_by=deleted_by
-                )
-            )
-            
-            await self.db.commit()
-            success = result.rowcount > 0
-            
-            if success:
-                logger.info(f"Soft deleted tenant {tenant_id}")
-            else:
-                logger.warning(f"Tenant {tenant_id} not found for soft delete")
-                
-            return success
-            
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to soft delete tenant: {e}")
-            raise
-    
-    async def hard_delete_tenant(self, tenant_id: str) -> bool:
-        """
-        Permanently delete tenant and all related data
-        """
-        try:
-            result = await self.db.execute(
-                delete(Tenant).where(Tenant.id == tenant_id)
-            )
-            
-            await self.db.commit()
-            success = result.rowcount > 0
-            
-            if success:
-                logger.info(f"Hard deleted tenant {tenant_id}")
-            else:
-                logger.warning(f"Tenant {tenant_id} not found for hard delete")
-                
-            return success
-            
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to hard delete tenant: {e}")
-            raise
-    
-    async def get_tenant_list(self, include_inactive: bool = False) -> List[Dict[str, Any]]:
-        """
-        Get list of all tenants
-        """
-        try:
-            query = select(Tenant)
-            if not include_inactive:
-                query = query.where(Tenant.is_active == True)
-                
-            result = await self.db.execute(query.order_by(Tenant.created_at.desc()))
-            tenants = result.scalars().all()
-            
-            tenant_list = []
-            for tenant in tenants:
-                tenant_list.append({
-                    "tenant_id": str(tenant.id),
-                    "tenant_name": tenant.tenant_name,
-                    "is_active": tenant.is_active,
-                    "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
-                    "created_by": tenant.created_by,
-                    "config": tenant.config or {}
-                })
-            
-            return tenant_list
-            
-        except Exception as e:
-            logger.error(f"Failed to get tenant list: {e}")
-            return []
-    
-    # ==================== DEPARTMENT OPERATIONS ====================
-    
-    async def create_department_with_agent(
+    async def create_default_groups_for_tenant(
         self,
         tenant_id: str,
-        department_name: str,
+        created_by: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Create default permission groups for a new tenant
+        Called by TenantService when creating a new tenant
+        Returns: Dict mapping role names to group IDs
+        """
+        try:
+            default_groups = await self._create_default_groups(tenant_id)
+            await self._setup_default_permissions(tenant_id, default_groups)
+            
+            logger.info(f"Created default groups for tenant {tenant_id}")
+            return default_groups
+            
+        except Exception as e:
+            logger.error(f"Failed to create default groups for tenant {tenant_id}: {e}")
+            raise
+
+    
+    # ==================== PERMISSION CRUD OPERATIONS ====================
+    
+    async def create_permission(
+        self,
+        permission_code: str,
+        permission_name: str,
+        resource_type: str,
+        action: str,
         description: Optional[str] = None,
-        created_by: str = None
-    ) -> Dict[str, Any]:
-        """
-        Create department and automatically create corresponding agent
-        """
+        is_system: bool = False,
+        created_by: Optional[str] = None
+    ) -> Permission:
+        """Create a new permission"""
         try:
-            department = Department(
+            permission = Permission(
                 id=str(uuid.uuid4()),
-                tenant_id=tenant_id,
-                department_name=department_name,
+                permission_code=permission_code,
+                permission_name=permission_name,
                 description=description,
-                is_active=True,
-                created_at=datetime.utcnow(),
-                created_by=created_by
+                resource_type=resource_type,
+                action=action,
+                is_system=is_system,
+                created_by=created_by,
+                created_at=datetime.utcnow()
             )
-            self.db.add(department)
             
-            agent = Agent(
-                id=str(uuid.uuid4()),
-                agent_name=f"{department_name}_Agent",
-                description=f"Default agent for {department_name} department",
-                department_id=str(department.id),
-                is_system=True,
-                is_enabled=True,
-                created_at=datetime.utcnow(),
-                created_by=created_by
-            )
-            self.db.add(agent)
-            
+            self.db.add(permission)
             await self.db.commit()
-            logger.info(f"Created department {department_name} with agent")
+            await self.db.refresh(permission)
             
-            return {
-                "department_id": str(department.id),
-                "department_name": department.department_name,
-                "agent_id": str(agent.id),
-                "agent_name": agent.agent_name,
-                "status": "created"
-            }
+            logger.info(f"Created permission: {permission_code}")
+            return permission
             
         except Exception as e:
+            logger.error(f"Failed to create permission {permission_code}: {e}")
             await self.db.rollback()
-            logger.error(f"Failed to create department with agent: {e}")
             raise
     
-    async def delete_department(self, department_id: str) -> bool:
-        """
-        Delete department and related agents
-        """
+    async def get_permission_by_id(self, permission_id: str) -> Optional[Permission]:
+        """Get permission by ID"""
         try:
-            await self.db.execute(
-                delete(Agent).where(Agent.department_id == department_id)
-            )
-            
             result = await self.db.execute(
-                delete(Department).where(Department.id == department_id)
+                select(Permission)
+                .where(Permission.id == permission_id)
+                .where(Permission.is_deleted == False)
             )
-            
-            await self.db.commit()
-            success = result.rowcount > 0
-            
-            if success:
-                logger.info(f"Deleted department {department_id} and related agents")
-            else:
-                logger.warning(f"Department {department_id} not found")
-                
-            return success
-            
+            return result.scalar_one_or_none()
         except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to delete department: {e}")
-            raise
+            logger.error(f"Failed to get permission {permission_id}: {e}")
+            return None
     
-    async def get_departments_by_tenant(self, tenant_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all departments for a tenant
-        """
+    async def get_permission_by_code(self, permission_code: str) -> Optional[Permission]:
+        """Get permission by code"""
         try:
             result = await self.db.execute(
-                select(Department)
-                .where(Department.tenant_id == tenant_id)
-                .where(Department.is_active == True)
-                .order_by(Department.created_at)
+                select(Permission)
+                .where(Permission.permission_code == permission_code)
+                .where(Permission.is_deleted == False)
             )
-            departments = result.scalars().all()
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Failed to get permission by code {permission_code}: {e}")
+            return None
+    
+    async def list_permissions(
+        self,
+        resource_type: Optional[str] = None,
+        action: Optional[str] = None,
+        is_system: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Permission]:
+        """List permissions with optional filters"""
+        try:
+            query = select(Permission).where(Permission.is_deleted == False)
             
-            dept_list = []
-            for dept in departments:
-                dept_list.append({
-                    "department_id": str(dept.id),
-                    "department_name": dept.department_name,
-                    "description": dept.description,
-                    "is_active": dept.is_active,
-                    "created_at": dept.created_at.isoformat() if dept.created_at else None
-                })
+            if resource_type:
+                query = query.where(Permission.resource_type == resource_type)
+            if action:
+                query = query.where(Permission.action == action)
+            if is_system is not None:
+                query = query.where(Permission.is_system == is_system)
             
-            return dept_list
+            query = query.offset(offset).limit(limit)
+            
+            result = await self.db.execute(query)
+            return result.scalars().all()
             
         except Exception as e:
-            logger.error(f"Failed to get departments: {e}")
+            logger.error(f"Failed to list permissions: {e}")
             return []
     
-    # ==================== USER OPERATIONS ====================
-    
-    async def create_user_invitation(
+    async def update_permission(
         self,
-        email: str,
-        role: str,
-        tenant_id: str,
-        department_id: Optional[str] = None,
-        invited_by: str = None
-    ) -> Dict[str, Any]:
-        """
-        Create user invitation record
-        """
+        permission_id: str,
+        permission_name: Optional[str] = None,
+        description: Optional[str] = None,
+        updated_by: Optional[str] = None
+    ) -> Optional[Permission]:
+        """Update permission (code, resource_type, action are immutable)"""
         try:
-            result = await self.db.execute(
-                select(User).where(User.email == email)
-            )
-            existing_user = result.scalar_one_or_none()
+            permission = await self.get_permission_by_id(permission_id)
+            if not permission:
+                return None
             
-            if existing_user:
-                return {
-                    "status": "user_exists",
-                    "message": "User already exists in system"
-                }
+            if permission_name:
+                permission.permission_name = permission_name
+            if description is not None:
+                permission.description = description
+            if updated_by:
+                permission.updated_by = updated_by
             
-            user = User(
-                id=str(uuid.uuid4()),
-                email=email,
-                username=email.split('@')[0], 
-                role=role,
-                tenant_id=tenant_id,
-                department_id=department_id,
-                is_active=False,  
-                is_verified=False,
-                created_at=datetime.utcnow(),
-                created_by=invited_by
-            )
-            self.db.add(user)
+            permission.updated_at = datetime.utcnow()
             
             await self.db.commit()
-            logger.info(f"Created invitation for {email} as {role}")
+            await self.db.refresh(permission)
             
-            return {
-                "user_id": str(user.id),
-                "email": email,
-                "role": role,
-                "status": "invitation_created"
-            }
+            logger.info(f"Updated permission: {permission.permission_code}")
+            return permission
             
         except Exception as e:
+            logger.error(f"Failed to update permission {permission_id}: {e}")
             await self.db.rollback()
-            logger.error(f"Failed to create user invitation: {e}")
             raise
     
-    async def assign_user_to_group(
+    async def delete_permission(self, permission_id: str, deleted_by: Optional[str] = None) -> bool:
+        """Soft delete permission (only if not system permission)"""
+        try:
+            permission = await self.get_permission_by_id(permission_id)
+            if not permission:
+                return False
+            
+            if permission.is_system:
+                logger.warning(f"Cannot delete system permission: {permission.permission_code}")
+                return False
+            
+            permission.soft_delete()
+            if deleted_by:
+                permission.updated_by = deleted_by
+            
+            await self.db.commit()
+            
+            logger.info(f"Deleted permission: {permission.permission_code}")
+                    return True
+            
+        except Exception as e:
+            logger.error(f"Failed to delete permission {permission_id}: {e}")
+            await self.db.rollback()
+            raise
+
+    # ==================== GROUP CRUD OPERATIONS ====================
+    
+    async def create_group(
+        self,
+        group_code: str,
+        group_name: str,
+        group_type: str,
+        description: Optional[str] = None,
+        department_id: Optional[str] = None,
+        is_system: bool = False,
+        settings: Optional[Dict[str, Any]] = None,
+        created_by: Optional[str] = None
+    ) -> Group:
+        """Create a new group"""
+        try:
+            group = Group(
+                id=str(uuid.uuid4()),
+                group_code=group_code,
+                group_name=group_name,
+                description=description,
+                group_type=group_type,
+                department_id=department_id,
+                is_system=is_system,
+                settings=settings,
+                created_by=created_by,
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(group)
+            await self.db.commit()
+            await self.db.refresh(group)
+            
+            logger.info(f"Created group: {group_code}")
+            return group
+            
+        except Exception as e:
+            logger.error(f"Failed to create group {group_code}: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def get_group_by_id(self, group_id: str) -> Optional[Group]:
+        """Get group by ID"""
+        try:
+            result = await self.db.execute(
+                select(Group)
+                .options(
+                    selectinload(Group.permissions).joinedload(GroupPermission.permission),
+                    selectinload(Group.members).joinedload(UserGroupMembership.user)
+                )
+                .where(Group.id == group_id)
+                .where(Group.is_deleted == False)
+            )
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Failed to get group {group_id}: {e}")
+            return None
+    
+    async def get_group_by_code(self, group_code: str) -> Optional[Group]:
+        """Get group by code"""
+        try:
+            result = await self.db.execute(
+                select(Group)
+                .where(Group.group_code == group_code)
+                .where(Group.is_deleted == False)
+            )
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Failed to get group by code {group_code}: {e}")
+            return None
+    
+    async def list_groups(
+        self,
+        group_type: Optional[str] = None,
+        department_id: Optional[str] = None,
+        is_system: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Group]:
+        """List groups with optional filters"""
+        try:
+            query = select(Group).where(Group.is_deleted == False)
+            
+            if group_type:
+                query = query.where(Group.group_type == group_type)
+            if department_id:
+                query = query.where(Group.department_id == department_id)
+            if is_system is not None:
+                query = query.where(Group.is_system == is_system)
+            
+            query = query.offset(offset).limit(limit)
+            
+            result = await self.db.execute(query)
+            return result.scalars().all()
+            
+        except Exception as e:
+            logger.error(f"Failed to list groups: {e}")
+            return []
+    
+    async def update_group(
+        self,
+        group_id: str,
+        group_name: Optional[str] = None,
+        description: Optional[str] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        updated_by: Optional[str] = None
+    ) -> Optional[Group]:
+        """Update group"""
+        try:
+            group = await self.get_group_by_id(group_id)
+            if not group:
+                return None
+            
+            if group_name:
+                group.group_name = group_name
+            if description is not None:
+                group.description = description
+            if settings is not None:
+                group.settings = settings
+            if updated_by:
+                group.updated_by = updated_by
+            
+            group.updated_at = datetime.utcnow()
+            
+            await self.db.commit()
+            await self.db.refresh(group)
+            
+            logger.info(f"Updated group: {group.group_code}")
+            return group
+            
+        except Exception as e:
+            logger.error(f"Failed to update group {group_id}: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def delete_group(self, group_id: str, deleted_by: Optional[str] = None) -> bool:
+        """Soft delete group (only if not system group)"""
+        try:
+            group = await self.get_group_by_id(group_id)
+            if not group:
+                return False
+            
+            if group.is_system:
+                logger.warning(f"Cannot delete system group: {group.group_code}")
+                return False
+            
+            group.soft_delete()
+            if deleted_by:
+                group.updated_by = deleted_by
+            
+            await self.db.commit()
+            
+            logger.info(f"Deleted group: {group.group_code}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to delete group {group_id}: {e}")
+            await self.db.rollback()
+            raise
+
+    # ==================== USER PERMISSION CRUD OPERATIONS ====================
+    
+    async def assign_permission_to_user(
+        self,
+        user_id: str,
+        permission_id: str,
+        granted_by: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        conditions: Optional[Dict[str, Any]] = None
+    ) -> UserPermission:
+        """Assign permission directly to user"""
+        try:
+            # Check if permission already exists
+            existing = await self.db.execute(
+                select(UserPermission)
+                .where(UserPermission.user_id == user_id)
+                .where(UserPermission.permission_id == permission_id)
+                .where(UserPermission.is_deleted == False)
+            )
+            
+            if existing.scalar_one_or_none():
+                raise ValueError("Permission already assigned to user")
+            
+            user_permission = UserPermission(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                permission_id=permission_id,
+                granted_by=granted_by,
+                expires_at=expires_at,
+                conditions=conditions,
+                created_by=granted_by,
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(user_permission)
+            await self.db.commit()
+            await self.db.refresh(user_permission)
+            
+            logger.info(f"Assigned permission {permission_id} to user {user_id}")
+            return user_permission
+            
+        except Exception as e:
+            logger.error(f"Failed to assign permission to user: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def revoke_permission_from_user(
+        self,
+        user_id: str,
+        permission_id: str,
+        revoked_by: Optional[str] = None
+    ) -> bool:
+        """Revoke permission from user"""
+        try:
+            result = await self.db.execute(
+                select(UserPermission)
+                .where(UserPermission.user_id == user_id)
+                .where(UserPermission.permission_id == permission_id)
+                .where(UserPermission.is_deleted == False)
+            )
+            
+            user_permission = result.scalar_one_or_none()
+            if not user_permission:
+                return False
+            
+            user_permission.soft_delete()
+            if revoked_by:
+                user_permission.updated_by = revoked_by
+            
+            await self.db.commit()
+            
+            logger.info(f"Revoked permission {permission_id} from user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to revoke permission from user: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def get_user_direct_permissions(self, user_id: str) -> List[UserPermission]:
+        """Get all direct permissions for a user"""
+        try:
+            result = await self.db.execute(
+                select(UserPermission)
+                .options(joinedload(UserPermission.permission))
+                .where(UserPermission.user_id == user_id)
+                .where(UserPermission.is_deleted == False)
+            )
+            return result.scalars().all()
+            
+        except Exception as e:
+            logger.error(f"Failed to get user permissions: {e}")
+            return []
+    
+    # ==================== GROUP PERMISSION CRUD OPERATIONS ====================
+    
+    async def assign_permission_to_group(
+        self,
+        group_id: str,
+        permission_id: str,
+        granted_by: Optional[str] = None,
+        conditions: Optional[Dict[str, Any]] = None
+    ) -> GroupPermission:
+        """Assign permission to group"""
+        try:
+            # Check if permission already exists
+            existing = await self.db.execute(
+                select(GroupPermission)
+                .where(GroupPermission.group_id == group_id)
+                .where(GroupPermission.permission_id == permission_id)
+                .where(GroupPermission.is_deleted == False)
+            )
+            
+            if existing.scalar_one_or_none():
+                raise ValueError("Permission already assigned to group")
+            
+            group_permission = GroupPermission(
+                id=str(uuid.uuid4()),
+                group_id=group_id,
+                permission_id=permission_id,
+                granted_by=granted_by,
+                conditions=conditions,
+                created_by=granted_by,
+                created_at=datetime.utcnow()
+            )
+            
+            self.db.add(group_permission)
+            await self.db.commit()
+            await self.db.refresh(group_permission)
+            
+            logger.info(f"Assigned permission {permission_id} to group {group_id}")
+            return group_permission
+            
+        except Exception as e:
+            logger.error(f"Failed to assign permission to group: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def revoke_permission_from_group(
+        self,
+        group_id: str,
+        permission_id: str,
+        revoked_by: Optional[str] = None
+    ) -> bool:
+        """Revoke permission from group"""
+        try:
+            result = await self.db.execute(
+                select(GroupPermission)
+                .where(GroupPermission.group_id == group_id)
+                .where(GroupPermission.permission_id == permission_id)
+                .where(GroupPermission.is_deleted == False)
+            )
+            
+            group_permission = result.scalar_one_or_none()
+            if not group_permission:
+                return False
+            
+            group_permission.soft_delete()
+            if revoked_by:
+                group_permission.updated_by = revoked_by
+            
+            await self.db.commit()
+            
+            logger.info(f"Revoked permission {permission_id} from group {group_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to revoke permission from group: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def get_group_permissions(self, group_id: str) -> List[GroupPermission]:
+        """Get all permissions for a group"""
+        try:
+            result = await self.db.execute(
+                select(GroupPermission)
+                .options(joinedload(GroupPermission.permission))
+                .where(GroupPermission.group_id == group_id)
+                .where(GroupPermission.is_deleted == False)
+            )
+            return result.scalars().all()
+            
+        except Exception as e:
+            logger.error(f"Failed to get group permissions: {e}")
+            return []
+
+    # ==================== USER GROUP MEMBERSHIP CRUD OPERATIONS ====================
+    
+    async def add_user_to_group(
         self,
         user_id: str,
         group_id: str,
-        assigned_by: Optional[str] = None
-    ) -> bool:
-        """
-        Assign user to a group
-        """
+        added_by: Optional[str] = None,
+        role_in_group: str = "MEMBER",
+        expires_at: Optional[datetime] = None
+    ) -> UserGroupMembership:
+        """Add user to group"""
         try:
-            result = await self.db.execute(
+            # Check if membership already exists
+            existing = await self.db.execute(
                 select(UserGroupMembership)
                 .where(UserGroupMembership.user_id == user_id)
                 .where(UserGroupMembership.group_id == group_id)
+                .where(UserGroupMembership.is_deleted == False)
             )
-            existing = result.scalar_one_or_none()
             
-            if existing:
-                return True 
+            if existing.scalar_one_or_none():
+                raise ValueError("User already member of group")
             
             membership = UserGroupMembership(
                 id=str(uuid.uuid4()),
                 user_id=user_id,
                 group_id=group_id,
-                assigned_by=assigned_by,
+                added_by=added_by,
+                role_in_group=role_in_group,
+                expires_at=expires_at,
+                created_by=added_by,
                 created_at=datetime.utcnow()
             )
+            
             self.db.add(membership)
+            await self.db.commit()
+            await self.db.refresh(membership)
+            
+            logger.info(f"Added user {user_id} to group {group_id}")
+            return membership
+            
+        except Exception as e:
+            logger.error(f"Failed to add user to group: {e}")
+            await self.db.rollback()
+            raise
+    
+    async def remove_user_from_group(
+        self,
+        user_id: str,
+        group_id: str,
+        removed_by: Optional[str] = None
+    ) -> bool:
+        """Remove user from group"""
+        try:
+            result = await self.db.execute(
+                select(UserGroupMembership)
+                .where(UserGroupMembership.user_id == user_id)
+                .where(UserGroupMembership.group_id == group_id)
+                .where(UserGroupMembership.is_deleted == False)
+            )
+            
+            membership = result.scalar_one_or_none()
+            if not membership:
+                return False
+            
+            membership.soft_delete()
+            if removed_by:
+                membership.updated_by = removed_by
             
             await self.db.commit()
-            logger.info(f"Assigned user {user_id} to group {group_id}")
+            
+            logger.info(f"Removed user {user_id} from group {group_id}")
             return True
             
         except Exception as e:
+            logger.error(f"Failed to remove user from group: {e}")
             await self.db.rollback()
-            logger.error(f"Failed to assign user to group: {e}")
             raise
     
-    async def grant_user_permission(
+    async def update_user_group_membership(
         self,
         user_id: str,
-        permission_code: str,
-        granted_by: Optional[str] = None
-    ) -> bool:
-        """
-        Grant direct permission to user
-        """
+        group_id: str,
+        role_in_group: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        updated_by: Optional[str] = None
+    ) -> Optional[UserGroupMembership]:
+        """Update user group membership"""
         try:
             result = await self.db.execute(
-                select(Permission).where(Permission.permission_code == permission_code)
+                select(UserGroupMembership)
+                .where(UserGroupMembership.user_id == user_id)
+                .where(UserGroupMembership.group_id == group_id)
+                .where(UserGroupMembership.is_deleted == False)
             )
-            permission = result.scalar_one_or_none()
             
-            if not permission:
-                logger.warning(f"Permission {permission_code} not found")
-                return False
-        
-            result = await self.db.execute(
-                select(UserPermission)
-                .where(UserPermission.user_id == user_id)
-                .where(UserPermission.permission_id == str(permission.id))
-            )
-            existing = result.scalar_one_or_none()
+            membership = result.scalar_one_or_none()
+            if not membership:
+                return None
             
-            if existing:
-                return True  
+            if role_in_group:
+                membership.role_in_group = role_in_group
+            if expires_at is not None:
+                membership.expires_at = expires_at
+            if updated_by:
+                membership.updated_by = updated_by
             
-            user_permission = UserPermission(
-                id=str(uuid.uuid4()),
-                user_id=user_id,
-                permission_id=str(permission.id),
-                granted_by=granted_by,
-                created_at=datetime.utcnow()
-            )
-            self.db.add(user_permission)
+            membership.updated_at = datetime.utcnow()
             
             await self.db.commit()
-            logger.info(f"Granted permission {permission_code} to user {user_id}")
-            return True
+            await self.db.refresh(membership)
+            
+            logger.info(f"Updated membership for user {user_id} in group {group_id}")
+            return membership
             
         except Exception as e:
+            logger.error(f"Failed to update user group membership: {e}")
             await self.db.rollback()
-            logger.error(f"Failed to grant user permission: {e}")
             raise
     
-    # ==================== PERMISSION CHECKING ====================
-    
-    async def check_user_permission(
-        self,
-        user_id: str,
-        permission_code: str,
-        resource_context: Optional[Dict[str, Any]] = None
-    ) -> bool:
-        """
-        Check if user has specific permission
-        """
+    async def get_user_group_memberships(self, user_id: str) -> List[UserGroupMembership]:
+        """Get all group memberships for a user"""
         try:
             result = await self.db.execute(
-                select(User)
-                .options(
-                    selectinload(User.permissions).joinedload(UserPermission.permission),
-                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group)
-                    .selectinload(Group.permissions).joinedload(GroupPermission.permission)
-                )
-                .where(User.id == user_id)
-                .where(User.is_active == True)
+                select(UserGroupMembership)
+                .options(joinedload(UserGroupMembership.group))
+                .where(UserGroupMembership.user_id == user_id)
+                .where(UserGroupMembership.is_deleted == False)
             )
-            
-            user = result.scalar_one_or_none()
-            if not user:
-                return False
-            
-            for user_perm in user.permissions:
-                if user_perm.permission.permission_code == permission_code:
-                    return True
-            
-            for membership in user.group_memberships:
-                group = membership.group
-                for group_perm in group.permissions:
-                    if group_perm.permission.permission_code == permission_code:
-                        return True
-            
-            return False
+            return result.scalars().all()
             
         except Exception as e:
-            logger.error(f"Failed to check user permission: {e}")
-            return False
+            logger.error(f"Failed to get user group memberships: {e}")
+            return []
     
-    async def get_user_permissions(self, user_id: str) -> List[str]:
-        """
-        Get all permissions for a user (direct + group permissions)
-        """
+    async def get_group_members(self, group_id: str) -> List[UserGroupMembership]:
+        """Get all members of a group"""
         try:
             result = await self.db.execute(
-                select(User)
-                .options(
-                    selectinload(User.permissions).joinedload(UserPermission.permission),
-                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group)
-                    .selectinload(Group.permissions).joinedload(GroupPermission.permission)
-                )
-                .where(User.id == user_id)
-                .where(User.is_active == True)
+                select(UserGroupMembership)
+                .options(joinedload(UserGroupMembership.user))
+                .where(UserGroupMembership.group_id == group_id)
+                .where(UserGroupMembership.is_deleted == False)
             )
-            
-            user = result.scalar_one_or_none()
-            if not user:
-                return []
-            
-            permissions = set()
-            
-            for user_perm in user.permissions:
-                permissions.add(user_perm.permission.permission_code)
-            
-            for membership in user.group_memberships:
-                group = membership.group
-                for group_perm in group.permissions:
-                    permissions.add(group_perm.permission.permission_code)
-            
-            return list(permissions)
+            return result.scalars().all()
             
         except Exception as e:
-            logger.error(f"Failed to get user permissions: {e}")
+            logger.error(f"Failed to get group members: {e}")
             return []
     
     # ==================== PRIVATE HELPER METHODS ====================
@@ -566,74 +783,3 @@ class PermissionService:
             logger.error(f"Failed to setup default permissions: {e}")
             raise
     
-    async def _setup_default_tools(self, tenant_id: str) -> None:
-        """
-        Setup default tool configurations for tenant departments
-        """
-        try:
-            result = await self.db.execute(
-                select(Tool).where(Tool.is_enabled == True)
-            )
-            tools = result.scalars().all()
-            
-            dept_result = await self.db.execute(
-                select(Department).where(Department.tenant_id == tenant_id)
-            )
-            departments = dept_result.scalars().all()
-            
-            for department in departments:
-                for tool in tools:
-                    
-                    dept_tool_config = DepartmentToolConfig(
-                        id=str(uuid.uuid4()),
-                        department_id=str(department.id),
-                        tool_id=str(tool.id),
-                        is_enabled=False,
-                        config_data={},
-                        usage_limits={},
-                        created_at=datetime.utcnow()
-                    )
-                    self.db.add(dept_tool_config)
-            
-            logger.info(f"Setup default tools for tenant {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup default tools: {e}")
-            raise
-    
-    async def _setup_default_provider(self, tenant_id: str) -> None:
-        """
-        Setup default provider configuration (Gemini)
-        """
-        try:
-            result = await self.db.execute(
-                select(Provider).where(Provider.provider_name == "gemini")
-            )
-            provider = result.scalar_one_or_none()
-            
-            if not provider:
-                logger.warning("Gemini provider not found, skipping default setup")
-                return
-            
-            dept_result = await self.db.execute(
-                select(Department).where(Department.tenant_id == tenant_id)
-            )
-            departments = dept_result.scalars().all()
-            
-            for department in departments:
-                dept_provider_config = DepartmentProviderConfig(
-                    id=str(uuid.uuid4()),
-                    department_id=str(department.id),
-                    provider_id=str(provider.id),
-                    is_enabled=True,
-                    model_name=DefaultProviderConfig.DEFAULT_MODEL,
-                    config_data=DefaultProviderConfig.get_default_config(),
-                    created_at=datetime.utcnow()
-                )
-                self.db.add(dept_provider_config)
-            
-            logger.info(f"Setup default provider for tenant {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup default provider: {e}")
-            raise
