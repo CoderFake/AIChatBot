@@ -14,102 +14,139 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 settings = get_settings()
 
+
+async def _init_db() -> None:
+    """Initialize database connections."""
+    logger.info("Initializing database connections...")
+    from config.database import init_db
+
+    await init_db()
+
+
+async def _init_milvus():
+    """Initialize Milvus vector service."""
+    logger.info("🔍 Initializing Milvus service...")
+    from services.vector.milvus_service import milvus_service
+
+    await milvus_service.initialize()
+    return milvus_service
+
+
+async def _init_llm_providers() -> None:
+    """Initialize LLM providers using database configuration."""
+    logger.info("🧠 Initializing LLM providers...")
+    from services.llm.provider_manager import llm_provider_manager
+    from config.database import get_db_session
+
+    db_session = next(get_db_session())
+    try:
+        await llm_provider_manager.initialize(db_session=db_session)
+    finally:
+        db_session.close()
+
+
+async def _init_tool_manager() -> None:
+    """Initialize tool manager."""
+    logger.info("Initializing tool manager...")
+    from services.tools.tool_manager import tool_manager
+
+    await tool_manager.initialize()
+
+
+async def _init_orchestrator():
+    """Initialize intelligent orchestrator."""
+    logger.info("Initializing intelligent orchestrator...")
+    from services.orchestrator.intelligent_orchestrator import (
+        IntelligentOrchestrator,
+    )
+
+    orchestrator = IntelligentOrchestrator()
+    return orchestrator
+
+
+async def _init_workflow():
+    """Initialize LangGraph workflow."""
+    logger.info("Initializing complete LangGraph workflow...")
+    from workflows.langgraph.complete_workflow import complete_rag_workflow
+
+    await complete_rag_workflow.initialize()
+    return complete_rag_workflow
+
+
+async def _init_streaming() -> None:
+    """Prepare streaming services."""
+    logger.info("Initializing streaming services...")
+    from services.streaming.streaming_service import (
+        streaming_orchestration_service,
+        websocket_streaming_service,
+    )
+
+    # Streaming services initialize on demand; this import ensures availability
+    _ = (streaming_orchestration_service, websocket_streaming_service)
+
+
+async def _perform_health_check(workflow, milvus):
+    """Run health checks for major components."""
+    logger.info("⚕️ Performing system health check...")
+    workflow_healthy = await workflow.health_check()
+    milvus_healthy = await milvus.health_check()
+
+    if not workflow_healthy:
+        logger.warning("Workflow health check failed")
+    if not milvus_healthy:
+        logger.warning("Milvus health check failed")
+
+
+def _log_system_config(milvus) -> None:
+    """Log system configuration details."""
+    logger.info("System configuration:")
+    logger.info(f"  • Environment: {settings.ENV}")
+    logger.info(f"  • Enabled LLM providers: {settings.get_enabled_providers()}")
+    logger.info(f"  • Enabled agents: {settings.get_enabled_agents()}")
+    logger.info(f"  • Enabled tools: {settings.get_enabled_tools()}")
+    logger.info(
+        f"  • Vector collections: {list(milvus.collection_configs.keys())}"
+    )
+    logger.info(
+        f"  • Orchestrator: {'Enabled' if settings.orchestrator.get('enabled', True) else 'Disabled'}"
+    )
+    logger.info("  • Streaming: Enabled")
+    logger.info("  • Multi-language support: vi, en, ja, ko")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifespan manager với complete system initialization
-    """
+    """Application lifespan manager with modular initialization."""
     logger.info("🚀 Starting Complete Agentic RAG System...")
-    
+
     try:
-        # 1. Initialize database connections
-        logger.info("Initializing database connections...")
-        from config.database import init_db
-        await init_db()
-        
-        # 1.5. Auto-sync registries to database (simple registry-based)
+        await _init_db()
         logger.info("🚀 Using registry-based configuration (no complex sync needed)")
-        
-        # 2. Initialize Milvus service (đã có)
-        logger.info("🔍 Initializing Milvus service...")
-        from services.vector.milvus_service import milvus_service
-        await milvus_service.initialize()
-        
-        # 3. Initialize LLM provider manager (database-first)
-        logger.info("🧠 Initializing LLM providers...")
-        from services.llm.provider_manager import llm_provider_manager
-        from config.database import get_db_session
-        
-        # Pass database session to provider manager for database-first loading
-        db_session = next(get_db_session())
-        try:
-            await llm_provider_manager.initialize(db_session=db_session)
-        finally:
-            db_session.close()
-        
-        # 4. Initialize tool manager
-        logger.info("Initializing tool manager...")
-        from services.tools.tool_manager import tool_manager
-        await tool_manager.initialize()
-        
-        # 5. Initialize intelligent orchestrator
-        logger.info("Initializing intelligent orchestrator...")
-        from services.orchestrator.intelligent_orchestrator import IntelligentOrchestrator
-        orchestrator = IntelligentOrchestrator()
-        # No explicit initialization needed - initialized on first use
-        
-        # 6. Initialize complete LangGraph workflow
-        logger.info("Initializing complete LangGraph workflow...")
-        from workflows.langgraph.complete_workflow import complete_rag_workflow
-        await complete_rag_workflow.initialize()
-        
-        # 7. Initialize streaming services
-        logger.info("Initializing streaming services...")
-        from services.streaming.streaming_service import (
-            streaming_orchestration_service,
-            websocket_streaming_service
-        )
-        # Streaming services are initialized on demand
-        
-        # 8. System health check
-        logger.info("⚕️ Performing system health check...")
-        workflow_healthy = await complete_rag_workflow.health_check()
-        milvus_healthy = await optimized_milvus_service.health_check()
-        
-        if not workflow_healthy:
-            logger.warning("Workflow health check failed")
-        if not milvus_healthy:
-            logger.warning("Milvus health check failed")
-        
-        # 9. Log system configuration
-        logger.info("System configuration:")
-        logger.info(f"  • Environment: {settings.ENV}")
-        logger.info(f"  • Enabled LLM providers: {settings.get_enabled_providers()}")
-        logger.info(f"  • Enabled agents: {settings.get_enabled_agents()}")
-        logger.info(f"  • Enabled tools: {settings.get_enabled_tools()}")
-        logger.info(f"  • Vector collections: {list(optimized_milvus_service.collection_configs.keys())}")
-        logger.info(f"  • Orchestrator: {'Enabled' if settings.orchestrator.get('enabled', True) else 'Disabled'}")
-        logger.info(f"  • Streaming: Enabled")
-        logger.info(f"  • Multi-language support: vi, en, ja, ko")
-        
+
+        milvus = await _init_milvus()
+        await _init_llm_providers()
+        await _init_tool_manager()
+        _ = await _init_orchestrator()
+        workflow = await _init_workflow()
+        await _init_streaming()
+        await _perform_health_check(workflow, milvus)
+        _log_system_config(milvus)
+
         logger.info("Complete Agentic RAG System started successfully!")
-        
+
         yield
-        
+
     except Exception as e:
         logger.error(f"❌ Failed to start application: {e}")
         raise
-    
-    # Shutdown
+
     logger.info("Shutting down Complete Agentic RAG System...")
-    
+
     try:
-        # Close database connections
         from config.database import close_db
+
         await close_db()
-        
         logger.info("✅ Application shutdown complete")
-        
+
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}")
 

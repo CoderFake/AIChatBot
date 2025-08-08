@@ -105,8 +105,8 @@ class Settings(BaseSettings):
     TIMEZONE: str = "Asia/Ho_Chi_Minh"
     
     # Security
-    SECRET_KEY: str = "your-secret-key-change-in-production"
-    JWT_SECRET_KEY: str = "your-jwt-secret-key-change-in-production"
+    SECRET_KEY: str = Field(..., env="SECRET_KEY")
+    JWT_SECRET_KEY: str = Field(..., env="JWT_SECRET_KEY")
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
