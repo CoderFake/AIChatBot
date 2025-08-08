@@ -16,6 +16,9 @@ from config.settings import get_settings, Settings
 from config.database import get_db, get_db_context
 from services.cache.cache_manager import cache_manager
 from services.cache.redis_service import redis_client
+from services.tools.tool_service import ToolService
+from services.llm.provider_service import ProviderService
+from services.agents.agent_sync_service import AgentSyncService
 from utils.logging import get_logger
 from utils.datetime_utils import CustomDateTime
 from models.database.tenant import Tenant, Department
@@ -57,6 +60,18 @@ class ConfigManager:
         try:
             await cache_manager.initialize()
             await redis_client.initialize()
+
+            # Sync default tools and providers into database
+            async with get_db_context() as db:
+                tool_service = ToolService(db)
+                await tool_service.initialize()
+
+                provider_service = ProviderService(db)
+                await provider_service.initialize()
+
+                agent_service = AgentSyncService(db)
+                await agent_service.initialize()
+
             self._initialized = True
             logger.info("Config manager initialized successfully")
             
