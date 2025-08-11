@@ -206,7 +206,7 @@ class PermissionService:
             await self.db.commit()
             
             logger.info(f"Deleted permission: {permission.permission_code}")
-                    return True
+            return True
             
         except Exception as e:
             logger.error(f"Failed to delete permission {permission_id}: {e}")
