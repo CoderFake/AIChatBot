@@ -40,8 +40,8 @@ class Provider(BaseModel):
         cascade="all, delete-orphan"
     )
     
-    department_configs = relationship(
-        "DepartmentProviderConfig",
+    tenant_configs = relationship(
+        "TenantProviderConfig",
         back_populates="provider",
         cascade="all, delete-orphan"
     )
@@ -105,19 +105,19 @@ class ProviderModel(BaseModel):
         return f"<ProviderModel(id='{self.id}', provider_id={self.provider_id}, model_name='{self.model_name}')>"
 
 
-class DepartmentProviderConfig(BaseModel):
+class TenantProviderConfig(BaseModel):
     """
-    Department-level provider configuration
+    Tenant-level provider configuration (API keys rotation, config)
     """
     
-    __tablename__ = "department_provider_configs"
+    __tablename__ = "tenant_provider_configs"
     
-    department_id = Column(
+    tenant_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("departments.id", ondelete="CASCADE"),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="Department ID"
+        comment="Tenant ID"
     )
     
     provider_id = Column(
@@ -158,7 +158,7 @@ class DepartmentProviderConfig(BaseModel):
     config_data = Column(
         JSONB,
         nullable=True,
-        comment="Department-specific provider configuration"
+        comment="Tenant-specific provider configuration"
     )
     
     configured_by = Column(
@@ -169,96 +169,66 @@ class DepartmentProviderConfig(BaseModel):
     )
     
     # Relationships
-    department = relationship("Department", back_populates="provider_configs")
-    provider = relationship("Provider", back_populates="department_configs")
+    tenant = relationship("Tenant", back_populates="provider_configs")
+    provider = relationship("Provider", back_populates="tenant_configs")
     
     __table_args__ = (
-        Index('idx_dept_provider_enabled', 'department_id', 'is_enabled'),
-        Index('idx_dept_provider_rotation', 'provider_id', 'current_key_index'),
+        Index('idx_tenant_provider_enabled', 'tenant_id', 'is_enabled'),
+        Index('idx_tenant_provider_rotation', 'provider_id', 'current_key_index'),
     )
     
     def get_api_keys(self) -> List[str]:
-        """
-        Get API keys list with backward compatibility check
-        Returns list of API keys for rotation
-        """
         if self.api_keys and isinstance(self.api_keys, list):
             return self.api_keys
         return []
     
     def get_current_api_key(self) -> Optional[str]:
-        """
-        Get current active API key based on rotation index
-        """
         keys = self.get_api_keys()
         if not keys:
             return None
-            
         if self.current_key_index >= len(keys):
             self.current_key_index = 0
-            
         return keys[self.current_key_index]
     
     def rotate_to_next_key(self) -> str:
-        """
-        Rotate to next API key and return it
-        Updates current_key_index based on rotation strategy
-        """
         keys = self.get_api_keys()
         if not keys:
             raise ValueError("No API keys available for rotation")
-        
         if self.rotation_strategy == "round_robin":
             self.current_key_index = (self.current_key_index + 1) % len(keys)
         elif self.rotation_strategy == "random":
             import random
             self.current_key_index = random.randint(0, len(keys) - 1)
         elif self.rotation_strategy == "fallback":
-
             if self.current_key_index < len(keys) - 1:
                 self.current_key_index += 1
             else:
                 self.current_key_index = 0
-        
         return keys[self.current_key_index]
     
     def add_api_key(self, new_key: str) -> None:
-        """
-        Add new API key to the rotation list
-        """
         keys = self.get_api_keys()
         if new_key not in keys:
             keys.append(new_key)
             self.api_keys = keys
     
     def remove_api_key(self, key_to_remove: str) -> bool:
-        """
-        Remove API key from rotation list
-        Returns True if key was removed, False if not found
-        """
         keys = self.get_api_keys()
         if key_to_remove in keys:
-            
             remove_index = keys.index(key_to_remove)
             keys.remove(key_to_remove)
             self.api_keys = keys
-            
             if self.current_key_index >= len(keys) and keys:
                 self.current_key_index = 0
             elif self.current_key_index > remove_index:
                 self.current_key_index -= 1
-                
             return True
         return False
     
     def get_cache_data(self) -> Dict[str, Any]:
-        """
-        Get provider config data for caching
-        Includes current API keys and rotation state
-        """
         return {
             "provider_id": str(self.provider_id),
-            "department_id": str(self.department_id),
+            "tenant_id": str(self.tenant_id),
             "config_id": str(self.id),
             "is_enabled": self.is_enabled,
             "api_keys": self.get_api_keys(),

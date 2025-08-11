@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from sqlalchemy import Column, String, Boolean, Text, Index, Integer, ForeignKey
+from sqlalchemy import Column, String, Boolean, Text, Index, Integer, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import text
@@ -52,6 +52,18 @@ class Tenant(BaseModel):
         back_populates="tenant",
         cascade="all, delete-orphan"
     )
+
+    provider_configs = relationship(
+        "TenantProviderConfig",
+        back_populates="tenant",
+        cascade="all, delete-orphan"
+    )
+
+    tool_configs = relationship(
+        "TenantToolConfig",
+        back_populates="tenant",
+        cascade="all, delete-orphan"
+    )
     
     __table_args__ = (
         Index('idx_tenant_active', 'is_active'),
@@ -100,18 +112,6 @@ class Department(BaseModel):
     tenant = relationship("Tenant", back_populates="departments")
     users = relationship("User", back_populates="department")
     
-    tool_configs = relationship(
-        "DepartmentToolConfig",
-        back_populates="department",
-        cascade="all, delete-orphan"
-    )
-    
-    provider_configs = relationship(
-        "DepartmentProviderConfig",
-        back_populates="department",
-        cascade="all, delete-orphan"
-    )
-    
     document_collections = relationship(
         "DocumentCollection",
         back_populates="department",
@@ -127,6 +127,7 @@ class Department(BaseModel):
     
     __table_args__ = (
         Index('idx_department_active', 'tenant_id', 'is_active'),
+        UniqueConstraint('tenant_id', 'department_name', name='uq_department_tenant_name'),
     )
     
     def __repr__(self) -> str:

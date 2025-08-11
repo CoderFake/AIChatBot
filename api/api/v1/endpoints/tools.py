@@ -22,20 +22,28 @@ class ToolConfigRequest(BaseModel):
     config_data: Optional[Dict[str, Any]] = None
 
 
-@router.post("/{tool_id}/departments/{department_id}", summary="Configure tool for a department")
-async def configure_tool(
+@router.post("/{tool_id}/tenants/{tenant_id}", summary="Configure tool for a tenant")
+async def configure_tool_for_tenant(
     tool_id: str,
-    department_id: str,
+    tenant_id: str,
     request: ToolConfigRequest,
 ) -> Dict[str, Any]:
     async with get_db_context() as db:
         service = ToolService(db)
-        success = await service.configure_tool_for_department(
+        success = await service.configure_tool_for_tenant(
             tool_id=tool_id,
-            department_id=department_id,
+            tenant_id=tenant_id,
             is_enabled=request.is_enabled,
             config_data=request.config_data or {},
         )
         if not success:
-            raise HTTPException(status_code=404, detail="Tool or department not found")
+            raise HTTPException(status_code=404, detail="Tool or tenant not found")
         return {"status": "success"}
+
+
+@router.get("/tenants/{tenant_id}", summary="List tools for a tenant")
+async def list_tenant_tools(tenant_id: str) -> Dict[str, Any]:
+    async with get_db_context() as db:
+        service = ToolService(db)
+        tools = await service.get_tenant_tools(tenant_id)
+        return {"tools": tools}

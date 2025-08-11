@@ -4,6 +4,7 @@ Specialized for validating permissions in middleware
 Check permissions from database with support role hierarchy
 """
 from typing import List, Dict, Any, Optional, Set
+from enum import Enum as PyEnum
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload, selectinload
@@ -18,6 +19,7 @@ from models.database.permission import (
 )
 from common.types import UserRole, RolePermissions
 from utils.logging import get_logger
+from services.cache.cache_manager import cache_manager
 
 logger = get_logger(__name__)
 
@@ -36,65 +38,52 @@ class ValidatePermission:
     async def check_user_has_permissions(
         self,
         user_id: str,
-        required_permissions: List[str],
+        required_permissions: List[Any],
         user_role: str,
-        require_all: bool = False
+        require_all: bool = False,
+        tenant_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Check if user has required permissions
         Supports role hierarchy - higher roles inherit lower role permissions
-        
-        Args:
-            user_id: User ID
-            required_permissions: List of permission codes to check
-            user_role: User's role from JWT token
-            require_all: If True, user must have ALL permissions. If False, user needs ANY permission
-        
-        Returns:
-            Dict with validation result
+        Uses cache per tenant-user for effective permissions
+        Accepts permission codes as str or Enum (perm.value)
         """
         try:
-            # Get user's actual permissions from database
-            user_permissions = await self.get_user_permissions(user_id)
+            normalized_required = self._normalize_permission_codes(required_permissions)
             
-            # Get role-based permissions (for hierarchy support)
-            role_permissions = self._get_role_permissions(user_role)
+            effective_permissions = await self._get_effective_permissions(user_id, user_role, tenant_id)
+            all_user_permissions = set(effective_permissions)
             
-            # Combine user's direct/group permissions with role permissions
-            all_user_permissions = set(user_permissions) | set(role_permissions)
-            
-            # Check if user has required permissions
-            required_set = set(required_permissions)
-            user_has_permissions = required_set & all_user_permissions
+            required_set = set(normalized_required)
+            matched = required_set & all_user_permissions
             
             if require_all:
-                # User must have ALL required permissions
                 has_access = required_set.issubset(all_user_permissions)
                 missing_permissions = list(required_set - all_user_permissions)
             else:
-                # User needs at least ONE of the required permissions
-                has_access = len(user_has_permissions) > 0
+                has_access = len(matched) > 0
                 missing_permissions = list(required_set - all_user_permissions) if not has_access else []
             
             result = {
                 "allowed": has_access,
                 "user_permissions": list(all_user_permissions),
-                "required_permissions": required_permissions,
-                "matched_permissions": list(user_has_permissions),
+                "required_permissions": normalized_required,
+                "matched_permissions": list(matched),
                 "missing_permissions": missing_permissions,
                 "user_role": user_role,
                 "require_all": require_all
             }
             
             if not has_access:
-                if require_all:
-                    result["reason"] = f"Missing required permissions: {missing_permissions}"
-                else:
-                    result["reason"] = f"User lacks any of the required permissions: {required_permissions}"
+                result["reason"] = (
+                    f"Missing required permissions: {missing_permissions}" if require_all
+                    else f"User lacks any of: {normalized_required}"
+                )
             
             logger.debug(
                 f"Permission check for user {user_id}: {has_access} "
-                f"(required: {required_permissions}, matched: {list(user_has_permissions)})"
+                f"(required: {normalized_required}, matched: {list(matched)})"
             )
             
             return result
@@ -131,20 +120,16 @@ class ValidatePermission:
             
             permissions = set()
             
-            # Add direct user permissions
             for user_perm in user.permissions:
                 if not user_perm.is_deleted and not user_perm.permission.is_deleted:
                     permissions.add(user_perm.permission.permission_code)
             
-            # Add group permissions
             for membership in user.group_memberships:
                 if membership.is_deleted:
                     continue
-                    
                 group = membership.group
                 if group.is_deleted:
                     continue
-                    
                 for group_perm in group.permissions:
                     if not group_perm.is_deleted and not group_perm.permission.is_deleted:
                         permissions.add(group_perm.permission.permission_code)
@@ -264,3 +249,56 @@ class ValidatePermission:
         except Exception as e:
             logger.error(f"Failed to get available permissions: {e}")
             return []
+    
+    # ==================== PRIVATE CACHE HELPERS ====================
+    
+    async def _get_effective_permissions(
+        self,
+        user_id: str,
+        user_role: str,
+        tenant_id: Optional[str]
+    ) -> List[str]:
+        """Compute or fetch from cache the effective permission codes for a user within a tenant."""
+        try:
+            # Build cache key: include tenant id if available
+            if not tenant_id:
+                # Try load from DB to find tenant of user once
+                from models.database.user import User as DBUser
+                res = await self.db.execute(select(DBUser.tenant_id).where(DBUser.id == user_id))
+                row = res.first()
+                if row and row[0]:
+                    tenant_id = str(row[0])
+            cache_key = f"tenant:{tenant_id}:user_permissions:{user_id}" if tenant_id else f"user_permissions:{user_id}"
+            
+            cached = await cache_manager.get(cache_key)
+            if isinstance(cached, list):
+                return cached
+            
+            # Compose from DB and role-derived
+            db_perms = await self.get_user_permissions(user_id)
+            role_perms = self._get_role_permissions(user_role)
+            all_perms = sorted(set(db_perms) | set(role_perms))
+            
+            # Store without TTL to avoid surprise eviction; rely on invalidation on changes
+            await cache_manager.set(cache_key, all_perms)
+            return all_perms
+        except Exception as e:
+            logger.warning(f"Failed to build effective permissions cache for {user_id}: {e}")
+            # Fallback to direct computation
+            db_perms = await self.get_user_permissions(user_id)
+            role_perms = self._get_role_permissions(user_role)
+            return sorted(set(db_perms) | set(role_perms))
+    
+    def _normalize_permission_codes(self, codes: List[Any]) -> List[str]:
+        """Normalize list of permission identifiers (Enum or str) to list of strings."""
+        normalized: List[str] = []
+        for c in codes:
+            try:
+                if isinstance(c, PyEnum):
+                    normalized.append(str(c.value))
+                else:
+                    normalized.append(str(c))
+            except Exception:
+                # best-effort
+                normalized.append(str(c))
+        return normalized

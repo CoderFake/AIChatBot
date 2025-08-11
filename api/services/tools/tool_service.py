@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, update, delete
 from utils.datetime_utils import CustomDateTime as datetime
 
-from models.database.tool import Tool, DepartmentToolConfig
-from models.database.tenant import Department
+from models.database.tool import Tool, TenantToolConfig
+from models.database.tenant import Tenant
 from api.tools.tool_registry import tool_registry
 from utils.logging import get_logger
 
@@ -102,7 +102,7 @@ class ToolService:
         return (datetime.now() - self._cache_timestamp).seconds < self._cache_ttl
     
     async def _refresh_tool_cache(self):
-        """Refresh tool cache from database"""
+        """Refresh tool cache from database (tenant-level only)"""
         try:
             result = await self.db.execute(
                 select(Tool).order_by(Tool.tool_name)
@@ -112,22 +112,22 @@ class ToolService:
             self._tool_cache = {}
             
             for tool in tools:
-                dept_configs_result = await self.db.execute(
-                    select(DepartmentToolConfig, Department)
-                    .join(Department, DepartmentToolConfig.department_id == Department.id)
-                    .where(DepartmentToolConfig.tool_id == tool.id)
+                # Tenant configs (preferred)
+                tenant_configs_result = await self.db.execute(
+                    select(TenantToolConfig, Tenant)
+                    .join(Tenant, TenantToolConfig.tenant_id == Tenant.id)
+                    .where(TenantToolConfig.tool_id == tool.id)
                 )
-                
-                department_configs = {}
-                for dept_config, department in dept_configs_result:
-                    department_configs[str(dept_config.department_id)] = {
-                        "config_id": str(dept_config.id),
-                        "department_name": department.department_name,
-                        "is_enabled": dept_config.is_enabled,
-                        "config_data": dept_config.config_data or {},
-                        "usage_limits": dept_config.usage_limits or {},
-                        "configured_by": str(dept_config.configured_by) if dept_config.configured_by else None,
-                        "configured_at": dept_config.created_at
+                tenant_configs = {}
+                for t_config, tenant in tenant_configs_result:
+                    tenant_configs[str(t_config.tenant_id)] = {
+                        "config_id": str(t_config.id),
+                        "tenant_name": tenant.tenant_name,
+                        "is_enabled": t_config.is_enabled,
+                        "config_data": t_config.config_data or {},
+                        "usage_limits": t_config.usage_limits or {},
+                        "configured_by": str(t_config.configured_by) if t_config.configured_by else None,
+                        "configured_at": t_config.created_at
                     }
                 
                 self._tool_cache[str(tool.id)] = {
@@ -139,7 +139,7 @@ class ToolService:
                     "is_enabled": tool.is_enabled,
                     "is_system": tool.is_system,
                     "base_config": tool.base_config or {},
-                    "department_configs": department_configs,
+                    "tenant_configs": tenant_configs,           # preferred
                     "created_at": tool.created_at,
                     "updated_at": tool.updated_at
                 }
@@ -182,7 +182,7 @@ class ToolService:
     
     async def enable_tool_globally(self, tool_id: str) -> bool:
         """
-        Enable tool globally (affects all departments)
+        Enable tool globally (affects all tenants)
         """
         try:
             result = await self.db.execute(
@@ -210,7 +210,7 @@ class ToolService:
     
     async def disable_tool_globally(self, tool_id: str) -> bool:
         """
-        Disable tool globally (affects all departments)
+        Disable tool globally (affects all tenants)
         """
         try:
             result = await self.db.execute(
@@ -236,98 +236,84 @@ class ToolService:
             await self.db.rollback()
             return False
     
-    async def configure_tool_for_department(
+    # Tenant-level APIs
+    async def configure_tool_for_tenant(
         self,
         tool_id: str,
-        department_id: str,
+        tenant_id: str,
         is_enabled: bool,
         config_data: Optional[Dict[str, Any]] = None,
         usage_limits: Optional[Dict[str, Any]] = None,
         configured_by: Optional[str] = None
     ) -> bool:
-        """
-        Configure tool for specific department
-        """
+        """Configure tool for specific tenant (preferred policy)."""
         try:
             result = await self.db.execute(
-                select(DepartmentToolConfig)
+                select(TenantToolConfig)
                 .where(
                     and_(
-                        DepartmentToolConfig.tool_id == tool_id,
-                        DepartmentToolConfig.department_id == department_id
+                        TenantToolConfig.tool_id == tool_id,
+                        TenantToolConfig.tenant_id == tenant_id
                     )
                 )
             )
-            
-            dept_config = result.scalar_one_or_none()
-            
-            if dept_config:
-                dept_config.is_enabled = is_enabled
-                dept_config.config_data = config_data or dept_config.config_data
-                dept_config.usage_limits = usage_limits or dept_config.usage_limits
-                dept_config.configured_by = configured_by or dept_config.configured_by
-                dept_config.updated_at = datetime.now()
+            t_config = result.scalar_one_or_none()
+            if t_config:
+                t_config.is_enabled = is_enabled
+                t_config.config_data = config_data or t_config.config_data
+                t_config.usage_limits = usage_limits or t_config.usage_limits
+                t_config.configured_by = configured_by or t_config.configured_by
+                t_config.updated_at = datetime.now()
             else:
-                dept_config = DepartmentToolConfig(
-                    department_id=department_id,
+                t_config = TenantToolConfig(
+                    tenant_id=tenant_id,
                     tool_id=tool_id,
                     is_enabled=is_enabled,
                     config_data=config_data or {},
                     usage_limits=usage_limits or {},
                     configured_by=configured_by
                 )
-                self.db.add(dept_config)
+                self.db.add(t_config)
             
             await self.db.commit()
             await self._refresh_tool_cache()
-            
-            action = "enabled" if is_enabled else "disabled"
-            logger.info(f"Tool {action} for department: tool_id={tool_id}, dept_id={department_id}")
+            logger.info(f"Tool {'enabled' if is_enabled else 'disabled'} for tenant: tool_id={tool_id}, tenant_id={tenant_id}")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to configure tool for department: {e}")
+            logger.error(f"Failed to configure tool for tenant: {e}")
             await self.db.rollback()
             return False
-    
-    async def get_department_tools(self, department_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all tools available for specific department
-        """
+
+    async def get_tenant_tools(self, tenant_id: str) -> List[Dict[str, Any]]:
+        """Get all tools for specific tenant using cache."""
         try:
             if not self._is_cache_valid():
                 await self._refresh_tool_cache()
             
-            department_tools = []
-            
+            tenant_tools: List[Dict[str, Any]] = []
             for tool_id, tool_info in self._tool_cache.items():
                 if not tool_info.get("is_enabled", False):
                     continue
+                t_configs = tool_info.get("tenant_configs", {})
+                t_config = t_configs.get(tenant_id, {})
                 
-                dept_configs = tool_info.get("department_configs", {})
-                dept_config = dept_configs.get(department_id, {})
-                
-                tool_data = {
+                tenant_tools.append({
                     "tool_id": tool_id,
                     "tool_name": tool_info["tool_name"],
                     "description": tool_info["description"],
                     "category": tool_info["category"],
                     "is_enabled_globally": tool_info["is_enabled"],
-                    "is_enabled_for_department": dept_config.get("is_enabled", False),
-                    "config_data": dept_config.get("config_data", {}),
-                    "usage_limits": dept_config.get("usage_limits", {}),
+                    "is_enabled_for_tenant": t_config.get("is_enabled", False),
+                    "config_data": t_config.get("config_data", {}),
+                    "usage_limits": t_config.get("usage_limits", {}),
                     "base_config": tool_info.get("base_config", {}),
-                    "configured_at": dept_config.get("configured_at")
-                }
-                
-                department_tools.append(tool_data)
-            
-            return department_tools
-            
+                    "configured_at": t_config.get("configured_at")
+                })
+            return tenant_tools
         except Exception as e:
-            logger.error(f"Failed to get department tools: {e}")
+            logger.error(f"Failed to get tenant tools: {e}")
             return []
-    
+
     async def delete_tool(self, tool_id: str) -> bool:
         """
         Delete tool (only non-system tools)
@@ -347,7 +333,7 @@ class ToolService:
                 return False
             
             await self.db.execute(
-                delete(DepartmentToolConfig).where(DepartmentToolConfig.tool_id == tool_id)
+                delete(TenantToolConfig).where(TenantToolConfig.tool_id == tool_id)
             )
             
             await self.db.delete(tool)
@@ -364,7 +350,7 @@ class ToolService:
     
     async def get_tool_usage_stats(self, tool_id: str) -> Dict[str, Any]:
         """
-        Get tool usage statistics across departments
+        Get tool usage statistics across tenants
         """
         try:
             if not self._is_cache_valid():
@@ -374,15 +360,15 @@ class ToolService:
             if not tool_info:
                 return {}
             
-            dept_configs = tool_info.get("department_configs", {})
+            tenant_configs = tool_info.get("tenant_configs", {})
             
             stats = {
                 "tool_id": tool_id,
                 "tool_name": tool_info["tool_name"],
-                "total_departments": len(dept_configs),
-                "enabled_departments": sum(1 for config in dept_configs.values() if config.get("is_enabled", False)),
-                "disabled_departments": sum(1 for config in dept_configs.values() if not config.get("is_enabled", False)),
-                "department_details": dept_configs
+                "total_tenants": len(tenant_configs),
+                "enabled_tenants": sum(1 for config in tenant_configs.values() if config.get("is_enabled", False)),
+                "disabled_tenants": sum(1 for config in tenant_configs.values() if not config.get("is_enabled", False)),
+                "tenant_details": tenant_configs,
             }
             
             return stats

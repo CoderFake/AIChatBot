@@ -18,13 +18,12 @@ from services.cache.cache_manager import cache_manager
 from services.cache.redis_service import redis_client
 from services.tools.tool_service import ToolService
 from services.llm.provider_service import ProviderService
-from services.agents.agent_sync_service import AgentSyncService
 from utils.logging import get_logger
 from utils.datetime_utils import CustomDateTime
 from models.database.tenant import Tenant, Department
-from models.database.provider import Provider, DepartmentProviderConfig
+from models.database.provider import Provider, TenantProviderConfig
 from models.database.agent import Agent, AgentToolConfig
-from models.database.tool import Tool, DepartmentToolConfig
+from models.database.tool import Tool, TenantToolConfig
 from models.database.workflow_agent import WorkflowAgent
 from models.database.user import User
 from models.database.permission import UserPermission
@@ -69,9 +68,6 @@ class ConfigManager:
                 provider_service = ProviderService(db)
                 await provider_service.initialize()
 
-                agent_service = AgentSyncService(db)
-                await agent_service.initialize()
-
             self._initialized = True
             logger.info("Config manager initialized successfully")
             
@@ -104,28 +100,35 @@ class ConfigManager:
         """
         try:
             result = await db_session.execute(
-                select(Provider, DepartmentProviderConfig, Department)
-                .join(DepartmentProviderConfig, Provider.id == DepartmentProviderConfig.provider_id)
-                .join(Department, DepartmentProviderConfig.department_id == Department.id)
+                select(Provider, TenantProviderConfig)
+                .join(TenantProviderConfig, Provider.id == TenantProviderConfig.provider_id)
                 .where(
                     and_(
-                        Department.tenant_id == tenant_id,
+                        TenantProviderConfig.tenant_id == tenant_id,
                         Provider.is_enabled == True,
-                        DepartmentProviderConfig.is_enabled == True
+                        TenantProviderConfig.is_enabled == True
                     )
                 )
             )
             
             tenant_providers = {}
             
-            for provider, dept_config, department in result:
-                provider_key = f"{provider.id}_{department.id}"
+            for provider, t_config in result:
+                provider_key = f"{provider.id}_{tenant_id}"
                 
-                cache_data = dept_config.get_cache_data()
+                cache_data = {
+                    "provider_id": str(provider.id),
+                    "tenant_id": tenant_id,
+                    "config_id": str(t_config.id),
+                    "is_enabled": t_config.is_enabled,
+                    "api_keys": t_config.get_api_keys(),
+                    "current_key_index": t_config.current_key_index,
+                    "rotation_strategy": t_config.rotation_strategy,
+                    "config_data": t_config.config_data or {},
+                }
                 
                 tenant_providers[provider_key] = {
                     "provider_name": provider.provider_name,
-                    "department_name": department.department_name,
                     "base_config": provider.base_config or {},
                     **cache_data, 
                     "last_updated": CustomDateTime.now().isoformat()
@@ -186,36 +189,34 @@ class ConfigManager:
         tenant_id: str, 
         db_session: AsyncSession
     ) -> Dict[str, Any]:
-        """Load tenant tool configurations from database"""
+        """Load tenant tool configurations from database (tenant-level)"""
         try:
             result = await db_session.execute(
-                select(Tool, DepartmentToolConfig, Department)
-                .join(DepartmentToolConfig, Tool.id == DepartmentToolConfig.tool_id)
-                .join(Department, DepartmentToolConfig.department_id == Department.id)
+                select(Tool, TenantToolConfig)
+                .join(TenantToolConfig, Tool.id == TenantToolConfig.tool_id)
                 .where(
                     and_(
-                        Department.tenant_id == tenant_id,
+                        TenantToolConfig.tenant_id == tenant_id,
                         Tool.is_enabled == True,
-                        DepartmentToolConfig.is_enabled == True
+                        TenantToolConfig.is_enabled == True
                     )
                 )
             )
             
             tenant_tools = {}
             
-            for tool, dept_config, department in result:
-                tool_key = f"{tool.id}_{department.id}"
+            for tool, t_config in result:
+                tool_key = f"{tool.id}_{tenant_id}"
                 
                 tenant_tools[tool_key] = {
                     "tool_id": str(tool.id),
                     "tool_name": tool.tool_name,
-                    "tool_type": tool.tool_type,
-                    "department_id": str(department.id),
-                    "department_name": department.department_name,
-                    "config_id": str(dept_config.id),
-                    "is_enabled": dept_config.is_enabled,
+                    "category": tool.category,
+                    "tenant_id": tenant_id,
+                    "config_id": str(t_config.id),
+                    "is_enabled": t_config.is_enabled,
                     "base_config": tool.base_config or {},
-                    "config_data": dept_config.config_data or {},
+                    "config_data": t_config.config_data or {},
                     "last_updated": CustomDateTime.now().isoformat()
                 }
             
@@ -279,13 +280,13 @@ class ConfigManager:
         try:
             if db_session:
                 result = await db_session.execute(
-                    select(DepartmentProviderConfig)
-                    .join(Department, DepartmentProviderConfig.department_id == Department.id)
+                    select(TenantProviderConfig)
+                    .join(Department, TenantProviderConfig.department_id == Department.id)
                     .where(
                         and_(
                             Department.tenant_id == tenant_id,
-                            DepartmentProviderConfig.provider_id == provider_id,
-                            DepartmentProviderConfig.department_id == department_id
+                            TenantProviderConfig.provider_id == provider_id,
+                            TenantProviderConfig.department_id == department_id
                         )
                     )
                 )
@@ -311,7 +312,7 @@ class ConfigManager:
         tenant_id: str,
         provider_id: str,
         department_id: str,
-        dept_config: DepartmentProviderConfig
+        dept_config: TenantProviderConfig
     ):
         """
         Update specific provider configuration in cache
@@ -473,6 +474,8 @@ class ConfigManager:
             
             for pattern in cache_patterns:
                 await cache_manager.delete(pattern)
+            
+            await cache_manager.delete_pattern(f"tenant:{tenant_id}:user_permissions:*")
             
             logger.info(f"Invalidated cache for tenant {tenant_id}")
             

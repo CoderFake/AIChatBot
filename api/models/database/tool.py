@@ -8,7 +8,7 @@ from models.database.base import BaseModel
 class Tool(BaseModel):
     """
     Global tool definitions
-    Shared across all departments but configurable per department
+    Shared across all departments but configurable per tenant
     """
     
     __tablename__ = "tools"
@@ -59,9 +59,9 @@ class Tool(BaseModel):
         comment="Base tool configuration"
     )
     
-    # Relationships
-    department_configs = relationship(
-        "DepartmentToolConfig",
+    # Relationships (tenant-level policy)
+    tenant_configs = relationship(
+        "TenantToolConfig",
         back_populates="tool",
         cascade="all, delete-orphan"
     )
@@ -75,20 +75,20 @@ class Tool(BaseModel):
         return f"<Tool(id='{self.id}', name='{self.tool_name}')>"
 
 
-class DepartmentToolConfig(BaseModel):
+class TenantToolConfig(BaseModel):
     """
-    Department-level tool configuration
-    Each department can enable/disable and configure tools
+    Tenant-level tool configuration
+    Each tenant can enable/disable and configure tools
     """
     
-    __tablename__ = "department_tool_configs"
+    __tablename__ = "tenant_tool_configs"
     
-    department_id = Column(
+    tenant_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("departments.id", ondelete="CASCADE"),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="Department ID"
+        comment="Tenant ID"
     )
     
     tool_id = Column(
@@ -103,19 +103,19 @@ class DepartmentToolConfig(BaseModel):
         Boolean,
         nullable=False,
         default=True,
-        comment="Whether tool is enabled for this department"
+        comment="Whether tool is enabled for this tenant"
     )
     
     config_data = Column(
         JSONB,
         nullable=True,
-        comment="Department-specific tool configuration"
+        comment="Tenant-specific tool configuration"
     )
     
     usage_limits = Column(
         JSONB,
         nullable=True,
-        comment="Usage limits for this department"
+        comment="Usage limits for this tenant"
     )
     
     configured_by = Column(
@@ -126,12 +126,12 @@ class DepartmentToolConfig(BaseModel):
     )
     
     # Relationships
-    department = relationship("Department", back_populates="tool_configs")
-    tool = relationship("Tool", back_populates="department_configs")
+    tenant = relationship("Tenant", back_populates="tool_configs")
+    tool = relationship("Tool", back_populates="tenant_configs")
     
     __table_args__ = (
-        Index('idx_dept_tool_enabled', 'department_id', 'is_enabled'),
+        Index('idx_tenant_tool_enabled', 'tenant_id', 'is_enabled'),
     )
     
     def __repr__(self) -> str:
-        return f"<DepartmentToolConfig(id='{self.id}', dept_id={self.department_id}, tool_id={self.tool_id})>"
+        return f"<TenantToolConfig(id='{self.id}', tenant_id={self.tenant_id}, tool_id={self.tool_id})>"

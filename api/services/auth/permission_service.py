@@ -3,7 +3,7 @@ Permission Service
 Core permission management: create default groups and validate user permissions
 Does NOT handle CRUD operations for tenant/tools - those belong to respective services
 """
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, delete, update
 from sqlalchemy.orm import joinedload, selectinload
@@ -20,10 +20,12 @@ from models.database.permission import (
 )
 from common.types import (
     RolePermissions,
-    DefaultGroupNames
+    DefaultGroupNames,
+    UserRole,
 )
 from config.settings import get_settings
 from utils.logging import get_logger
+from services.cache.cache_manager import cache_manager
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -62,7 +64,75 @@ class PermissionService:
             logger.error(f"Failed to create default groups for tenant {tenant_id}: {e}")
             raise
 
-    
+    # ==================== ROLE HIERARCHY HELPERS ====================
+
+    async def get_user_roles(self, user_id: str) -> List[UserRole]:
+        """Return tenant default roles that user currently holds (as UserRole enums)."""
+        try:
+            result = await self.db.execute(
+                select(UserGroupMembership)
+                .options(joinedload(UserGroupMembership.group))
+                .where(UserGroupMembership.user_id == user_id)
+                .where(UserGroupMembership.is_deleted == False)
+            )
+            memberships = result.scalars().all()
+            roles: Set[UserRole] = set()
+            for m in memberships:
+                if m.group and m.group.group_code:
+                    # Match by suffix _ROLE
+                    for role in UserRole:
+                        if m.group.group_code.endswith(f"_{role.name}"):
+                            roles.add(role)
+                            break
+            return list(roles)
+        except Exception as e:
+            logger.error(f"Failed to get roles for user {user_id}: {e}")
+            return []
+
+    def role_controls_role(self, actor_role: UserRole, target_role: UserRole) -> bool:
+        """A role controls another if its permission set is a superset of the other's."""
+        try:
+            actor_perms = RolePermissions.get_permissions_for_role(actor_role)
+            target_perms = RolePermissions.get_permissions_for_role(target_role)
+            return actor_perms.issuperset(target_perms)
+        except Exception as e:
+            logger.error(f"Failed to evaluate role control {actor_role} -> {target_role}: {e}")
+            return False
+
+    async def can_user_control_user(self, actor_user_id: str, target_user_id: str) -> bool:
+        """True if any actor role controls any target role by permission superset."""
+        try:
+            actor_roles = await self.get_user_roles(actor_user_id)
+            target_roles = await self.get_user_roles(target_user_id)
+            if not actor_roles or not target_roles:
+                return False
+            return any(self.role_controls_role(a, t) for a in actor_roles for t in target_roles)
+        except Exception as e:
+            logger.error(f"Failed to evaluate control between {actor_user_id} and {target_user_id}: {e}")
+            return False
+
+    async def can_user_control_group(self, actor_user_id: str, group_id: str) -> bool:
+        """True if actor has a role whose permissions superset the target group's implied role."""
+        try:
+            actor_roles = await self.get_user_roles(actor_user_id)
+            if not actor_roles:
+                return False
+            result = await self.db.execute(select(Group).where(Group.id == group_id))
+            group = result.scalar_one_or_none()
+            if not group or not group.group_code:
+                return False
+            target_role: Optional[UserRole] = None
+            for role in UserRole:
+                if group.group_code.endswith(f"_{role.name}"):
+                    target_role = role
+                    break
+            if not target_role:
+                return False
+            return any(self.role_controls_role(a, target_role) for a in actor_roles)
+        except Exception as e:
+            logger.error(f"Failed to evaluate control over group {group_id}: {e}")
+            return False
+
     # ==================== PERMISSION CRUD OPERATIONS ====================
     
     async def create_permission(
@@ -358,6 +428,9 @@ class PermissionService:
                 logger.warning(f"Cannot delete system group: {group.group_code}")
                 return False
             
+            # Invalidate caches of all members before deletion
+            await self._invalidate_group_members_permission_cache(group_id)
+            
             group.soft_delete()
             if deleted_by:
                 group.updated_by = deleted_by
@@ -410,6 +483,9 @@ class PermissionService:
             await self.db.commit()
             await self.db.refresh(user_permission)
             
+            # Invalidate user's permission cache
+            await self._invalidate_user_permission_cache(user_id)
+            
             logger.info(f"Assigned permission {permission_id} to user {user_id}")
             return user_permission
             
@@ -442,6 +518,9 @@ class PermissionService:
                 user_permission.updated_by = revoked_by
             
             await self.db.commit()
+            
+            # Invalidate user's permission cache
+            await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Revoked permission {permission_id} from user {user_id}")
             return True
@@ -502,6 +581,9 @@ class PermissionService:
             await self.db.commit()
             await self.db.refresh(group_permission)
             
+            # Invalidate caches for all group members
+            await self._invalidate_group_members_permission_cache(group_id)
+            
             logger.info(f"Assigned permission {permission_id} to group {group_id}")
             return group_permission
             
@@ -534,6 +616,9 @@ class PermissionService:
                 group_permission.updated_by = revoked_by
             
             await self.db.commit()
+            
+            # Invalidate caches for all group members
+            await self._invalidate_group_members_permission_cache(group_id)
             
             logger.info(f"Revoked permission {permission_id} from group {group_id}")
             return True
@@ -596,6 +681,9 @@ class PermissionService:
             await self.db.commit()
             await self.db.refresh(membership)
             
+            # Invalidate user's permission cache
+            await self._invalidate_user_permission_cache(user_id)
+            
             logger.info(f"Added user {user_id} to group {group_id}")
             return membership
             
@@ -628,6 +716,9 @@ class PermissionService:
                 membership.updated_by = removed_by
             
             await self.db.commit()
+            
+            # Invalidate user's permission cache
+            await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Removed user {user_id} from group {group_id}")
             return True
@@ -669,6 +760,9 @@ class PermissionService:
             
             await self.db.commit()
             await self.db.refresh(membership)
+            
+            # Invalidate user's permission cache
+            await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Updated membership for user {user_id} in group {group_id}")
             return membership
@@ -782,4 +876,37 @@ class PermissionService:
         except Exception as e:
             logger.error(f"Failed to setup default permissions: {e}")
             raise
+    
+    async def _invalidate_user_permission_cache(self, user_id: str) -> None:
+        """Invalidate cached effective permissions for a user (scoped by tenant)."""
+        try:
+            result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
+            row = result.first()
+            if not row or not row[0]:
+                return
+            tenant_id = str(row[0])
+            cache_key = f"tenant:{tenant_id}:user_permissions:{user_id}"
+            await cache_manager.delete(cache_key)
+            logger.debug(f"Invalidated user permission cache: {cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to invalidate user permission cache for {user_id}: {e}")
+    
+    async def _invalidate_group_members_permission_cache(self, group_id: str) -> None:
+        """Invalidate cached permissions for all users in a group."""
+        try:
+            result = await self.db.execute(
+                select(UserGroupMembership.user_id, User.tenant_id)
+                .join(User, User.id == UserGroupMembership.user_id)
+                .where(UserGroupMembership.group_id == group_id)
+                .where(UserGroupMembership.is_deleted == False)
+                .where(User.is_deleted == False)
+            )
+            rows = result.all()
+            for user_id, tenant_id in rows:
+                if tenant_id:
+                    cache_key = f"tenant:{tenant_id}:user_permissions:{user_id}"
+                    await cache_manager.delete(cache_key)
+                    logger.debug(f"Invalidated user permission cache: {cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to invalidate group members cache for group {group_id}: {e}")
     

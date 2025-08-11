@@ -1,5 +1,4 @@
 
-from .agent_registry import agent_registry
-from .agent_sync_service import AgentSyncService
+from .agent_service import AgentService
 
-__all__ = ["agent_registry", "AgentSyncService"]
+__all__ = ["AgentService"]

@@ -11,6 +11,7 @@ from utils.datetime_utils import CustomDateTime, TenantDateTimeManager
 from common.types import DefaultProviderConfig
 from utils.logging import get_logger
 from core.exceptions import ServiceError
+from services.storage.minio_service import MinioService
 
 logger = get_logger(__name__)
 
@@ -33,7 +34,11 @@ class TenantService:
         config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Create new tenant with WorkflowAgent and timezone configuration
+        Create new tenant with timezone configuration and base resources.
+        Side-effects within same transaction:
+        - Ensure MinIO bucket for tenant (bucket name = tenant_id)
+        - Create default groups/permissions
+        WorkflowAgent is NOT created here; call create_default_workflow_agent() afterwards.
         """
         try:
             tenant = Tenant(
@@ -45,10 +50,15 @@ class TenantService:
             )
             
             self.db.add(tenant)
-            await self.db.flush()  
-            workflow_agent = await self._create_workflow_agent(
-                tenant_id=tenant.id
-            )
+            await self.db.flush()
+
+            try:
+                minio = MinioService()
+                if not minio.ensure_bucket(str(tenant.id)):
+                    raise ServiceError("Failed to ensure MinIO bucket for tenant")
+            except Exception as storage_exc:
+                logger.error(f"Create tenant bucket failed: {storage_exc}")
+                raise
             
             default_groups = await self.permission_service.create_default_groups_for_tenant(
                 tenant_id=tenant.id,
@@ -58,7 +68,6 @@ class TenantService:
             await self.db.commit()
             
             await self._load_tenant_to_cache(tenant)
-            
             await self._load_tenant_config_to_redis(tenant.id)
             
             result = {
@@ -66,7 +75,6 @@ class TenantService:
                 "tenant_name": tenant.tenant_name,
                 "timezone": tenant.timezone,
                 "locale": tenant.locale,
-                "workflow_agent_id": str(workflow_agent.id),
                 "default_groups": default_groups,
                 "created_at": tenant.created_at.isoformat()
             }
@@ -78,34 +86,59 @@ class TenantService:
             await self.db.rollback()
             logger.error(f"Failed to create tenant: {e}")
             raise ServiceError(f"Failed to create tenant: {str(e)}")
-    
-    async def _create_workflow_agent(
+
+    async def create_default_workflow_agent(
         self,
-        tenant_id: str
-    ) -> WorkflowAgent:
+        tenant_id: str,
+        provider_name: Optional[str] = None,
+        model_name: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        created_by: str = "system",
+    ) -> Dict[str, Any]:
         """
-        Create WorkflowAgent for tenant with default configuration
-        API key is set to None - tenant will configure later
+        Create default WorkflowAgent for a tenant (separate step after tenant creation).
+        If parameters are not provided, use DefaultProviderConfig.
         """
-        workflow_agent = WorkflowAgent(
-            tenant_id=tenant_id,
-            provider_name=DefaultProviderConfig.PROVIDER_NAME.value,  
-            model_name=DefaultProviderConfig.DEFAULT_MODEL.value,
-            model_config={
-                "temperature": DefaultProviderConfig.DEFAULT_TEMPERATURE,
-                "max_tokens": DefaultProviderConfig.DEFAULT_MAX_TOKENS,
-                "top_p": DefaultProviderConfig.DEFAULT_TOP_P
-            },
-            max_iterations=10,
-            timeout_seconds=300,
-            confidence_threshold=0.7
-        )
-        
-        self.db.add(workflow_agent)
-        await self.db.flush()
-        
-        logger.info(f"Created default WorkflowAgent for tenant {tenant_id} (key: none)")
-        return workflow_agent
+        try:
+            result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_id))
+            tenant = result.scalar_one_or_none()
+            if not tenant:
+                raise ServiceError(f"Tenant not found: {tenant_id}")
+
+            wf = WorkflowAgent(
+                tenant_id=tenant_id,
+                provider_name=provider_name or DefaultProviderConfig.PROVIDER_NAME.value,
+                model_name=model_name or DefaultProviderConfig.DEFAULT_MODEL.value,
+                model_config=model_config or {
+                    "temperature": DefaultProviderConfig.DEFAULT_TEMPERATURE,
+                    "max_tokens": DefaultProviderConfig.DEFAULT_MAX_TOKENS,
+                    "top_p": DefaultProviderConfig.DEFAULT_TOP_P,
+                },
+                max_iterations=10,
+                timeout_seconds=300,
+                confidence_threshold=0.7,
+                created_by=created_by,
+            )
+            
+            self.db.add(wf)
+            await self.db.flush()
+            await self.db.commit()
+
+            logger.info(f"Created WorkflowAgent for tenant {tenant_id}")
+            return {
+                "workflow_agent_id": str(wf.id),
+                "tenant_id": str(tenant_id),
+                "provider_name": wf.provider_name,
+                "model_name": wf.model_name,
+                "model_config": wf.model_config,
+                "max_iterations": wf.max_iterations,
+                "timeout_seconds": wf.timeout_seconds,
+                "confidence_threshold": wf.confidence_threshold,
+            }
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to create default WorkflowAgent for tenant {tenant_id}: {e}")
+            raise ServiceError(f"Failed to create workflow agent: {str(e)}")
     
     async def get_tenant_by_id(self, tenant_id: str) -> Optional[Dict[str, Any]]:
         """

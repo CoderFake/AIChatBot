@@ -12,8 +12,8 @@ import uuid
 from models.database.user import User
 from models.database.permission import Permission, Group, UserPermission, GroupPermission, UserGroupMembership
 from models.database.tenant import Tenant, Department
-from models.database.tool import Tool, DepartmentToolConfig
-from models.database.provider import Provider, DepartmentProviderConfig
+from models.database.tool import Tool, TenantToolConfig
+from models.database.provider import Provider, TenantProviderConfig
 from common.types import (
     AccessLevel,
     UserRole,
@@ -162,8 +162,8 @@ class PermissionService:
     
     async def _setup_default_tools(self, tenant_id: str) -> None:
         """
-        Setup default tool configurations for tenant departments
-        Uses Tool, DepartmentToolConfig models
+        Setup default tool configurations for tenant
+        Uses Tool, TenantToolConfig models
         """
         try:
             result = await self.db.execute(
@@ -171,36 +171,30 @@ class PermissionService:
             )
             tools = result.scalars().all()
             
-            dept_result = await self.db.execute(
-                select(Department).where(Department.tenant_id == tenant_id)
-            )
-            departments = dept_result.scalars().all()
-            
-            for department in departments:
-                for tool in tools:
-                    is_enabled = tool.category in ["document_tools", "calculation_tools"]
-                    
-                    dept_tool_config = DepartmentToolConfig(
-                        id=str(uuid.uuid4()),
-                        department_id=str(department.id),
-                        tool_id=str(tool.id),
-                        is_enabled=is_enabled,
-                        config_data={},
-                        usage_limits={},
-                        created_at=datetime.utcnow()
-                    )
-                    self.db.add(dept_tool_config)
+            # Enable default categories at tenant level (example policy)
+            for tool in tools:
+                is_enabled = tool.category in ["document_tools", "calculation_tools"]
+                t_config = TenantToolConfig(
+                    id=str(uuid.uuid4()),
+                    tenant_id=str(tenant_id),
+                    tool_id=str(tool.id),
+                    is_enabled=is_enabled,
+                    config_data={},
+                    usage_limits={},
+                    created_at=datetime.utcnow()
+                )
+                self.db.add(t_config)
             
             logger.info(f"Setup default tools for tenant {tenant_id}")
             
         except Exception as e:
             logger.error(f"Failed to setup default tools: {e}")
             raise
-    
+
     async def _setup_default_provider(self, tenant_id: str) -> None:
         """
-        Setup default provider configuration (Gemini)
-        Uses Provider, DepartmentProviderConfig models
+        Setup default provider configuration (Gemini) at tenant-level
+        Uses Provider, TenantProviderConfig models
         """
         try:
             result = await self.db.execute(
@@ -212,22 +206,18 @@ class PermissionService:
                 logger.warning("Gemini provider not found, skipping default setup")
                 return
             
-            dept_result = await self.db.execute(
-                select(Department).where(Department.tenant_id == tenant_id)
+            t_provider_config = TenantProviderConfig(
+                id=str(uuid.uuid4()),
+                tenant_id=str(tenant_id),
+                provider_id=str(provider.id),
+                is_enabled=True,
+                api_keys=DefaultProviderConfig.get_default_api_keys() if hasattr(DefaultProviderConfig, 'get_default_api_keys') else [],
+                current_key_index=0,
+                rotation_strategy="round_robin",
+                config_data=DefaultProviderConfig.get_default_config() if hasattr(DefaultProviderConfig, 'get_default_config') else {},
+                created_at=datetime.utcnow()
             )
-            departments = dept_result.scalars().all()
-            
-            for department in departments:
-                dept_provider_config = DepartmentProviderConfig(
-                    id=str(uuid.uuid4()),
-                    department_id=str(department.id),
-                    provider_id=str(provider.id),
-                    is_enabled=True,
-                    model_name=DefaultProviderConfig.DEFAULT_MODEL,
-                    config_data=DefaultProviderConfig.get_default_config(),
-                    created_at=datetime.utcnow()
-                )
-                self.db.add(dept_provider_config)
+            self.db.add(t_provider_config)
             
             logger.info(f"Setup default provider for tenant {tenant_id}")
             

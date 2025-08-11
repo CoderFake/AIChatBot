@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index
+from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import text
@@ -37,6 +37,14 @@ class Agent(BaseModel):
         nullable=False,
         default=False,
         comment="System agent that cannot be deleted"
+    )
+
+    tenant_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Tenant owner of this agent"
     )
     
     department_id = Column(
@@ -78,10 +86,11 @@ class Agent(BaseModel):
     __table_args__ = (
         Index('idx_agent_enabled', 'is_enabled'),
         Index('idx_agent_provider', 'provider_id'),
+        UniqueConstraint('tenant_id', 'agent_name', name='uq_agent_tenant_name'),
     )
     
     def __repr__(self) -> str:
-        return f"<Agent(id='{self.id}', name='{self.agent_name}', department_id='{self.department_id}')>"
+        return f"<Agent(id='{self.id}', name='{self.agent_name}', tenant_id='{self.tenant_id}', department_id='{self.department_id}')>"
 
 
 class AgentToolConfig(BaseModel):
