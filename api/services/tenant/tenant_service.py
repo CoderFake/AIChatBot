@@ -7,7 +7,7 @@ from models.database.tenant import Tenant
 from models.database.provider import WorkflowAgent
 from services.auth.permission_service import PermissionService
 from services.cache.redis_service import redis_service
-from utils.datetime_utils import CustomDateTime, TenantDateTimeManager
+from utils.datetime_utils import DateTimeManager
 from common.types import DefaultProviderConfig
 from utils.logging import get_logger
 from core.exceptions import ServiceError
@@ -249,30 +249,20 @@ class TenantService:
     
     async def _load_tenant_to_cache(self, tenant: Tenant):
         """
-        Load basic tenant info to Redis cache and set timezone context
+        Load basic tenant info to Redis cache for timezone resolution
         ConfigManager handles detailed config caching separately
         """
         try:
             tenant_cache_data = {
-                "tenant_id": str(tenant.id),
-                "tenant_name": tenant.tenant_name,
-                "timezone": tenant.timezone,
-                "locale": tenant.locale,
-                "is_active": tenant.is_active,
-                "settings": tenant.settings or {},
-                "cached_at": CustomDateTime.utc_now().isoformat()
+                "timezone": tenant.timezone
             }
             
-            # Load basic tenant data to cache
             await redis_service.cache_tenant_data(
                 tenant_id=str(tenant.id),
                 data=tenant_cache_data
             )
             
-            # Set timezone context for datetime operations
-            TenantDateTimeManager.set_tenant_context(tenant.timezone)
-            
-            logger.info(f"Loaded basic tenant {tenant.tenant_name} to cache with timezone {tenant.timezone}")
+            logger.info(f"Loaded tenant {tenant.tenant_name} timezone {tenant.timezone} to cache")
             
         except Exception as e:
             logger.error(f"Failed to load tenant to cache: {e}")
@@ -328,7 +318,6 @@ class TenantService:
             if is_active is not None:
                 query = query.where(Tenant.is_active == is_active)
             
-            # Get total count
             count_result = await self.db.execute(
                 select(select(Tenant).count()).select_from(
                     query.subquery()
@@ -336,7 +325,6 @@ class TenantService:
             )
             total = count_result.scalar()
             
-            # Get paginated results
             query = query.offset((page - 1) * limit).limit(limit)
             result = await self.db.execute(query)
             tenants = result.scalars().all()

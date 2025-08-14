@@ -1,5 +1,4 @@
-from .document import DocumentMetadata, EnhancedDocumentMetadata, MetadataTransformer
-from .database.agent import Agent, AgentTool
+from .database.agent import Agent, AgentToolConfig
 from .database.provider import Provider
 from .database.tool import Tool
 from .database.user import User
@@ -9,14 +8,9 @@ from .database.permission import Permission, Group
 from common.types import AccessLevel
 
 __all__ = [
-    # Document metadata
-    "DocumentMetadata", 
-    "EnhancedDocumentMetadata", 
-    "MetadataTransformer",
-    
     # Database models
     "Agent",
-    "AgentTool", 
+    "AgentToolConfig", 
     "Provider",
     "Tool",
     "User",

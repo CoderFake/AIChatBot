@@ -6,10 +6,10 @@ import requests
 from typing import Dict, Any, Optional, Type
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import aiohttp
 import asyncio
-from api.models.models import WeatherInput
+from models.models import WeatherInput
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -20,20 +20,20 @@ class WeatherTool(BaseTool):
     Weather tool for getting current weather and forecasts
     Uses OpenWeatherMap API (requires API key in environment or config)
     """
-    name = "weather"
-    description = "Gets current weather conditions and forecasts for a specified location."
+    name: str = "weather"
+    description: str = "Gets current weather conditions and forecasts for a specified location."
     args_schema: Type[BaseModel] = WeatherInput
+
+    api_key: Optional[str] = None
+    base_url: str = "https://api.openweathermap.org/data/2.5"
     
     def __init__(self, api_key: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.api_key = api_key
-        self.base_url = "https://api.openweathermap.org/data/2.5"
+        if not api_key:
+            import os
+            api_key = os.getenv("OPENWEATHERMAP_API_KEY")
+        super().__init__(api_key=api_key, **kwargs)
         logger.info("Initialized weather tool")
         
-        if not self.api_key:
-            import os
-            self.api_key = os.getenv("OPENWEATHERMAP_API_KEY")
-            
         if not self.api_key:
             logger.warning("No OpenWeatherMap API key found. Weather tool may not work.")
 

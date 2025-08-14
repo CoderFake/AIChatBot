@@ -1,0 +1,20 @@
+{
+  "title": "App Metrics (Prometheus)",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "HTTP Requests (/metrics scrape per 5m)",
+      "targets": [
+        { "expr": "sum(increase(scrape_duration_seconds_count[5m]))" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Scrape Duration (s)",
+      "targets": [
+        { "expr": "avg_over_time(scrape_duration_seconds[5m])" }
+      ]
+    }
+  ]
+} 

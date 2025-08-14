@@ -2,8 +2,12 @@ import os
 from typing import Dict, List, Any, Optional
 from functools import lru_cache
 
-import torch
-from pydantic import BaseSettings, Field, validator, root_validator
+try:
+    import torch
+except Exception:
+    torch = None
+from pydantic import Field, field_validator, model_validator, ConfigDict
+from pydantic_settings import BaseSettings
 from pydantic.dataclasses import dataclass
 
 
@@ -95,6 +99,13 @@ class TenantCacheConfig:
 class Settings(BaseSettings):
     """Application settings with comprehensive configuration"""
     
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore"
+    )
+    
     # Application
     APP_NAME: str = "Multi-Agent RAG System"
     APP_VERSION: str = "2.0.0"
@@ -105,14 +116,14 @@ class Settings(BaseSettings):
     TIMEZONE: str = "Asia/Ho_Chi_Minh"
     
     # Security
-    SECRET_KEY: str = Field(..., env="SECRET_KEY")
-    JWT_SECRET_KEY: str = Field(..., env="JWT_SECRET_KEY")
+    SECRET_KEY: str = Field(default="dev-secret-key-change-in-production", env="SECRET_KEY")
+    JWT_SECRET_KEY: str = Field(default="dev-jwt-secret-change-in-production", env="JWT_SECRET_KEY")
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Database
-    DATABASE_URL: str = "postgresql://user:password@localhost:5432/multi_agent_rag"
+    DATABASE_URL: str = "postgresql://ai_user:ai_pass@localhost:5432/ai_chatbot"
     
     # Redis
     REDIS_HOST: str = "redis"
@@ -136,10 +147,82 @@ class Settings(BaseSettings):
     DEVICE: str = "cpu"
     
     # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
+    CORS_ORIGINS: List[str] | str = ["http://localhost:3000", "http://localhost:8080"]
+
+    # Email SMTP
+    EMAIL_TEMPLATES_DIR: str = Field(default="templates/email", env="EMAIL_TEMPLATES_DIR")
+    SMTP_HOST: str = Field(default="smtp.gmail.com", env="SMTP_HOST")
+    SMTP_PORT: int = Field(default=587, env="SMTP_PORT")
+    SMTP_TLS: bool = Field(default=True, env="SMTP_TLS")
+    SMTP_USER: Optional[str] = Field(default=None, env="SMTP_USER")
+    SMTP_PASS: Optional[str] = Field(default=None, env="SMTP_PASS")
+    EMAIL_FROM_NAME: str = Field(default_factory=lambda: os.environ.get("APP_NAME", "AI Chatbot"), env="EMAIL_FROM_NAME")
+    EMAIL_FROM: str = Field(default="no-reply@example.com", env="EMAIL_FROM")
+    
+    @field_validator('CORS_ORIGINS', mode='before')
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v]
+        s = str(v).strip()
+        # JSON array
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("\"") and s.endswith("\"")):
+            try:
+                import json
+                data = json.loads(s)
+                if isinstance(data, list):
+                    return [str(x).strip() for x in data]
+            except Exception:
+                pass
+        # CSV
+        return [x.strip() for x in s.split(',') if x.strip()]
     
     # Kafka
-    KAFKA_BOOTSTRAP_SERVERS: List[str] = ["localhost:9092"]
+    KAFKA_BOOTSTRAP_SERVERS: List[str] | str = ["kafka:9092"]
+    
+    @field_validator('KAFKA_BOOTSTRAP_SERVERS', mode='before')
+    @classmethod
+    def parse_kafka_bootstrap(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v]
+        s = str(v).strip()
+        # JSON array
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                import json
+                data = json.loads(s)
+                if isinstance(data, list):
+                    return [str(x).strip() for x in data]
+            except Exception:
+                pass
+        # CSV or single string
+        return [x.strip() for x in s.split(',') if x.strip()]
+    
+    @model_validator(mode="after")
+    def normalize_list_fields(self) -> "Settings":
+        def _to_list(value: List[str] | str) -> List[str]:
+            if isinstance(value, list):
+                return [str(x).strip() for x in value]
+            if value is None:
+                return []
+            s = str(value).strip()
+            if s.startswith('[') and s.endswith(']'):
+                try:
+                    import json
+                    data = json.loads(s)
+                    if isinstance(data, list):
+                        return [str(x).strip() for x in data]
+                except Exception:
+                    pass
+            return [x.strip() for x in s.split(',') if x.strip()]
+
+        self.CORS_ORIGINS = _to_list(self.CORS_ORIGINS)
+        self.KAFKA_BOOTSTRAP_SERVERS = _to_list(self.KAFKA_BOOTSTRAP_SERVERS)
+        return self
     KAFKA_DOCUMENT_TOPIC: str = "document_processing"
     KAFKA_CONSUMER_GROUP: str = "document_processors"
     
@@ -151,9 +234,13 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def update_configs_from_env(cls, values):
         """Update configuration objects from environment variables"""
+        if not isinstance(values, dict):
+            return values
+            
         milvus_config = values.get('milvus', MilvusConfig())
         if values.get('MILVUS_PUBLIC_HOST') and values.get('MILVUS_PUBLIC_PORT'):
             milvus_config.public_uri = f"http://{values['MILVUS_PUBLIC_HOST']}:{values['MILVUS_PUBLIC_PORT']}"
@@ -172,7 +259,8 @@ class Settings(BaseSettings):
         
         return values
     
-    @validator('llm_providers', pre=True, always=True)
+    @field_validator('llm_providers', mode="before")
+    @classmethod
     def setup_default_providers(cls, v):
         """Setup default LLM provider configurations (API keys loaded from tenant cache in Redis)"""
         if not v:
@@ -182,9 +270,10 @@ class Settings(BaseSettings):
             "gemini": LLMProviderConfig(
                 name="gemini",
                 enabled=False,
-                models=["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-                default_model="gemini-2.0-flash",
+                models=["gemini-2.5-pro","gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+                default_model="gemini-2.5-pro",
                 config={
+                    "base_url": "https://api.google.com/v1",
                     "timeout": 60,
                     "max_retries": 3
                 }
@@ -195,7 +284,7 @@ class Settings(BaseSettings):
                 models=["llama3.1:8b", "llama3.1:70b", "llama3.2:1b", "mistral-nemo:12b"],
                 default_model="llama3.1:8b",
                 config={
-                    "base_url": "http://localhost:11434",
+                    "base_url": "http://ollama:11434",
                     "timeout": 180,
                     "max_retries": 2
                 }
@@ -207,7 +296,8 @@ class Settings(BaseSettings):
                 default_model="claude-3-5-sonnet-20241022",
                 config={
                     "base_url": "https://api.anthropic.com/v1",
-                    "timeout": 120
+                    "timeout": 120,
+                    "max_retries": 3
                 }
             ),
             "mistral": LLMProviderConfig(
@@ -217,7 +307,8 @@ class Settings(BaseSettings):
                 default_model="mistral-large-latest",
                 config={
                     "base_url": "https://api.mistral.ai/v1",
-                    "timeout": 90
+                    "timeout": 180,
+                    "max_retries": 3
                 }
             )
         }
@@ -243,7 +334,7 @@ class Settings(BaseSettings):
     @lru_cache(maxsize=1)
     def get_device(self) -> str:
         """Get computation device (CPU/GPU)"""
-        if torch.cuda.is_available() and self.DEVICE != "cpu":
+        if torch and self.DEVICE != "cpu":
             return "cuda"
         return "cpu"
     
@@ -283,11 +374,6 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development environment"""
         return self.ENV.lower() == "development"
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
 
 
 @lru_cache()

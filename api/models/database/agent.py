@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index, UniqueConstraint
+from typing import List, Dict, Any, Optional
+from sqlalchemy import Column, String, Boolean, Text, ForeignKey, Index, UniqueConstraint, Integer, Float
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import text
@@ -149,12 +150,6 @@ class WorkflowAgent(BaseModel):
     
     __tablename__ = "workflow_agents"
 
-    workflow_agent_name = Column(
-        String(200),
-        nullable=False,
-        comment="Workflow Agent name"
-    )
-
     tenant_id = Column(
         UUID(as_uuid=True),
         ForeignKey("tenants.id", ondelete="CASCADE"),
@@ -163,25 +158,76 @@ class WorkflowAgent(BaseModel):
         comment="Tenant ID"
     )
     
-    provider_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("providers.id", ondelete="CASCADE"),
+    provider_name = Column(
+        String(100),
         nullable=False,
-        index=True,
-        comment="Provider ID"
+        comment="Provider name (e.g. gemini, openai)"
+    )
+    
+    model_name = Column(
+        String(100),
+        nullable=False,
+        comment="Model name (e.g. gemini-pro, gpt-4)"
+    )
+    
+    model_config = Column(
+        JSONB,
+        nullable=True,
+        comment="Model configuration (temperature, max_tokens, etc.)"
+    )
+    
+    max_iterations = Column(
+        Integer,
+        nullable=False,
+        default=10,
+        comment="Maximum workflow iterations"
+    )
+    
+    timeout_seconds = Column(
+        Integer,
+        nullable=False,
+        default=300,
+        comment="Workflow timeout in seconds"
+    )
+    
+    confidence_threshold = Column(
+        Float,
+        nullable=False,
+        default=0.7,
+        comment="Minimum confidence threshold"
+    )
+    
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("TRUE"),
+        comment="Whether workflow agent is active"
     )
 
     # Relationships
     tenant = relationship("Tenant", back_populates="workflow_agent")
-    provider = relationship("Provider", back_populates="workflow_agent")
     
     __table_args__ = (
-        # Indexes for performance optimization
         Index('idx_workflow_agent_tenant', 'tenant_id'),
-        Index('idx_workflow_agent_provider', 'provider_id'),
-        Index('idx_workflow_agent_enabled', 'is_deleted'),
+        Index('idx_workflow_agent_active', 'is_active'),
+        UniqueConstraint('tenant_id', name='uq_workflow_agent_tenant'),
     )
     
+    def get_workflow_config(self) -> Dict[str, Any]:
+        """Get workflow configuration"""
+        return {
+            "id": str(self.id),
+            "tenant_id": str(self.tenant_id),
+            "provider_name": self.provider_name,
+            "model_name": self.model_name,
+            "model_config": self.model_config or {},
+            "max_iterations": self.max_iterations,
+            "timeout_seconds": self.timeout_seconds,
+            "confidence_threshold": self.confidence_threshold,
+            "is_active": self.is_active
+        }
+    
     def __repr__(self) -> str:
-        return f"<WorkflowAgent(id='{self.id}', name='{self.workflow_agent_name}', tenant_id='{self.tenant_id}')>"
+        return f"<WorkflowAgent(id='{self.id}', tenant_id='{self.tenant_id}', provider='{self.provider_name}')>"
     

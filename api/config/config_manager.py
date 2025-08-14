@@ -19,14 +19,11 @@ from services.cache.redis_service import redis_client
 from services.tools.tool_service import ToolService
 from services.llm.provider_service import ProviderService
 from utils.logging import get_logger
-from utils.datetime_utils import CustomDateTime
+from utils.datetime_utils import DateTimeManager
 from models.database.tenant import Tenant, Department
 from models.database.provider import Provider, TenantProviderConfig
-from models.database.agent import Agent, AgentToolConfig
+from models.database.agent import Agent, WorkflowAgent
 from models.database.tool import Tool, TenantToolConfig
-from models.database.workflow_agent import WorkflowAgent
-from models.database.user import User
-from models.database.permission import UserPermission
 
 logger = get_logger(__name__)
 
@@ -45,6 +42,17 @@ class ConfigManager:
         
         self._load_settings()
     
+    async def _get_tenant_timezone(self, tenant_id: str, db_session: AsyncSession) -> str:
+        """Resolve tenant timezone; fallback to system timezone if unavailable."""
+        try:
+            result = await db_session.execute(select(Tenant).where(Tenant.id == tenant_id))
+            tenant = result.scalar_one_or_none()
+            if tenant and hasattr(tenant, "timezone") and tenant.timezone:
+                return str(tenant.timezone)
+        except Exception:
+            pass
+        return self.settings.TIMEZONE
+    
     def _load_settings(self) -> None:
         """Load settings from environment/config files"""
         try:
@@ -60,7 +68,6 @@ class ConfigManager:
             await cache_manager.initialize()
             await redis_client.initialize()
 
-            # Sync default tools and providers into database
             async with get_db_context() as db:
                 tool_service = ToolService(db)
                 await tool_service.initialize()
@@ -96,15 +103,26 @@ class ConfigManager:
     ) -> Dict[str, Any]:
         """
         Load tenant provider configurations from database
-        Updated to support multiple API keys with rotation
+        Only cache providers/models that are actively used by department agents
+        API keys are stored encrypted in DB and decrypted for cache usage
         """
         try:
+            from models.database.agent import Agent
+            
             result = await db_session.execute(
-                select(Provider, TenantProviderConfig)
-                .join(TenantProviderConfig, Provider.id == TenantProviderConfig.provider_id)
+                select(Agent, Department, Provider, TenantProviderConfig)
+                .join(Department, Agent.department_id == Department.id)
+                .join(Provider, Agent.provider_id == Provider.id)
+                .join(TenantProviderConfig, 
+                      and_(
+                          TenantProviderConfig.provider_id == Provider.id,
+                          TenantProviderConfig.tenant_id == Department.tenant_id
+                      ))
                 .where(
                     and_(
-                        TenantProviderConfig.tenant_id == tenant_id,
+                        Department.tenant_id == tenant_id,
+                        Agent.is_enabled == True,
+                        Department.is_active == True,
                         Provider.is_enabled == True,
                         TenantProviderConfig.is_enabled == True
                     )
@@ -113,28 +131,37 @@ class ConfigManager:
             
             tenant_providers = {}
             
-            for provider, t_config in result:
-                provider_key = f"{provider.id}_{tenant_id}"
+            for agent, department, provider, t_config in result:
+                provider_key = f"{provider.id}_{department.id}"
+                
+                encrypted_keys = t_config.api_keys if t_config.api_keys else []
+                
+                if not encrypted_keys:
+                    logger.warning(f"No API keys available for provider {provider.provider_name} in dept {department.department_name}")
+                    continue
                 
                 cache_data = {
                     "provider_id": str(provider.id),
+                    "provider_name": provider.provider_name,
                     "tenant_id": tenant_id,
-                    "config_id": str(t_config.id),
+                    "department_id": str(department.id),
+                    "department_name": department.department_name,
+                    "agent_id": str(agent.id),
+                    "agent_name": agent.agent_name,
+                    "model_id": str(agent.model_id) if agent.model_id else None,
                     "is_enabled": t_config.is_enabled,
-                    "api_keys": t_config.get_api_keys(),
-                    "current_key_index": t_config.current_key_index,
+                    "encrypted_api_keys": encrypted_keys,
                     "rotation_strategy": t_config.rotation_strategy,
+                    "current_key_index": t_config.current_key_index,
+                    "key_count": len(encrypted_keys),
+                    "base_config": provider.base_config or {},
                     "config_data": t_config.config_data or {},
+                    "last_updated": DateTimeManager._now().isoformat()
                 }
                 
-                tenant_providers[provider_key] = {
-                    "provider_name": provider.provider_name,
-                    "base_config": provider.base_config or {},
-                    **cache_data, 
-                    "last_updated": CustomDateTime.now().isoformat()
-                }
+                tenant_providers[provider_key] = cache_data
             
-            logger.info(f"Loaded {len(tenant_providers)} providers for tenant {tenant_id}")
+            logger.info(f"Loaded {len(tenant_providers)} active provider configs for tenant {tenant_id}")
             return tenant_providers
             
         except Exception as e:
@@ -148,7 +175,8 @@ class ConfigManager:
     ) -> Dict[str, Any]:
         """Load tenant agent configurations from database"""
         try:
-            result = await db_session.execute(
+            tz = await self._get_tenant_timezone(tenant_id, db_session)
+            result = await db_session.execute( 
                 select(Agent, Department)
                 .join(Department, Agent.department_id == Department.id)
                 .where(
@@ -174,7 +202,7 @@ class ConfigManager:
                     "capabilities": agent.capabilities or {},
                     "system_prompt": agent.system_prompt,
                     "model_config": agent.model_config or {},
-                    "last_updated": CustomDateTime.now().isoformat()
+                    "last_updated": DateTimeManager._now().isoformat()
                 }
             
             logger.info(f"Loaded {len(tenant_agents)} agents for tenant {tenant_id}")
@@ -191,6 +219,7 @@ class ConfigManager:
     ) -> Dict[str, Any]:
         """Load tenant tool configurations from database (tenant-level)"""
         try:
+            tz = await self._get_tenant_timezone(tenant_id, db_session)
             result = await db_session.execute(
                 select(Tool, TenantToolConfig)
                 .join(TenantToolConfig, Tool.id == TenantToolConfig.tool_id)
@@ -217,7 +246,7 @@ class ConfigManager:
                     "is_enabled": t_config.is_enabled,
                     "base_config": tool.base_config or {},
                     "config_data": t_config.config_data or {},
-                    "last_updated": CustomDateTime.now().isoformat()
+                    "last_updated": DateTimeManager._now().isoformat()
                 }
             
             logger.info(f"Loaded {len(tenant_tools)} tools for tenant {tenant_id}")
@@ -234,6 +263,7 @@ class ConfigManager:
     ) -> Dict[str, Any]:
         """Load tenant workflow configuration from database"""
         try:
+            tz = await self._get_tenant_timezone(tenant_id, db_session)
             result = await db_session.execute(
                 select(WorkflowAgent)
                 .where(WorkflowAgent.tenant_id == tenant_id)
@@ -250,13 +280,13 @@ class ConfigManager:
                 "tenant_id": tenant_id,
                 "provider_name": workflow_agent.provider_name or "none",
                 "model_name": workflow_agent.model_name or "none", 
-                "api_key": workflow_agent.api_key,  # Will be None initially
+                "api_key": workflow_agent.api_key,
                 "is_active": workflow_agent.is_active,
                 "model_config": workflow_agent.model_config or {},
                 "max_iterations": workflow_agent.max_iterations,
                 "timeout_seconds": workflow_agent.timeout_seconds,
                 "confidence_threshold": workflow_agent.confidence_threshold,
-                "last_updated": CustomDateTime.now().isoformat()
+                "last_updated": DateTimeManager._now().isoformat()
             }
             
             logger.info(f"Loaded workflow config for tenant {tenant_id}")
@@ -281,28 +311,23 @@ class ConfigManager:
             if db_session:
                 result = await db_session.execute(
                     select(TenantProviderConfig)
-                    .join(Department, TenantProviderConfig.department_id == Department.id)
                     .where(
                         and_(
-                            Department.tenant_id == tenant_id,
-                            TenantProviderConfig.provider_id == provider_id,
-                            TenantProviderConfig.department_id == department_id
+                            TenantProviderConfig.tenant_id == tenant_id,
+                            TenantProviderConfig.provider_id == provider_id
                         )
                     )
                 )
-                
-                dept_config = result.scalar_one_or_none()
-                if dept_config:
-                    dept_config.current_key_index = new_key_index
+                t_config = result.scalar_one_or_none()
+                if t_config:
+                    t_config.current_key_index = new_key_index
                     await db_session.commit()
-                    
-                    await self._update_provider_cache(tenant_id, provider_id, department_id, dept_config)
-                    
-                    logger.info(f"Updated key rotation for provider {provider_id} in department {department_id}")
+                    await self._update_provider_cache(tenant_id, provider_id, department_id, new_key_index)
+                    logger.info(f"Updated key rotation for provider {provider_id} (tenant-level), reflected for dept {department_id}")
                     return True
-            
+             
             return False
-            
+             
         except Exception as e:
             logger.error(f"Failed to update provider key rotation: {e}")
             return False
@@ -312,7 +337,7 @@ class ConfigManager:
         tenant_id: str,
         provider_id: str,
         department_id: str,
-        dept_config: TenantProviderConfig
+        new_key_index: int
     ):
         """
         Update specific provider configuration in cache
@@ -326,9 +351,9 @@ class ConfigManager:
             cached_providers = await cache_manager.get_dict(cache_key) or {}
             
             if provider_key in cached_providers:
-                cache_data = dept_config.get_cache_data()
-                cached_providers[provider_key].update(cache_data)
-                cached_providers[provider_key]["last_updated"] = CustomDateTime.now().isoformat()
+                # Không đưa plaintext key vào cache; chỉ cập nhật index và thời gian
+                cached_providers[provider_key]["current_key_index"] = new_key_index
+                cached_providers[provider_key]["last_updated"] = DateTimeManager.maintainer_now().isoformat()
                 
                 await cache_manager.set_dict(
                     cache_key,

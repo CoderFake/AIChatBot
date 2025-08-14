@@ -2,6 +2,7 @@ from sqlalchemy import Column, String, Boolean, ForeignKey, Index, Integer
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from typing import List, Optional, Dict, Any
+from utils.encryption_utils import encryption_service
 
 from models.database.base import BaseModel
 
@@ -178,11 +179,20 @@ class TenantProviderConfig(BaseModel):
     )
     
     def get_api_keys(self) -> List[str]:
-        if self.api_keys and isinstance(self.api_keys, list):
-            return self.api_keys
+        """Get decrypted API keys"""
+        if self.api_keys:
+            from utils.encryption_utils import encryption_service
+            try:
+                return encryption_service.decrypt_api_keys(self.api_keys)
+            except Exception as e:
+                from utils.logging import get_logger
+                logger = get_logger(__name__)
+                logger.error(f"Failed to decrypt API keys: {e}")
+                return []
         return []
     
     def get_current_api_key(self) -> Optional[str]:
+        """Get current decrypted API key"""
         keys = self.get_api_keys()
         if not keys:
             return None
@@ -191,6 +201,7 @@ class TenantProviderConfig(BaseModel):
         return keys[self.current_key_index]
     
     def rotate_to_next_key(self) -> str:
+        """Rotate to next API key and return decrypted key"""
         keys = self.get_api_keys()
         if not keys:
             raise ValueError("No API keys available for rotation")
@@ -207,34 +218,49 @@ class TenantProviderConfig(BaseModel):
         return keys[self.current_key_index]
     
     def add_api_key(self, new_key: str) -> None:
-        keys = self.get_api_keys()
-        if new_key not in keys:
-            keys.append(new_key)
-            self.api_keys = keys
+        """Add new API key (will be encrypted before storage)"""
+        from utils.encryption_utils import encryption_service
+        
+        current_keys = self.get_api_keys()
+        
+        if new_key not in current_keys:
+            current_keys.append(new_key)
+            
+            self.api_keys = encryption_service.encrypt_api_keys(current_keys)
     
     def remove_api_key(self, key_to_remove: str) -> bool:
-        keys = self.get_api_keys()
-        if key_to_remove in keys:
-            remove_index = keys.index(key_to_remove)
-            keys.remove(key_to_remove)
-            self.api_keys = keys
-            if self.current_key_index >= len(keys) and keys:
+        """Remove API key by decrypted value"""
+        current_keys = self.get_api_keys()
+        
+        if key_to_remove in current_keys:
+            remove_index = current_keys.index(key_to_remove)
+            current_keys.remove(key_to_remove)
+            
+            self.api_keys = encryption_service.encrypt_api_keys(current_keys)
+            
+            if self.current_key_index >= len(current_keys) and current_keys:
                 self.current_key_index = 0
             elif self.current_key_index > remove_index:
                 self.current_key_index -= 1
             return True
         return False
     
+    def set_api_keys(self, keys: List[str]) -> None:
+        """Set API keys (will be encrypted before storage)"""
+        from utils.encryption_utils import encryption_service
+        self.api_keys = encryption_service.encrypt_api_keys(keys)
+        self.current_key_index = 0
+    
     def get_cache_data(self) -> Dict[str, Any]:
+        """Get data for caching (without plaintext API key)"""
         return {
-            "provider_id": str(self.provider_id),
             "tenant_id": str(self.tenant_id),
-            "config_id": str(self.id),
+            "provider_id": str(self.provider_id),
             "is_enabled": self.is_enabled,
-            "api_keys": self.get_api_keys(),
-            "current_key_index": self.current_key_index,
             "rotation_strategy": self.rotation_strategy,
             "config_data": self.config_data or {},
+            "key_count": len(self.api_keys or []),
+            "current_key_index": self.current_key_index,
             "last_updated": self.updated_at.isoformat() if self.updated_at else None
         }
     

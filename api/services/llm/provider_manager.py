@@ -48,16 +48,11 @@ class GeminiProvider(BaseLLMProvider):
     async def initialize(self) -> bool:
         """Initialize Gemini provider"""
         try:
-            if not self._api_keys:
-                logger.error("No Gemini API keys provided")
-                return False
-            
-            import google.generativeai as genai
-            
-            genai.configure(api_key=self._api_keys[0])
-            
-            test_model = genai.GenerativeModel(self.config.default_model)
-            await test_model.generate_content_async("Hello")
+            if self._api_keys:
+                import google.generativeai as genai
+                genai.configure(api_key=self._api_keys[0])
+                test_model = genai.GenerativeModel(self.config.default_model)
+                await test_model.generate_content_async("Hello")
             
             self._initialized = True
             logger.info(f"Gemini provider initialized with {len(self._api_keys)} API keys")
@@ -75,11 +70,18 @@ class GeminiProvider(BaseLLMProvider):
         import google.generativeai as genai
         
         model_name = model or self.config.default_model
-        max_retries = len(self._api_keys)
+        runtime_keys = kwargs.get("api_keys")
+        if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
+            keys = [k for k in runtime_keys if k]
+        else:
+            keys = self._api_keys
+        if not keys:
+            raise RuntimeError("No API keys provided for Gemini at runtime")
+        max_retries = len(keys)
         
         for attempt in range(max_retries):
             try:
-                current_key = self._api_keys[self._current_key_index]
+                current_key = keys[self._current_key_index]
                 genai.configure(api_key=current_key)
                 llm_model = genai.GenerativeModel(model_name)
                 response = await llm_model.generate_content_async(
@@ -101,7 +103,7 @@ class GeminiProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Gemini API call failed with key {self._current_key_index}: {e}")
                 
-                self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+                self._current_key_index = (self._current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Gemini API keys failed: {e}")
@@ -212,21 +214,16 @@ class MistralProvider(BaseLLMProvider):
     async def initialize(self) -> bool:
         """Initialize Mistral provider"""
         try:
-            if not self._api_keys:
-                logger.error("No Mistral API keys provided")
-                return False
-            
-            import httpx
-            
-            headers = {
-                "Authorization": f"Bearer {self._api_keys[0]}",
-                "Content-Type": "application/json"
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{self._base_url}/models", headers=headers)
-                if response.status_code != 200:
-                    raise Exception(f"Mistral API test failed: {response.status_code}")
+            if self._api_keys:
+                import httpx
+                headers = {
+                    "Authorization": f"Bearer {self._api_keys[0]}",
+                    "Content-Type": "application/json"
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"{self._base_url}/models", headers=headers)
+                    if response.status_code != 200:
+                        raise Exception(f"Mistral API test failed: {response.status_code}")
             
             self._initialized = True
             logger.info(f"Mistral provider initialized with {len(self._api_keys)} API keys")
@@ -244,11 +241,18 @@ class MistralProvider(BaseLLMProvider):
         import httpx
         
         model_name = model or self.config.default_model
-        max_retries = len(self._api_keys)
+        runtime_keys = kwargs.get("api_keys")
+        if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
+            keys = [k for k in runtime_keys if k]
+        else:
+            keys = self._api_keys
+        if not keys:
+            raise RuntimeError("No API keys provided for Mistral at runtime")
+        max_retries = len(keys)
         
         for attempt in range(max_retries):
             try:
-                current_key = self._api_keys[self._current_key_index]
+                current_key = keys[self._current_key_index]
                 headers = {
                     "Authorization": f"Bearer {current_key}",
                     "Content-Type": "application/json"
@@ -285,7 +289,7 @@ class MistralProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Mistral API call failed with key {self._current_key_index}: {e}")
                 
-                self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+                self._current_key_index = (self._current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Mistral API keys failed: {e}")
@@ -312,21 +316,16 @@ class MetaProvider(BaseLLMProvider):
     async def initialize(self) -> bool:
         """Initialize Meta provider"""
         try:
-            if not self._api_keys:
-                logger.error("No Meta/Together API keys provided")
-                return False
-            
-            import httpx
-            
-            headers = {
-                "Authorization": f"Bearer {self._api_keys[0]}",
-                "Content-Type": "application/json"
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{self._base_url}/models", headers=headers)
-                if response.status_code != 200:
-                    raise Exception(f"Meta/Together API test failed: {response.status_code}")
+            if self._api_keys:
+                import httpx
+                headers = {
+                    "Authorization": f"Bearer {self._api_keys[0]}",
+                    "Content-Type": "application/json"
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"{self._base_url}/models", headers=headers)
+                    if response.status_code != 200:
+                        raise Exception(f"Meta/Together API test failed: {response.status_code}")
             
             self._initialized = True
             logger.info(f"Meta provider initialized with {len(self._api_keys)} API keys")
@@ -344,11 +343,18 @@ class MetaProvider(BaseLLMProvider):
         import httpx
         
         model_name = model or self.config.default_model
-        max_retries = len(self._api_keys)
+        runtime_keys = kwargs.get("api_keys")
+        if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
+            keys = [k for k in runtime_keys if k]
+        else:
+            keys = self._api_keys
+        if not keys:
+            raise RuntimeError("No API keys provided for Meta Together at runtime")
+        max_retries = len(keys)
         
         for attempt in range(max_retries):
             try:
-                current_key = self._api_keys[self._current_key_index]
+                current_key = keys[self._current_key_index]
                 headers = {
                     "Authorization": f"Bearer {current_key}",
                     "Content-Type": "application/json"
@@ -385,7 +391,7 @@ class MetaProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Meta API call failed with key {self._current_key_index}: {e}")
                 
-                self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+                self._current_key_index = (self._current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Meta API keys failed: {e}")
@@ -412,32 +418,26 @@ class AnthropicProvider(BaseLLMProvider):
     async def initialize(self) -> bool:
         """Initialize Anthropic provider"""
         try:
-            if not self._api_keys:
-                logger.error("No Anthropic API keys provided")
-                return False
-            
-            import httpx
-            
-            headers = {
-                "x-api-key": self._api_keys[0],
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            payload = {
-                "model": self.config.default_model,
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "Hello"}]
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self._base_url}/messages",
-                    headers=headers,
-                    json=payload
-                )
-                if response.status_code not in [200, 201]:
-                    raise Exception(f"Anthropic API test failed: {response.status_code}")
+            if self._api_keys:
+                import httpx
+                headers = {
+                    "x-api-key": self._api_keys[0],
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01"
+                }
+                payload = {
+                    "model": self.config.default_model,
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{self._base_url}/messages",
+                        headers=headers,
+                        json=payload
+                    )
+                    if response.status_code not in [200, 201]:
+                        raise Exception(f"Anthropic API test failed: {response.status_code}")
             
             self._initialized = True
             logger.info(f"Anthropic provider initialized with {len(self._api_keys)} API keys")
@@ -455,11 +455,18 @@ class AnthropicProvider(BaseLLMProvider):
         import httpx
         
         model_name = model or self.config.default_model
-        max_retries = len(self._api_keys)
+        runtime_keys = kwargs.get("api_keys")
+        if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
+            keys = [k for k in runtime_keys if k]
+        else:
+            keys = self._api_keys
+        if not keys:
+            raise RuntimeError("No API keys provided for Anthropic at runtime")
+        max_retries = len(keys)
         
         for attempt in range(max_retries):
             try:
-                current_key = self._api_keys[self._current_key_index]
+                current_key = keys[self._current_key_index]
                 headers = {
                     "x-api-key": current_key,
                     "Content-Type": "application/json",
@@ -497,7 +504,7 @@ class AnthropicProvider(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Anthropic API call failed with key {self._current_key_index}: {e}")
                 
-                self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+                self._current_key_index = (self._current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Anthropic API keys failed: {e}")
@@ -559,22 +566,41 @@ class LLMProviderManager:
             if not self._db_session:
                 return {}
             
-            from models.database import Provider
+            from sqlalchemy import select
+            from models.database.provider import Provider, ProviderModel
             
-            db_providers = self._db_session.query(Provider).all()
-            provider_configs = {}
+            result = await self._db_session.execute(
+                select(Provider, ProviderModel)
+                .join(ProviderModel, ProviderModel.provider_id == Provider.id, isouter=True)
+            )
+            rows = result.all()
+            provider_map: Dict[str, Dict[str, Any]] = {}
+            models_map: Dict[str, List[str]] = {}
             
-            for db_provider in db_providers:
-                provider_configs[db_provider.name] = {
-                    "name": db_provider.name,
-                    "display_name": db_provider.display_name,
-                    "description": db_provider.description,
-                    "is_enabled": db_provider.is_enabled,
-                    "models": db_provider.models or [],
-                    "default_model": db_provider.default_model,
-                    "config": db_provider.provider_config or {},
-                    "source": "database"
-                }
+            for provider, prov_model in rows:
+                key = str(provider.id)
+                if key not in provider_map:
+                    provider_map[key] = {
+                        "name": provider.provider_name,
+                        "is_enabled": provider.is_enabled,
+                        "config": provider.base_config or {},
+                        "models": [],
+                        "default_model": "",
+                        "source": "database"
+                    }
+                    models_map[key] = []
+                if prov_model and prov_model.model_name:
+                    models_map[key].append(prov_model.model_name)
+            
+            provider_configs: Dict[str, Dict[str, Any]] = {}
+            for key, pdata in provider_map.items():
+                model_names = models_map.get(key, [])
+                pdata["models"] = model_names
+                default_model = ""
+                if model_names:
+                    default_model = model_names[0]
+                pdata["default_model"] = default_model
+                provider_configs[pdata["name"]] = pdata
             
             logger.info(f"Loaded {len(provider_configs)} providers from database")
             return provider_configs
@@ -604,7 +630,7 @@ class LLMProviderManager:
                     "default_model": registry_def["default_model"],
                     "config": {
                         **registry_def["provider_config"],
-                        "api_keys": settings_config.config.get("api_keys", []) if settings_config else []
+                        **(settings_config.config if settings_config else {})
                     },
                     "source": "registry_fallback"
                 }
@@ -678,10 +704,6 @@ class LLMProviderManager:
                 issues.append(f"Unsupported provider type: {provider_name}")
             
             config = provider_config.config
-            if provider_name in ["gemini", "mistral", "meta", "anthropic"]:
-                if not config.get("api_keys") or not any(key.strip() for key in config.get("api_keys", [])):
-                    issues.append(f"Missing or empty API keys")
-            
             if provider_name == "ollama":
                 if not config.get("base_url"):
                     issues.append("Missing base_url for Ollama")

@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libreoffice \
     pandoc \
+    libxml2 \
+    libxslt1.1 \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
@@ -26,7 +29,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install Python dependencies
-COPY api/requirements.txt .
+COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
@@ -39,7 +42,7 @@ RUN useradd --create-home --shell /bin/bash app && \
     chown -R app:app /app
 
 # Copy application code
-COPY --chown=app:app api/ .
+COPY --chown=app:app . .
 
 # Switch to non-root user
 USER app
@@ -52,7 +55,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 EXPOSE 8000
 
 # Start command
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+CMD ["/app/start.sh"]
 
 # Development stage
 FROM base as development
@@ -61,7 +66,7 @@ FROM base as development
 RUN pip install pytest pytest-asyncio httpx
 
 # Copy application code
-COPY api/ .
+COPY . .
 
 # Create directories
 RUN mkdir -p /app/logs /app/uploads /app/documents
@@ -70,4 +75,6 @@ RUN mkdir -p /app/logs /app/uploads /app/documents
 EXPOSE 8000
 
 # Development command with hot reload
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--log-level", "debug"]
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+CMD ["/app/start.sh"]

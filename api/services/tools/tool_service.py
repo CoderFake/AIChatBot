@@ -6,10 +6,11 @@ from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, update, delete
 from utils.datetime_utils import CustomDateTime as datetime
+from utils.datetime_utils import DateTimeManager
 
 from models.database.tool import Tool, TenantToolConfig
 from models.database.tenant import Tenant
-from api.tools.tool_registry import tool_registry
+from tools.tool_registry import tool_registry
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -99,7 +100,7 @@ class ToolService:
         """Check if tool cache is still valid"""
         if not self._cache_timestamp:
             return False
-        return (datetime.now() - self._cache_timestamp).seconds < self._cache_ttl
+        return (DateTimeManager._now() - self._cache_timestamp).seconds < self._cache_ttl
     
     async def _refresh_tool_cache(self):
         """Refresh tool cache from database (tenant-level only)"""
@@ -112,7 +113,6 @@ class ToolService:
             self._tool_cache = {}
             
             for tool in tools:
-                # Tenant configs (preferred)
                 tenant_configs_result = await self.db.execute(
                     select(TenantToolConfig, Tenant)
                     .join(Tenant, TenantToolConfig.tenant_id == Tenant.id)
@@ -139,12 +139,12 @@ class ToolService:
                     "is_enabled": tool.is_enabled,
                     "is_system": tool.is_system,
                     "base_config": tool.base_config or {},
-                    "tenant_configs": tenant_configs,           # preferred
+                    "tenant_configs": tenant_configs,
                     "created_at": tool.created_at,
                     "updated_at": tool.updated_at
                 }
             
-            self._cache_timestamp = datetime.now()
+            self._cache_timestamp = DateTimeManager._now()
             logger.info(f"Tool cache refreshed with {len(self._tool_cache)} tools")
             
         except Exception as e:
@@ -195,7 +195,7 @@ class ToolService:
                 return False
             
             tool.is_enabled = True
-            tool.updated_at = datetime.now()
+            tool.updated_at = DateTimeManager._now()
             
             await self.db.commit()
             await self._refresh_tool_cache()
@@ -223,7 +223,7 @@ class ToolService:
                 return False
             
             tool.is_enabled = False
-            tool.updated_at = datetime.now()
+            tool.updated_at = DateTimeManager._now()
             
             await self.db.commit()
             await self._refresh_tool_cache()
@@ -263,7 +263,7 @@ class ToolService:
                 t_config.config_data = config_data or t_config.config_data
                 t_config.usage_limits = usage_limits or t_config.usage_limits
                 t_config.configured_by = configured_by or t_config.configured_by
-                t_config.updated_at = datetime.now()
+                t_config.updated_at = DateTimeManager._now()
             else:
                 t_config = TenantToolConfig(
                     tenant_id=tenant_id,

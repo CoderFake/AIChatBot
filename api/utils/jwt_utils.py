@@ -9,6 +9,7 @@ import uuid
 from config.settings import get_settings
 from utils.logging import get_logger
 from core.exceptions import AuthenticationError
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -47,7 +48,7 @@ class JWTManager:
             user_role = payload.get("role", "USER")
             jwt_settings = settings.get_jwt_settings_for_user_type(user_role)
             
-            now = datetime.utcnow()
+            now = DateTimeManager.utc_now()
             jti = str(uuid.uuid4())
             
             if token_type == "access":

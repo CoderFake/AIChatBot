@@ -9,7 +9,7 @@ from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackMan
 from pydantic import BaseModel, Field
 import aiohttp
 import asyncio
-from api.models.models import WebSearchInput
+from models.models import WebSearchInput
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -19,8 +19,8 @@ class WebSearchTool(BaseTool):
     Web search tool for finding information on the internet
     Supports multiple search engines with DuckDuckGo as default (no API key required)
     """
-    name = "web_search"
-    description = "Searches the web for information using various search engines. Returns relevant web results."
+    name: str = "web_search"
+    description: str = "Searches the web for information using various search engines. Returns relevant web results."
     args_schema: Type[BaseModel] = WebSearchInput
     
     def __init__(self, **kwargs):

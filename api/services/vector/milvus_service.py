@@ -357,6 +357,136 @@ class MilvusService:
             logger.error(f"Failed to rebuild index for {collection_name}: {e}")
             return False
 
+    async def compact_collection(
+        self,
+        collection_name: str,
+        milvus_instance: str
+    ) -> bool:
+        """Compact collection to optimize storage"""
+        try:
+            client = self._get_client(milvus_instance)
+            client.compact(collection_name)
+            logger.info(f"Compacted collection {collection_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to compact collection {collection_name}: {e}")
+            return False
+
+    async def index_document_chunks(
+        self,
+        collection_name: str,
+        chunks: List[Any],
+        metadata: Dict[str, Any],
+        milvus_instance: str
+    ) -> int:
+        """
+        Index document chunks into Milvus collection
+        
+        Args:
+            collection_name: Target collection name
+            chunks: List of document chunks (from FileProcessor)
+            metadata: Base metadata for all chunks
+            milvus_instance: Milvus instance type (public/private)
+            
+        Returns:
+            Number of chunks indexed
+        """
+        try:
+            await self.ensure_collection_exists(collection_name, milvus_instance)
+            
+            documents = []
+            texts = []
+            
+            for i, chunk in enumerate(chunks):
+                if hasattr(chunk, 'page_content'):
+                    text = chunk.page_content
+                elif isinstance(chunk, dict):
+                    text = chunk.get('content', chunk.get('text', str(chunk)))
+                else:
+                    text = str(chunk)
+                
+                texts.append(text)
+                
+                chunk_metadata = metadata.copy()
+                if hasattr(chunk, 'metadata') and isinstance(chunk.metadata, dict):
+                    chunk_metadata.update(chunk.metadata)
+                elif isinstance(chunk, dict) and 'metadata' in chunk:
+                    chunk_metadata.update(chunk['metadata'])
+                
+                documents.append({
+                    "text": text,
+                    "document_id": metadata.get("document_id", "unknown"),
+                    "department": metadata.get("department_id", "unknown"),
+                    "document_source": f"chunk_{i}",
+                    "metadata": chunk_metadata
+                })
+            
+            success = await self.insert_documents(
+                documents=documents,
+                collection_name=collection_name,
+                milvus_instance=milvus_instance
+            )
+            
+            if success:
+                logger.info(f"Successfully indexed {len(chunks)} chunks into {collection_name}")
+                return len(chunks)
+            else:
+                logger.error(f"Failed to index chunks into {collection_name}")
+                return 0
+                
+        except Exception as e:
+            logger.error(f"Error indexing document chunks: {e}")
+            raise
+
+    async def delete_document_vectors(
+        self,
+        collection_name: str,
+        document_id: str
+    ) -> bool:
+        """
+        Delete all vectors for a specific document
+        
+        Args:
+            collection_name: Target collection name
+            document_id: Document ID to delete
+            
+        Returns:
+            True if deletion successful
+        """
+        try:
+            filter_expr = f'document_id == "{document_id}"'
+            
+            try:
+                public_result = await self.bulk_delete_by_filter(
+                    filter_expr=filter_expr,
+                    collection_name=collection_name,
+                    milvus_instance=DBDocumentPermissionLevel.PUBLIC.value
+                )
+            except Exception as e:
+                logger.debug(f"Public instance delete failed (expected if not public): {e}")
+                public_result = False
+            
+            try:
+                private_result = await self.bulk_delete_by_filter(
+                    filter_expr=filter_expr,
+                    collection_name=collection_name,
+                    milvus_instance=DBDocumentPermissionLevel.PRIVATE.value
+                )
+            except Exception as e:
+                logger.debug(f"Private instance delete failed (expected if not private): {e}")
+                private_result = False
+            
+            success = public_result or private_result
+            if success:
+                logger.info(f"Successfully deleted vectors for document {document_id} from {collection_name}")
+            else:
+                logger.warning(f"No vectors found for document {document_id} in {collection_name}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error deleting document vectors: {e}")
+            raise
 
     def clear_cache(self):
         """Clear collection existence cache"""

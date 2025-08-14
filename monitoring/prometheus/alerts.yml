@@ -1,0 +1,29 @@
+groups:
+  - name: api-alerts
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: High 5xx error rate detected
+          description: API 5xx rate is high over the last 5 minutes.
+
+      - alert: HighApiCpuUsage
+        expr: sum(irate(container_cpu_usage_seconds_total{name=~".*api.*"}[5m])) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: API container high CPU usage
+          description: API CPU usage > 80% for 5 minutes.
+
+      - alert: HighApiMemoryUsage
+        expr: (container_memory_usage_bytes{name=~".*api.*"} / 1024 / 1024) > 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: API container high memory usage
+          description: API memory usage > 1 GiB for 5 minutes. 

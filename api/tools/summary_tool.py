@@ -7,9 +7,8 @@ from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain_core.prompts import PromptTemplate
 from langchain_core.language_models import BaseLanguageModel
-from langchain_core.documents import Document
-from pydantic import BaseModel, Field
-from api.models.models import SummaryInput
+from pydantic import BaseModel
+from models.models import SummaryInput
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -20,13 +19,14 @@ class SummaryTool(BaseTool):
     Summary tool for text summarization
     Provides various types of text summarization including concise, bullet points, detailed summaries
     """
-    name = "summary"
-    description = "Summarizes text content in various formats including concise summaries, bullet points, and detailed analysis."
+    name: str = "summary"
+    description: str = "Summarizes text content in various formats including concise summaries, bullet points, and detailed analysis."
     args_schema: Type[BaseModel] = SummaryInput
+
+    llm: Optional[BaseLanguageModel] = None
     
     def __init__(self, llm: Optional[BaseLanguageModel] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.llm = llm
+        super().__init__(llm=llm, **kwargs)
         logger.info("Initialized summary tool")
 
     def _create_summary_prompt(self, summary_type: str, max_length: Optional[int] = None, 

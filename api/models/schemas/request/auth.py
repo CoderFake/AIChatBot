@@ -2,13 +2,12 @@
 Authentication request schemas
 """
 from typing import Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class LoginRequest(BaseModel):
-    """Login request schema"""
-    username: str
-    password: str
+    username: str = Field(..., description="Username")
+    password: str = Field(..., description="Password")
     
     @field_validator('username')
     @classmethod
@@ -38,8 +37,7 @@ class RefreshTokenRequest(BaseModel):
 
 
 class LogoutRequest(BaseModel):
-    """Logout request schema"""
-    pass
+    token: str = Field(..., description="Bearer token to revoke")
 
 
 class ChangePasswordRequest(BaseModel):

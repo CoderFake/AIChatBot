@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, Type, Union
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from pydantic import BaseModel
-from api.models.models import CalculatorInput
+from models.models import CalculatorInput
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -19,8 +19,8 @@ class CalculatorTool(BaseTool):
     Calculator tool for performing mathematical calculations
     Supports basic arithmetic operations and common mathematical functions
     """
-    name = "calculator"
-    description = "Performs mathematical calculations. Input should be a valid mathematical expression."
+    name: str = "calculator"
+    description: str = "Performs mathematical calculations. Input should be a valid mathematical expression."
     args_schema: Type[BaseModel] = CalculatorInput
     
     _operators = {
@@ -145,7 +145,7 @@ class CalculatorTool(BaseTool):
         Args:
             expression: Mathematical expression to evaluate
             run_manager: Optional callback manager for tool run
-            
+        
         Returns:
             String representation of the calculation result
         """
@@ -170,7 +170,7 @@ class CalculatorTool(BaseTool):
         Args:
             expression: Mathematical expression to evaluate
             run_manager: Optional async callback manager for tool run
-            
+        
         Returns:
             String representation of the calculation result
         """

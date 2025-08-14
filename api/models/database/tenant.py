@@ -27,6 +27,22 @@ class Tenant(BaseModel):
         comment="Tenant description"
     )
     
+    timezone = Column(
+        String(50),
+        nullable=False,
+        default="UTC",
+        server_default=text("'UTC'"),
+        comment="Tenant timezone (e.g. Asia/Ho_Chi_Minh)"
+    )
+    
+    locale = Column(
+        String(10),
+        nullable=False,
+        default="en_US",
+        server_default=text("'en_US'"),
+        comment="Tenant locale (e.g. vi_VN, en_US)"
+    )
+    
     is_active = Column(
         Boolean,
         nullable=False,
@@ -41,6 +57,7 @@ class Tenant(BaseModel):
         comment="Tenant configuration settings"
     )
     
+    # Relationships
     departments = relationship(
         "Department",
         back_populates="tenant",
@@ -65,8 +82,21 @@ class Tenant(BaseModel):
         cascade="all, delete-orphan"
     )
     
+    workflow_agent = relationship(
+        "WorkflowAgent",
+        back_populates="tenant",
+        uselist=False,
+        cascade="all, delete-orphan"
+    )
+
+    chat_sessions = relationship(
+        "ChatSession",
+        back_populates="tenant"
+    )
+    
     __table_args__ = (
         Index('idx_tenant_active', 'is_active'),
+        Index('idx_tenant_timezone', 'timezone'),
     )
     
     def __repr__(self) -> str:

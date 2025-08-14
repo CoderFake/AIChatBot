@@ -7,7 +7,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from pydantic import BaseModel
 import pytz
-from api.models.models import DateTimeInput
+from models.models import DateTimeInput
 from utils.logging import get_logger
 
 
@@ -19,8 +19,8 @@ class DateTimeTool(BaseTool):
     DateTime tool for date and time operations
     Supports various datetime operations including formatting, timezone conversion, arithmetic, etc.
     """
-    name = "datetime"
-    description = "Performs date and time operations including getting current time, formatting, timezone conversion, and date arithmetic."
+    name: str = "datetime"
+    description: str = "Performs date and time operations including getting current time, formatting, timezone conversion, and date arithmetic."
     args_schema: Type[BaseModel] = DateTimeInput
     
     def __init__(self, **kwargs):

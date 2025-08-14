@@ -1,6 +1,7 @@
 """
 Authentication Middleware for FastAPI
 JWT-based authentication with role verification for Depends()
+Integrates AuthService for authentication and ValidatePermission for authorization
 """
 from typing import Optional, Dict, Any, List
 from fastapi import HTTPException, Depends, status
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.database import get_db
 from config.settings import get_settings
 from common.types import UserRole
+from services.auth.auth_service import AuthService
 from services.auth.validate_permission import ValidatePermission
 from utils.logging import get_logger
 
@@ -22,7 +24,7 @@ security = HTTPBearer()
 
 class JWTAuth:
     """
-    JWT authentication handler
+    JWT authentication handler with AuthService integration
     """
     
     @staticmethod
@@ -50,34 +52,66 @@ class JWTAuth:
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """
-        Get current user from JWT token
-        Returns user context with role information
+        Get current user from JWT token with comprehensive validation:
+        1. Decode JWT token
+        2. Check token blacklist via AuthService
+        3. Validate user status via AuthService
         """
         try:
             token = credentials.credentials
             payload = JWTAuth.decode_token(token)
             
             user_id = payload.get("user_id")
+            jti = payload.get("jti")  
             role = payload.get("role")
             tenant_id = payload.get("tenant_id")
             department_id = payload.get("department_id")
             
-            if not user_id or not role:
+            if not user_id or not role or not jti:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid token payload"
+                    detail="Invalid token payload - missing required fields"
                 )
+            
+            # Use AuthService for comprehensive token validation
+            auth_service = AuthService(db)
+            
+            # Check token blacklist and user status
+            token_validation = await auth_service.validate_token(jti, user_id)
+            
+            if not token_validation.get("valid"):
+                reason = token_validation.get("reason", "token_invalid")
+                message = token_validation.get("message", "Token validation failed")
+                
+                logger.warning(f"Token validation failed for user {user_id}: {reason}")
+                
+                # Map different failure reasons to appropriate HTTP status
+                if reason == "token_blacklisted":
+                    status_code = status.HTTP_401_UNAUTHORIZED
+                    detail = "Token has been revoked"
+                elif reason in ["user_deleted", "user_inactive"]:
+                    status_code = status.HTTP_403_FORBIDDEN
+                    detail = message
+                else:
+                    status_code = status.HTTP_401_UNAUTHORIZED
+                    detail = "Authentication failed"
+                
+                raise HTTPException(status_code=status_code, detail=detail)
             
             user_context = {
                 "user_id": user_id,
+                "jti": jti,
                 "role": role,
                 "tenant_id": tenant_id,
                 "department_id": department_id,
                 "email": payload.get("email"),
-                "username": payload.get("username")
+                "username": payload.get("username"),
+                "token_validated": True,
+                "validation_timestamp": payload.get("iat"),
+                "expires_at": payload.get("exp")
             }
             
-            logger.debug(f"Authenticated user: {user_id} with role: {role}")
+            logger.debug(f"Authentication successful: user {user_id} with role {role}")
             return user_context
             
         except HTTPException:
@@ -174,25 +208,26 @@ class RoleRequired:
 class MaintainerOnly:
     """
     Require MAINTAINER role with specific permissions
+    Uses AuthService for authentication and ValidatePermission for authorization
     """
     def __init__(self, required_permissions: List[str] = None):
         self.required_permissions = required_permissions or []
     
     async def __call__(
         self,
-        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user),
+        credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
+        user_context = await JWTAuth.get_current_user(credentials, db)
+        
         user_role = user_context.get("role")
         
-        # Check role hierarchy first
         if user_role != UserRole.MAINTAINER.value:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="MAINTAINER role required"
             )
         
-        # Check specific permissions if provided
         if self.required_permissions:
             validate_permission = ValidatePermission(db)
             result = await validate_permission.check_user_has_permissions(
@@ -220,18 +255,22 @@ class MaintainerOnly:
 class AdminOnly:
     """
     Require ADMIN role (or higher) with specific permissions
+    Uses AuthService for authentication and ValidatePermission for authorization
     """
     def __init__(self, required_permissions: List[str] = None):
         self.required_permissions = required_permissions or []
     
     async def __call__(
         self,
-        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user),
+        credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
+        # Step 1: Authentication via JWTAuth (includes token blacklist + user status check)
+        user_context = await JWTAuth.get_current_user(credentials, db)
+        
         user_role = user_context.get("role")
         
-        # Check role hierarchy - MAINTAINER can also access ADMIN endpoints
+        # Step 2: Role hierarchy check - MAINTAINER can also access ADMIN endpoints
         allowed_roles = [UserRole.ADMIN.value, UserRole.MAINTAINER.value]
         if user_role not in allowed_roles:
             raise HTTPException(
@@ -239,7 +278,7 @@ class AdminOnly:
                 detail="ADMIN role or higher required"
             )
         
-        # Check specific permissions if provided
+        # Step 3: Specific permissions check if provided
         if self.required_permissions:
             validate_permission = ValidatePermission(db)
             result = await validate_permission.check_user_has_permissions(
@@ -395,7 +434,9 @@ class RequireUser:
 class ValidateApiPermission:
     """
     Advanced permission validation for API endpoints
-    Uses ValidatePermission class for detailed permission checking
+    Complete flow: Authentication -> Authorization
+    1. AuthService: Check token blacklist + user status
+    2. ValidatePermission: Check endpoint permissions
     """
     
     def __init__(self, endpoint_path: str, http_method: str):
@@ -404,13 +445,17 @@ class ValidateApiPermission:
     
     async def __call__(
         self,
-        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user),
+        credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """
-        Validate API access with detailed permission checking
+        Complete validation flow:
+        1. JWT decode + token blacklist check + user status (AuthService)
+        2. Endpoint permission validation (ValidatePermission)
         """
         try:
+            user_context = await JWTAuth.get_current_user(credentials, db)
+            
             validate_permission = ValidatePermission(db)
             
             validation_result = await validate_permission.validate_api_access(
@@ -433,7 +478,6 @@ class ValidateApiPermission:
                     detail=validation_result.get("reason", "Access denied")
                 )
             
-            # Add validation info to user context
             user_context.update({
                 "validated_permissions": validation_result.get("user_permissions", []),
                 "permission_validation": validation_result,
@@ -441,7 +485,7 @@ class ValidateApiPermission:
             })
             
             logger.info(
-                f"Permission validation passed for user {user_context.get('user_id')} "
+                f"Complete validation passed for user {user_context.get('user_id')} "
                 f"on {self.http_method} {self.endpoint_path}"
             )
             
@@ -450,7 +494,7 @@ class ValidateApiPermission:
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Permission validation failed: {e}")
+            logger.error(f"API permission validation failed: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Permission validation failed"
@@ -460,7 +504,7 @@ class ValidateApiPermission:
 class RequirePermission:
     """
     Require specific permission for endpoint access
-    Direct permission checking without role hierarchy
+    Complete flow: Authentication -> Permission Check
     """
     
     def __init__(self, permission_code: str):
@@ -468,28 +512,38 @@ class RequirePermission:
     
     async def __call__(
         self,
-        user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user),
+        credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """
-        Check if user has specific permission
+        Check specific permission with authentication
         """
         try:
+            user_context = await JWTAuth.get_current_user(credentials, db)
             validate_permission = ValidatePermission(db)
             
-            has_permission = await validate_permission.check_user_permission(
+            result = await validate_permission.check_user_has_permissions(
                 user_id=user_context.get("user_id"),
-                permission_code=self.permission_code
+                required_permissions=[self.permission_code],
+                user_role=user_context.get("role"),
+                require_all=True,
+                tenant_id=user_context.get("tenant_id")
             )
             
-            if not has_permission:
+            if not result.get("allowed"):
                 logger.warning(
-                    f"Permission {self.permission_code} denied for user {user_context.get('user_id')}"
+                    f"Permission {self.permission_code} denied for user {user_context.get('user_id')}: "
+                    f"{result.get('reason', 'Permission check failed')}"
                 )
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Missing required permission: {self.permission_code}"
                 )
+            
+            user_context.update({
+                "validated_permissions": result.get("matched_permissions", []),
+                "permission_validation": result
+            })
             
             logger.info(
                 f"Permission {self.permission_code} granted for user {user_context.get('user_id')}"
@@ -510,11 +564,9 @@ class RequirePermission:
 jwt_auth = JWTAuth()
 require_user = RequireUser()
 
-# Dependency exports for easy use in endpoints
 GetCurrentUser = Depends(jwt_auth.get_current_user)
 AuthenticatedUser = Depends(require_user)
 
-# Permission-based role dependencies (factory functions)
 def RequireMaintainer(required_permissions: List[str] = None):
     """Factory function for MAINTAINER role with specific permissions"""
     return Depends(MaintainerOnly(required_permissions))

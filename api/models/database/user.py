@@ -112,8 +112,24 @@ class User(BaseModel):
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
     department = relationship("Department", back_populates="users")
-    permissions = relationship("UserPermission", back_populates="user", cascade="all, delete-orphan")
-    group_memberships = relationship("UserGroupMembership", back_populates="user", cascade="all, delete-orphan")
+    permissions = relationship(
+        "UserPermission",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="UserPermission.user_id",
+    )
+    group_memberships = relationship(
+        "UserGroupMembership",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="UserGroupMembership.user_id",
+    )
+    chat_sessions = relationship("ChatSession", back_populates="user")
+    documents = relationship(
+        "Document",
+        back_populates="uploaded_by_user",
+        foreign_keys="Document.uploaded_by",
+    )
     
     __table_args__ = (
         UniqueConstraint('username', name='uq_user_username'),

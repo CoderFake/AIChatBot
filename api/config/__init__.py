@@ -1,20 +1,6 @@
 """
-Configuration management service package
-Real-time configuration updates và component reload
+Configuration package
+Lightweight __init__ to avoid side-effect imports. Import submodules explicitly where needed.
 """
 
-from .config_manager import (
-    ConfigManager,
-    ConfigSubscriber, 
-    ConfigChange,
-    ConfigChangeType,
-    config_manager
-)
-
-__all__ = [
-    "ConfigManager",
-    "ConfigSubscriber",
-    "ConfigChange", 
-    "ConfigChangeType",
-    "config_manager"
-]
+__all__ = []

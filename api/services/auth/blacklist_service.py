@@ -1,450 +1,199 @@
 """
-Permission Service
-Manages permissions and tenant configurations
+Token Blacklist Service
+Manages token blacklisting and validation for security
+All token operations use UTC timezone for consistency
 """
-from typing import List, Dict, Any, Optional, Set
+from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, delete
-from sqlalchemy.orm import joinedload
-from datetime import datetime
-import uuid
+from sqlalchemy import select, delete, and_
+from datetime import datetime, timedelta
 
-from models.database.user import User
-from models.database.permission import Permission, Group, UserPermission, GroupPermission, UserGroupMembership
-from models.database.tenant import Tenant, Department
-from models.database.tool import Tool, TenantToolConfig
-from models.database.provider import Provider, TenantProviderConfig
-from common.types import (
-    AccessLevel,
-    UserRole,
-    RolePermissions,
-    DefaultGroupNames,
-    DefaultProviderConfig,
-    DBDocumentPermissionLevel
-)
-from config.settings import get_settings
+from models.database.user import TokenBlacklist
+from utils.datetime_utils import DateTimeManager
 from utils.logging import get_logger
-from core.exceptions import PermissionDeniedError, NotFoundError
 
 logger = get_logger(__name__)
-settings = get_settings()
 
 
-class PermissionService:
+class TokenBlacklistService:
     """
-    Service for managing permissions and tenant configurations
-    Uses correct database model names and relationships
+    Service for managing token blacklist operations
+    All token operations use UTC timezone to prevent timezone-related validation errors
     """
     
     def __init__(self, db: AsyncSession):
         self.db = db
     
-    async def create_tenant_with_defaults(
-        self,
-        tenant_name: str,
-        created_by: str,
-        config: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Create new tenant with default permissions and configurations
-        Sets up default groups, roles, and tool/provider access
-        """
-        try:
-            tenant = Tenant(
-                id=str(uuid.uuid4()),
-                tenant_name=tenant_name,
-                config=config or {},
-                is_active=True,
-                created_at=datetime.utcnow(),
-                created_by=created_by
-            )
-            self.db.add(tenant)
-            
-            default_groups = await self._create_default_groups(tenant.id)
-            
-            await self._setup_default_permissions(tenant.id, default_groups)
-            
-            await self._setup_default_tools(tenant.id)
-            
-            await self._setup_default_provider(tenant.id)
-            
-            await self.db.commit()
-            
-            logger.info(f"Created tenant {tenant_name} with defaults")
-            
-            return {
-                "tenant_id": tenant.id,
-                "tenant_name": tenant.tenant_name,
-                "groups": default_groups,
-                "status": "created"
-            }
-            
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Failed to create tenant: {e}")
-            raise
-    
-    async def _create_default_groups(self, tenant_id: str) -> Dict[str, str]:
-        """
-        Create default groups for tenant
-        Uses Group model from database
-        """
-        try:
-            default_groups = {}
-            
-            groups_to_create = [
-                ("ADMIN", DefaultGroupNames.ADMIN, "ROLE"), 
-                ("DEPT_ADMIN", DefaultGroupNames.DEPT_ADMIN, "ROLE"),
-                ("DEPT_MANAGER", DefaultGroupNames.DEPT_MANAGER, "ROLE"),
-                ("USER", DefaultGroupNames.USER, "ROLE")
-            ]
-            
-            for group_code, group_name, group_type in groups_to_create:
-                group = Group(
-                    id=str(uuid.uuid4()),
-                    group_code=f"{tenant_id}_{group_code}",
-                    group_name=group_name,
-                    description=DefaultGroupNames.DESCRIPTIONS.get(group_name, f"Default {group_name} group"),
-                    group_type=group_type,
-                    is_system=True,
-                    created_at=datetime.utcnow()
-                )
-                self.db.add(group)
-                default_groups[group_code] = str(group.id)
-            
-            logger.info(f"Created {len(default_groups)} default groups for tenant {tenant_id}")
-            return default_groups
-            
-        except Exception as e:
-            logger.error(f"Failed to create default groups: {e}")
-            raise
-    
-    async def _setup_default_permissions(self, tenant_id: str, groups: Dict[str, str]) -> None:
-        """
-        Setup default permissions for groups
-        Uses Permission, GroupPermission models
-        MAINTAINER permissions are system-wide, not tenant-specific
-        """
-        try:
-            result = await self.db.execute(select(Permission))
-            all_permissions = {p.permission_code: p for p in result.scalars().all()}
-            
-            role_permissions = {
-                "ADMIN": RolePermissions.ADMIN_PERMISSIONS,
-                "DEPT_ADMIN": RolePermissions.DEPT_ADMIN_PERMISSIONS,
-                "DEPT_MANAGER": RolePermissions.DEPT_MANAGER_PERMISSIONS,
-                "USER": RolePermissions.USER_PERMISSIONS
-            }
-            
-            for role, permissions in role_permissions.items():
-                if role in groups:
-                    group_id = groups[role]
-                    
-                    for permission_code in permissions:
-                        if hasattr(permission_code, 'value'):
-                            permission_code = permission_code.value
-                        
-                        if permission_code in all_permissions:
-                            group_permission = GroupPermission(
-                                id=str(uuid.uuid4()),
-                                group_id=group_id,
-                                permission_id=str(all_permissions[permission_code].id),
-                                granted_by=None,
-                                created_at=datetime.utcnow()
-                            )
-                            self.db.add(group_permission)
-            
-            logger.info(f"Setup default permissions for tenant {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup default permissions: {e}")
-            raise
-    
-    async def _setup_default_tools(self, tenant_id: str) -> None:
-        """
-        Setup default tool configurations for tenant
-        Uses Tool, TenantToolConfig models
-        """
-        try:
-            result = await self.db.execute(
-                select(Tool).where(Tool.is_enabled == True)
-            )
-            tools = result.scalars().all()
-            
-            # Enable default categories at tenant level (example policy)
-            for tool in tools:
-                is_enabled = tool.category in ["document_tools", "calculation_tools"]
-                t_config = TenantToolConfig(
-                    id=str(uuid.uuid4()),
-                    tenant_id=str(tenant_id),
-                    tool_id=str(tool.id),
-                    is_enabled=is_enabled,
-                    config_data={},
-                    usage_limits={},
-                    created_at=datetime.utcnow()
-                )
-                self.db.add(t_config)
-            
-            logger.info(f"Setup default tools for tenant {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup default tools: {e}")
-            raise
-
-    async def _setup_default_provider(self, tenant_id: str) -> None:
-        """
-        Setup default provider configuration (Gemini) at tenant-level
-        Uses Provider, TenantProviderConfig models
-        """
-        try:
-            result = await self.db.execute(
-                select(Provider).where(Provider.provider_name == "gemini")
-            )
-            provider = result.scalar_one_or_none()
-            
-            if not provider:
-                logger.warning("Gemini provider not found, skipping default setup")
-                return
-            
-            t_provider_config = TenantProviderConfig(
-                id=str(uuid.uuid4()),
-                tenant_id=str(tenant_id),
-                provider_id=str(provider.id),
-                is_enabled=True,
-                api_keys=DefaultProviderConfig.get_default_api_keys() if hasattr(DefaultProviderConfig, 'get_default_api_keys') else [],
-                current_key_index=0,
-                rotation_strategy="round_robin",
-                config_data=DefaultProviderConfig.get_default_config() if hasattr(DefaultProviderConfig, 'get_default_config') else {},
-                created_at=datetime.utcnow()
-            )
-            self.db.add(t_provider_config)
-            
-            logger.info(f"Setup default provider for tenant {tenant_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to setup default provider: {e}")
-            raise
-    
-    async def check_user_permission(
-        self,
-        user_id: str,
-        permission_code: str,
-        resource_context: Optional[Dict[str, Any]] = None
-    ) -> bool:
-        """
-        Check if user has specific permission
-        """
-        try:
-            result = await self.db.execute(
-                select(User)
-                .options(
-                    joinedload(User.permissions).joinedload(UserPermission.permission),
-                    joinedload(User.group_memberships).joinedload(UserGroupMembership.group)
-                    .joinedload(Group.permissions).joinedload(GroupPermission.permission)
-                )
-                .where(User.id == user_id)
-                .where(User.is_active == True)
-            )
-            
-            user = result.scalar_one_or_none()
-            if not user:
-                return False
-            
-            user_permissions = {up.permission.permission_code for up in user.permissions if up.permission}
-            if permission_code in user_permissions:
-                return True
-            
-            for membership in user.group_memberships:
-                if membership.group and membership.group.permissions:
-                    group_permissions = {gp.permission.permission_code for gp in membership.group.permissions if gp.permission}
-                    if permission_code in group_permissions:
-                        return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to check user permission: {e}")
-            return False
-    
-    async def get_user_permissions(self, user_id: str) -> Set[str]:
-        """
-        Get all permissions for user
-        """
-        try:
-            result = await self.db.execute(
-                select(User)
-                .options(
-                    joinedload(User.permissions).joinedload(UserPermission.permission),
-                    joinedload(User.group_memberships).joinedload(UserGroupMembership.group)
-                    .joinedload(Group.permissions).joinedload(GroupPermission.permission)
-                )
-                .where(User.id == user_id)
-                .where(User.is_active == True)
-            )
-            
-            user = result.scalar_one_or_none()
-            if not user:
-                return set()
-            
-            permissions = set()
-            
-            for up in user.permissions:
-                if up.permission:
-                    permissions.add(up.permission.permission_code)
-            
-            for membership in user.group_memberships:
-                if membership.group and membership.group.permissions:
-                    for gp in membership.group.permissions:
-                        if gp.permission:
-                            permissions.add(gp.permission.permission_code)
-            
-            return permissions
-            
-        except Exception as e:
-            logger.error(f"Failed to get user permissions: {e}")
-            return set()
-    
-    async def assign_user_to_group(
+    async def blacklist_token(
         self, 
+        jti: str, 
+        token_type: str, 
         user_id: str, 
-        group_id: str, 
-        added_by: Optional[str] = None,
-        role_in_group: str = "MEMBER"
+        expires_at: datetime,
+        reason: str = "logout"
     ) -> bool:
         """
-        Assign user to group
+        Add token to blacklist using UTC timezone
         """
         try:
-            existing = await self.db.execute(
-                select(UserGroupMembership)
-                .where(
-                    and_(
-                        UserGroupMembership.user_id == user_id,
-                        UserGroupMembership.group_id == group_id
-                    )
-                )
-            )
-            
-            if existing.scalar_one_or_none():
-                logger.warning(f"User {user_id} already in group {group_id}")
-                return False
-            
-            membership = UserGroupMembership(
-                id=str(uuid.uuid4()),
+            blacklist_entry = TokenBlacklist(
+                jti=jti,
+                token_type=token_type,
                 user_id=user_id,
-                group_id=group_id,
-                added_by=added_by,
-                role_in_group=role_in_group,
-                created_at=datetime.utcnow()
+                expires_at=expires_at,
+                reason=reason
             )
             
-            self.db.add(membership)
+            self.db.add(blacklist_entry)
             await self.db.commit()
             
-            logger.info(f"User {user_id} assigned to group {group_id}")
+            logger.info(f"Token blacklisted: JTI={jti}, user={user_id}, reason={reason}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to assign user to group: {e}")
+            logger.error(f"Failed to blacklist token {jti}: {e}")
             await self.db.rollback()
             return False
     
-    async def remove_user_from_group(self, user_id: str, group_id: str) -> bool:
+    async def is_token_blacklisted(self, jti: str) -> bool:
         """
-        Remove user from group
+        Check if token is blacklisted using UTC timezone comparison
         """
         try:
             result = await self.db.execute(
-                delete(UserGroupMembership)
-                .where(
+                select(TokenBlacklist).where(
                     and_(
-                        UserGroupMembership.user_id == user_id,
-                        UserGroupMembership.group_id == group_id
+                        TokenBlacklist.jti == jti,
+                        TokenBlacklist.expires_at > DateTimeManager._now()
                     )
                 )
             )
             
-            if result.rowcount > 0:
-                await self.db.commit()
-                logger.info(f"User {user_id} removed from group {group_id}")
-                return True
-            else:
-                logger.warning(f"No membership found for user {user_id} in group {group_id}")
-                return False
+            blacklisted = result.scalar_one_or_none() is not None
+            
+            if blacklisted:
+                logger.debug(f"Token {jti} is blacklisted")
+            
+            return blacklisted
             
         except Exception as e:
-            logger.error(f"Failed to remove user from group: {e}")
+            logger.error(f"Error checking token blacklist for {jti}: {e}")
+            return True
+    
+    async def revoke_all_user_tokens(self, user_id: str, reason: str = "admin_revoke") -> bool:
+        """
+        Revoke all tokens for a user using UTC timezone
+        """
+        try:
+            revoke_entry = TokenBlacklist(
+                jti=f"revoke_all_{user_id}_{int(DateTimeManager._now().timestamp())}",
+                token_type="revoke_all",
+                user_id=user_id,
+                expires_at=DateTimeManager._now() + timedelta(days=30),
+                reason=reason
+            )
+            
+            self.db.add(revoke_entry)
+            await self.db.commit()
+            
+            logger.info(f"Revoked all tokens for user {user_id}, reason: {reason}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to revoke all tokens for user {user_id}: {e}")
             await self.db.rollback()
             return False
-
-
-class RAGPermissionService:
-    """
-    RAG-specific permission service for document access
-    """
     
-    def __init__(self, db: AsyncSession):
-        self.db = db
-    
-    async def get_user_document_access_levels(
-        self, 
-        user_id: str, 
-        department: str
-    ) -> List[DBDocumentPermissionLevel]:
+    async def cleanup_expired_tokens(self) -> int:
         """
-        Get document access levels for user in department
+        Clean up expired tokens from blacklist using UTC timezone
         """
         try:
-            permission_service = PermissionService(self.db)
-            user_permissions = await permission_service.get_user_permissions(user_id)
+            current_time = DateTimeManager._now()
             
-            access_levels = []
+            result = await self.db.execute(
+                delete(TokenBlacklist).where(
+                    TokenBlacklist.expires_at <= current_time
+                )
+            )
             
-            if any(perm in user_permissions for perm in [
-                "document.public.read", "chat.public"
-            ]):
-                access_levels.append(DBDocumentPermissionLevel.PUBLIC)
+            await self.db.commit()
+            deleted_count = result.rowcount
             
-            if any(perm in user_permissions for perm in [
-                "document.private.read", "chat.private"
-            ]):
-                access_levels.append(DBDocumentPermissionLevel.PRIVATE)
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} expired tokens")
             
-            return access_levels if access_levels else [DBDocumentPermissionLevel.PUBLIC]
+            return deleted_count
             
         except Exception as e:
-            logger.error(f"Failed to get document access levels: {e}")
-            return [DBDocumentPermissionLevel.PUBLIC]
+            logger.error(f"Token cleanup failed: {e}")
+            await self.db.rollback()
+            return 0
     
-    async def check_document_access(
-        self,
-        user_id: str,
-        document_access_level: str,
-        document_department: str,
-        user_department: str
-    ) -> bool:
+    async def get_user_blacklisted_tokens(self, user_id: str) -> List[dict]:
         """
-        Check if user can access document based on access level and department
+        Get all blacklisted tokens for a user
         """
         try:
-            if document_access_level == AccessLevel.PUBLIC.value:
-                return True
+            result = await self.db.execute(
+                select(TokenBlacklist).where(
+                    and_(
+                        TokenBlacklist.user_id == user_id,
+                        TokenBlacklist.expires_at > DateTimeManager._now()
+                    )
+                ).order_by(TokenBlacklist.created_at.desc())
+            )
             
-            if document_access_level == AccessLevel.PRIVATE.value:
-                return document_department == user_department
+            tokens = result.scalars().all()
             
-            permission_service = PermissionService(self.db)
-            user_permissions = await permission_service.get_user_permissions(user_id)
+            return [
+                {
+                    "jti": token.jti,
+                    "token_type": token.token_type,
+                    "reason": token.reason,
+                    "expires_at": token.expires_at.isoformat(),
+                    "created_at": token.created_at.isoformat()
+                }
+                for token in tokens
+            ]
             
-            required_permissions = {
-                AccessLevel.PRIVATE.value: ["document.private.read", "chat.private"]
+        except Exception as e:
+            logger.error(f"Failed to get blacklisted tokens for user {user_id}: {e}")
+            return []
+    
+    async def get_blacklist_stats(self) -> dict:
+        """
+        Get statistics about token blacklist
+        """
+        try:
+            current_time = DateTimeManager._now()
+            
+            active_result = await self.db.execute(
+                select(TokenBlacklist).where(
+                    TokenBlacklist.expires_at > current_time
+                )
+            )
+            active_count = len(active_result.scalars().all())
+            
+            expired_result = await self.db.execute(
+                select(TokenBlacklist).where(
+                    TokenBlacklist.expires_at <= current_time
+                )
+            )
+            expired_count = len(expired_result.scalars().all())
+            
+            return {
+                "active_blacklisted_tokens": active_count,
+                "expired_tokens": expired_count,
+                "total_tokens": active_count + expired_count,
+                "last_checked": current_time.isoformat()
             }
             
-            if document_access_level in required_permissions:
-                return any(perm in user_permissions for perm in required_permissions[document_access_level])
-            
-            return False
-            
         except Exception as e:
-            logger.error(f"Failed to check document access: {e}")
-            return False
+            logger.error(f"Failed to get blacklist stats: {e}")
+            return {
+                "active_blacklisted_tokens": 0,
+                "expired_tokens": 0,
+                "total_tokens": 0,
+                "error": str(e)
+            }

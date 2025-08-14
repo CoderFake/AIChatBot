@@ -193,7 +193,6 @@ class ValidatePermission:
         Validate access based on user context
         """
         try:
-            # Basic context validations
             if required_context:
                 if required_context.get("requires_department") and not department_id:
                     if user_role not in ["MAINTAINER", "ADMIN"]:
@@ -274,17 +273,14 @@ class ValidatePermission:
             if isinstance(cached, list):
                 return cached
             
-            # Compose from DB and role-derived
             db_perms = await self.get_user_permissions(user_id)
             role_perms = self._get_role_permissions(user_role)
             all_perms = sorted(set(db_perms) | set(role_perms))
             
-            # Store without TTL to avoid surprise eviction; rely on invalidation on changes
             await cache_manager.set(cache_key, all_perms)
             return all_perms
         except Exception as e:
             logger.warning(f"Failed to build effective permissions cache for {user_id}: {e}")
-            # Fallback to direct computation
             db_perms = await self.get_user_permissions(user_id)
             role_perms = self._get_role_permissions(user_role)
             return sorted(set(db_perms) | set(role_perms))
@@ -299,6 +295,5 @@ class ValidatePermission:
                 else:
                     normalized.append(str(c))
             except Exception:
-                # best-effort
                 normalized.append(str(c))
         return normalized

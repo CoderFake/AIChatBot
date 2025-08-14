@@ -59,7 +59,6 @@ class Tool(BaseModel):
         comment="Base tool configuration"
     )
     
-    # Relationships (tenant-level policy)
     tenant_configs = relationship(
         "TenantToolConfig",
         back_populates="tool",

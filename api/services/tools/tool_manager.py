@@ -1,4 +1,3 @@
-# api/services/tools/tool_manager.py
 """
 Tool Manager Service
 Database-driven tool management with ID-based operations
@@ -8,11 +7,12 @@ from sqlalchemy import and_
 from datetime import datetime
 import json
 
-from models.database.tool import Tool, DepartmentToolConfig
+from models.database.tool import Tool, TenantToolConfig
 from models.database.tenant import Department
-from api.tools.tool_registry import tool_registry
+from tools.tool_registry import tool_registry
 from utils.logging import get_logger
 from config.database import get_db_context
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 
@@ -46,7 +46,7 @@ class ToolManager:
         """Check if tool cache is still valid"""
         if not self._cache_timestamp:
             return False
-        return (datetime.now() - self._cache_timestamp).seconds < self._cache_ttl
+        return (DateTimeManager.system_now() - self._cache_timestamp).seconds < self._cache_ttl
     
     async def _refresh_tool_cache(self):
         """Refresh tool cache from database"""
@@ -62,27 +62,29 @@ class ToolManager:
                 
                 for tool in tools:
                     dept_configs = (
-                        db.query(DepartmentToolConfig)
+                        db.query(TenantToolConfig)
                         .join(Department)
                         .filter(
                             and_(
-                                DepartmentToolConfig.tool_id == tool.id,
-                                DepartmentToolConfig.is_enabled == True
+                                TenantToolConfig.tool_id == tool.id,
+                                TenantToolConfig.is_enabled == True
                             )
                         )
                         .all()
                     )
                     
                     department_configs = {}
-                    for dept_config in dept_configs:
-                        department_configs[str(dept_config.department_id)] = {
-                            "config_id": str(dept_config.id),
-                            "department_name": dept_config.department.department_name,
-                            "is_enabled": dept_config.is_enabled,
-                            "config_data": dept_config.config_data or {},
-                            "usage_limits": dept_config.usage_limits or {},
-                            "configured_by": str(dept_config.configured_by) if dept_config.configured_by else None,
-                            "configured_at": dept_config.created_at
+                    for tenant_config in dept_configs:
+                        # Lưu theo tenant (vì hiện chưa có bảng config theo department)
+                        tenant_key = str(tenant_config.tenant_id)
+                        department_configs[tenant_key] = {
+                            "config_id": str(tenant_config.id),
+                            "department_name": None,
+                            "is_enabled": tenant_config.is_enabled,
+                            "config_data": tenant_config.config_data or {},
+                            "usage_limits": tenant_config.usage_limits or {},
+                            "configured_by": str(tenant_config.configured_by) if tenant_config.configured_by else None,
+                            "configured_at": tenant_config.created_at
                         }
                     
                     self._tool_cache[str(tool.id)] = {
@@ -97,7 +99,7 @@ class ToolManager:
                         "department_configs": department_configs
                     }
                 
-                self._cache_timestamp = datetime.now()
+                self._cache_timestamp = DateTimeManager.system_now()
                 logger.info(f"Tool cache refreshed with {len(self._tool_cache)} enabled tools")
                 
         except Exception as e:
@@ -144,11 +146,10 @@ class ToolManager:
             
             for tool_id, tool_info in self._tool_cache.items():
                 dept_configs = tool_info.get("department_configs", {})
+                # Tạm thời ánh xạ department_id sang tenant_id nếu cần
+                dept_config = dept_configs.get(department_id) or next(iter(dept_configs.values()), None)
                 
-                if department_id in dept_configs:
-                    dept_config = dept_configs[department_id]
-                    
-                    if dept_config.get("is_enabled", False):
+                if dept_config and dept_config.get("is_enabled", False):
                         tool_data = {
                             "tool_id": tool_id,
                             "tool_name": tool_info["tool_name"],
@@ -184,11 +185,8 @@ class ToolManager:
                 return None
             
             dept_configs = tool_info.get("department_configs", {})
-            if department_id not in dept_configs:
-                return None
-            
-            dept_config = dept_configs[department_id]
-            if not dept_config.get("is_enabled", False):
+            dept_config = dept_configs.get(department_id) or next(iter(dept_configs.values()), None)
+            if not dept_config or not dept_config.get("is_enabled", False):
                 return None
             
             return self._tool_instances.get(tool_id)
@@ -208,7 +206,7 @@ class ToolManager:
             
             tool_info = self._tool_cache.get(tool_id, {})
             dept_configs = tool_info.get("department_configs", {})
-            dept_config = dept_configs.get(department_id, {})
+            dept_config = dept_configs.get(department_id) or next(iter(dept_configs.values()), {})
             
             base_config = tool_info.get("base_config", {})
             dept_specific_config = dept_config.get("config_data", {})

@@ -24,12 +24,12 @@ class ToolRegistry:
         Register all default tools
         Called during initialization
         """
-        from api.tools.calculator_tool import CalculatorTool
-        from api.tools.date_time_tool import DateTimeTool
-        from api.tools.weather_tool import WeatherTool
-        from api.tools.web_search_tool import WebSearchTool
-        from api.tools.summary_tool import SummaryTool
-        from api.tools.rag_tool import RAGSearchTool
+        from tools.calculator_tool import CalculatorTool
+        from tools.date_time_tool import DateTimeTool
+        from tools.weather_tool import WeatherTool
+        from tools.web_search_tool import WebSearchTool
+        from tools.summary_tool import SummaryTool
+        from tools.rag_tool import RAGSearchTool
         
         tools_to_register = [
             CalculatorTool(),

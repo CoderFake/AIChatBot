@@ -255,13 +255,6 @@ class Document(BaseModel):
         comment="Vector processing status: pending, processing, completed, failed"
     )
     
-    # Metadata
-    metadata = Column(
-        JSONB,
-        nullable=True,
-        comment="Additional document metadata"
-    )
-    
     chunk_count = Column(
         Integer,
         nullable=False,

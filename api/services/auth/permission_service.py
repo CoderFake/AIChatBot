@@ -26,6 +26,8 @@ from common.types import (
 from config.settings import get_settings
 from utils.logging import get_logger
 from services.cache.cache_manager import cache_manager
+from utils.datetime_utils import DateTimeManager
+from models.database.tenant import Department, Tenant
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -79,7 +81,6 @@ class PermissionService:
             roles: Set[UserRole] = set()
             for m in memberships:
                 if m.group and m.group.group_code:
-                    # Match by suffix _ROLE
                     for role in UserRole:
                         if m.group.group_code.endswith(f"_{role.name}"):
                             roles.add(role)
@@ -156,7 +157,7 @@ class PermissionService:
                 action=action,
                 is_system=is_system,
                 created_by=created_by,
-                created_at=datetime.utcnow()
+                created_at=await DateTimeManager.tenant_now_cached(None, self.db)
             )
             
             self.db.add(permission)
@@ -245,7 +246,7 @@ class PermissionService:
             if updated_by:
                 permission.updated_by = updated_by
             
-            permission.updated_at = datetime.utcnow()
+            permission.updated_at = await DateTimeManager.tenant_now_cached(None, self.db)
             
             await self.db.commit()
             await self.db.refresh(permission)
@@ -308,7 +309,7 @@ class PermissionService:
                 is_system=is_system,
                 settings=settings,
                 created_by=created_by,
-                created_at=datetime.utcnow()
+                created_at=await DateTimeManager.tenant_now_cached((await self._get_tenant_id_from_department(department_id)) if department_id else None, self.db)
             )
             
             self.db.add(group)
@@ -404,7 +405,12 @@ class PermissionService:
             if updated_by:
                 group.updated_by = updated_by
             
-            group.updated_at = datetime.utcnow()
+            tenant_id_for_group: Optional[str] = None
+            if group.department_id:
+                tenant_id_for_group = await self._get_tenant_id_from_department(group.department_id)
+                group.updated_at = await DateTimeManager.tenant_now_cached(tenant_id_for_group, self.db)
+            else:
+                group.updated_at = await DateTimeManager.tenant_now_cached(None, self.db)
             
             await self.db.commit()
             await self.db.refresh(group)
@@ -428,7 +434,6 @@ class PermissionService:
                 logger.warning(f"Cannot delete system group: {group.group_code}")
                 return False
             
-            # Invalidate caches of all members before deletion
             await self._invalidate_group_members_permission_cache(group_id)
             
             group.soft_delete()
@@ -457,7 +462,6 @@ class PermissionService:
     ) -> UserPermission:
         """Assign permission directly to user"""
         try:
-            # Check if permission already exists
             existing = await self.db.execute(
                 select(UserPermission)
                 .where(UserPermission.user_id == user_id)
@@ -476,14 +480,13 @@ class PermissionService:
                 expires_at=expires_at,
                 conditions=conditions,
                 created_by=granted_by,
-                created_at=datetime.utcnow()
+                created_at=await DateTimeManager.tenant_now_cached(await self._get_tenant_id_from_user(user_id), self.db)
             )
             
             self.db.add(user_permission)
             await self.db.commit()
             await self.db.refresh(user_permission)
             
-            # Invalidate user's permission cache
             await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Assigned permission {permission_id} to user {user_id}")
@@ -519,7 +522,6 @@ class PermissionService:
             
             await self.db.commit()
             
-            # Invalidate user's permission cache
             await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Revoked permission {permission_id} from user {user_id}")
@@ -556,7 +558,6 @@ class PermissionService:
     ) -> GroupPermission:
         """Assign permission to group"""
         try:
-            # Check if permission already exists
             existing = await self.db.execute(
                 select(GroupPermission)
                 .where(GroupPermission.group_id == group_id)
@@ -574,14 +575,13 @@ class PermissionService:
                 granted_by=granted_by,
                 conditions=conditions,
                 created_by=granted_by,
-                created_at=datetime.utcnow()
+                created_at=await DateTimeManager.tenant_now_cached(await self._get_tenant_id_from_group(group_id), self.db)
             )
             
             self.db.add(group_permission)
             await self.db.commit()
             await self.db.refresh(group_permission)
             
-            # Invalidate caches for all group members
             await self._invalidate_group_members_permission_cache(group_id)
             
             logger.info(f"Assigned permission {permission_id} to group {group_id}")
@@ -617,7 +617,6 @@ class PermissionService:
             
             await self.db.commit()
             
-            # Invalidate caches for all group members
             await self._invalidate_group_members_permission_cache(group_id)
             
             logger.info(f"Revoked permission {permission_id} from group {group_id}")
@@ -655,7 +654,6 @@ class PermissionService:
     ) -> UserGroupMembership:
         """Add user to group"""
         try:
-            # Check if membership already exists
             existing = await self.db.execute(
                 select(UserGroupMembership)
                 .where(UserGroupMembership.user_id == user_id)
@@ -674,14 +672,13 @@ class PermissionService:
                 role_in_group=role_in_group,
                 expires_at=expires_at,
                 created_by=added_by,
-                created_at=datetime.utcnow()
+                created_at=await DateTimeManager.tenant_now_cached(await self._get_tenant_id_from_user(user_id), self.db)
             )
             
             self.db.add(membership)
             await self.db.commit()
             await self.db.refresh(membership)
             
-            # Invalidate user's permission cache
             await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Added user {user_id} to group {group_id}")
@@ -717,7 +714,6 @@ class PermissionService:
             
             await self.db.commit()
             
-            # Invalidate user's permission cache
             await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Removed user {user_id} from group {group_id}")
@@ -756,12 +752,11 @@ class PermissionService:
             if updated_by:
                 membership.updated_by = updated_by
             
-            membership.updated_at = datetime.utcnow()
+            membership.updated_at = await DateTimeManager.tenant_now_cached(await self._get_tenant_id_from_user(user_id), self.db)
             
             await self.db.commit()
             await self.db.refresh(membership)
             
-            # Invalidate user's permission cache
             await self._invalidate_user_permission_cache(user_id)
             
             logger.info(f"Updated membership for user {user_id} in group {group_id}")
@@ -818,6 +813,8 @@ class PermissionService:
                 ("USER", DefaultGroupNames.USER, "ROLE")
             ]
             
+            tz_now = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
+
             for group_code, group_name, group_type in groups_to_create:
                 group = Group(
                     id=str(uuid.uuid4()),
@@ -826,7 +823,7 @@ class PermissionService:
                     description=DefaultGroupNames.DESCRIPTIONS.get(group_name, f"Default {group_name} group"),
                     group_type=group_type,
                     is_system=True,
-                    created_at=datetime.utcnow()
+                    created_at=tz_now
                 )
                 self.db.add(group)
                 default_groups[group_code] = str(group.id)
@@ -853,6 +850,8 @@ class PermissionService:
                 "USER": RolePermissions.USER_PERMISSIONS
             }
             
+            tz_now = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
+
             for role, permissions in role_permissions.items():
                 if role in groups:
                     group_id = groups[role]
@@ -867,7 +866,7 @@ class PermissionService:
                                 group_id=group_id,
                                 permission_id=str(all_permissions[permission_code].id),
                                 granted_by=None,
-                                created_at=datetime.utcnow()
+                                created_at=tz_now
                             )
                             self.db.add(group_permission)
             
@@ -909,4 +908,33 @@ class PermissionService:
                     logger.debug(f"Invalidated user permission cache: {cache_key}")
         except Exception as e:
             logger.warning(f"Failed to invalidate group members cache for group {group_id}: {e}")
+
+    async def _get_tenant_id_from_user(self, user_id: str) -> Optional[str]:
+        try:
+            result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
+            row = result.first()
+            return str(row[0]) if row and row[0] else None
+        except Exception:
+            return None
+
+    async def _get_tenant_id_from_group(self, group_id: str) -> Optional[str]:
+        try:
+            result = await self.db.execute(
+                select(Department.tenant_id)
+                .select_from(Group)
+                .join(Department, Department.id == Group.department_id, isouter=True)
+                .where(Group.id == group_id)
+            )
+            row = result.first()
+            return str(row[0]) if row and row[0] else None
+        except Exception:
+            return None
+
+    async def _get_tenant_id_from_department(self, department_id: str) -> Optional[str]:
+        try:
+            result = await self.db.execute(select(Department.tenant_id).where(Department.id == department_id))
+            row = result.first()
+            return str(row[0]) if row and row[0] else None
+        except Exception:
+            return None
     

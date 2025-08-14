@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from services.cache.redis_service import redis_client
 from config.settings import get_settings
 from utils.logging import get_logger
-from utils.datetime_utils import CustomDateTime
+from utils.datetime_utils import  DateTimeManager
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -351,7 +351,7 @@ class CacheManager:
         try:
             client = redis_client.get_client()
             if client:
-                test_key = f"health_check_{CustomDateTime.now().timestamp()}"
+                test_key = f"health_check_{DateTimeManager.system_now().timestamp()}"
                 await client.set(test_key, "test", ex=10)
                 value = await client.get(test_key)
                 await client.delete(test_key)

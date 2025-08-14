@@ -6,17 +6,18 @@ from datetime import datetime
 from typing import Optional
 import json
 from pathlib import Path
+from .datetime_utils import DateTimeManager
 
 from config.settings import get_settings
 
 settings = get_settings()
 
 class JsonFormatter(logging.Formatter):
-    """JSON formatter for structured logging""" 
+    """JSON formatter for structured logging"""
     
     def format(self, record: logging.LogRecord) -> str:
         log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": DateTimeManager._now().isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -66,30 +67,24 @@ class ColoredFormatter(logging.Formatter):
 def setup_logging() -> None:
     """Setup logging configuration"""
     
-    import os
     log_base = os.getenv("LOG_DIR", "./logs")
     log_dir = Path(log_base)
     log_dir.mkdir(parents=True, exist_ok=True)
    
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
-    
     root_logger.handlers.clear()
     
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
-    
-    if settings.DEBUG:
-        console_formatter = ColoredFormatter()
-    else:
-        console_formatter = JsonFormatter()
-    
-    console_handler.setFormatter(console_formatter)
+    console_handler.setFormatter(ColoredFormatter() if settings.DEBUG else JsonFormatter())
     root_logger.addHandler(console_handler)
     
+    # File handlers (JSON for Promtail/Loki)
     file_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "app.log",
-        maxBytes=10 * 1024 * 1024,  # 10MB
+        maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding='utf-8'
     )
@@ -99,7 +94,7 @@ def setup_logging() -> None:
     
     error_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "error.log",
-        maxBytes=10 * 1024 * 1024,  # 10MB
+        maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding='utf-8'
     )
@@ -107,10 +102,11 @@ def setup_logging() -> None:
     error_handler.setFormatter(JsonFormatter())
     root_logger.addHandler(error_handler)
     
+    # Access logger (separate file)
     access_logger = logging.getLogger("access")
     access_handler = logging.handlers.RotatingFileHandler(
         filename=log_dir / "access.log",
-        maxBytes=10 * 1024 * 1024,  # 10MB
+        maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding='utf-8'
     )
@@ -118,6 +114,8 @@ def setup_logging() -> None:
     access_logger.addHandler(access_handler)
     access_logger.setLevel(logging.INFO)
     access_logger.propagate = False
+    
+    # Reduce noisy libs
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -129,10 +127,8 @@ def setup_logging() -> None:
 
 def get_logger(name: str) -> logging.Logger:
     """Get logger instance with specific name"""
-    
     if not logging.getLogger().handlers:
         setup_logging()
-    
     return logging.getLogger(name)
 
 class LoggerMixin:
@@ -140,7 +136,6 @@ class LoggerMixin:
     
     @property
     def logger(self) -> logging.Logger:
-        """Get logger for current class"""
         return get_logger(self.__class__.__name__)
 
 class RequestLoggerAdapter(logging.LoggerAdapter):
@@ -159,16 +154,15 @@ class RequestLoggerAdapter(logging.LoggerAdapter):
         return msg, kwargs
 
 def get_request_logger(
-    name: str, 
-    request_id: str, 
+    name: str,
+    request_id: str,
     user_id: Optional[str] = None
 ) -> RequestLoggerAdapter:
-    """Get logger with request context"""
     logger = get_logger(name)
     return RequestLoggerAdapter(logger, request_id, user_id)
 
 def log_performance(logger_name: Optional[str] = None):
-    """Decorator to log performance of functions""" 
+    """Decorator to log performance of functions"""
     
     def decorator(func):
         import functools
@@ -179,16 +173,13 @@ def log_performance(logger_name: Optional[str] = None):
         async def async_wrapper(*args, **kwargs):
             logger = get_logger(logger_name or func.__module__)
             start_time = time.time()
-            
             try:
                 result = await func(*args, **kwargs)
                 execution_time = time.time() - start_time
-                
                 logger.info(
                     f"Function {func.__name__} completed",
                     extra={"execution_time": execution_time}
                 )
-                
                 return result
             except Exception as e:
                 execution_time = time.time() - start_time
@@ -203,16 +194,13 @@ def log_performance(logger_name: Optional[str] = None):
         def sync_wrapper(*args, **kwargs):
             logger = get_logger(logger_name or func.__module__)
             start_time = time.time()
-            
             try:
                 result = func(*args, **kwargs)
                 execution_time = time.time() - start_time
-                
                 logger.info(
                     f"Function {func.__name__} completed",
                     extra={"execution_time": execution_time}
                 )
-                
                 return result
             except Exception as e:
                 execution_time = time.time() - start_time

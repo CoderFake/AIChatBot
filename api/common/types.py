@@ -160,7 +160,6 @@ class Permission(Enum):
     # Dept Admin permissions
     PROVIDER_CONFIG = "provider.configure"
     TOOL_CONFIG_DEPT = "tool.configure.department"
-    INVITE_DEPT_MANAGER = "invite.dept.manager"
     
     # Dept Manager permissions
     DOCUMENT_PRIVATE_CREATE = "document.private.create"
@@ -322,3 +321,62 @@ class DefaultProviderConfig:
             "temperature": cls.DEFAULT_TEMPERATURE,
             "max_tokens": cls.DEFAULT_MAX_TOKENS
         }
+
+
+class DocumentAccessLevel(Enum):
+    """Document access level enum"""
+    PUBLIC = "public"
+    PRIVATE = "private"
+
+
+class DocumentProcessingStatus(Enum):
+    """Document processing status enum"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class VectorProcessingStatus(Enum):
+    """Vector processing status enum"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class KafkaMessageStatus(Enum):
+    """Kafka message status enum"""
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
+
+
+class DocumentConstants:
+    """Constants for document operations to avoid hardcoding"""
+    
+    # Folder constants
+    ROOT_FOLDER_PATH = "/"
+    ROOT_FOLDER_NAME = "root"
+    
+    # Collection name templates
+    COLLECTION_NAME_TEMPLATE_PUBLIC = "{tenant_id}-{department_id}-public"
+    COLLECTION_NAME_TEMPLATE_PRIVATE = "{tenant_id}-{department_id}-private"
+    
+    # Bucket name template
+    BUCKET_NAME_TEMPLATE = "{prefix}-{tenant_id}"
+    
+    STORAGE_KEY_TEMPLATE = "{tenant_id}/{department_id}/{folder_path}{document_uuid}_{filename}"
+    
+    # Progress steps for Kafka
+    PROGRESS_START = 5
+    PROGRESS_STORAGE_UPLOADED = 20
+    PROGRESS_DB_CREATED = 35
+    PROGRESS_CHUNKS_EXTRACTED = 70
+    PROGRESS_STORAGE_DELETED = 35
+    PROGRESS_DB_DELETED = 65
+    PROGRESS_COMPLETED = 100
+    
+    # Batch processing
+    DEFAULT_BATCH_SEMAPHORE_LIMIT = 4

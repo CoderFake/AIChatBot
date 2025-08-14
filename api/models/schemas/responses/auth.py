@@ -3,7 +3,7 @@
 Authentication response schemas
 """
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UserInfoSchema(BaseModel):
@@ -24,13 +24,26 @@ class UserInfoSchema(BaseModel):
     permissions: List[str] = []
 
 
+class TokenPairResponse(BaseModel):
+    access_token: str = Field(..., description="JWT access token")
+    refresh_token: str = Field(..., description="JWT refresh token")
+    token_type: str = Field("bearer", description="Token type")
+
+
 class LoginResponse(BaseModel):
-    """Login response schema"""
+    user_id: str
+    username: str
+    email: str
+    full_name: Optional[str] = None
+    role: str
+    tenant_id: Optional[str] = None
+    department_id: Optional[str] = None
+    is_verified: bool
+    last_login: Optional[str] = None
+    first_login: bool = Field(..., description="True if first login") 
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
-    expires_in: int
-    user: UserInfoSchema
 
 
 class RefreshTokenResponse(BaseModel):
@@ -41,8 +54,8 @@ class RefreshTokenResponse(BaseModel):
 
 
 class LogoutResponse(BaseModel):
-    """Logout response schema"""
-    message: str = "Logged out successfully"
+    success: bool
+    detail: str
 
 
 class UserInfoResponse(BaseModel):

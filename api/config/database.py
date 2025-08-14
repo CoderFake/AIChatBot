@@ -7,9 +7,7 @@ from typing import AsyncGenerator, Optional
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import QueuePool
 from sqlalchemy import event, text
-from sqlalchemy.exc import DisconnectionError, InvalidRequestError
 
 from config.settings import get_settings
 from utils.logging import get_logger
@@ -36,21 +34,18 @@ class DatabaseManager:
             
             self.engine = create_async_engine(
                 database_url,
-                poolclass=QueuePool,
-                pool_size=20,
-                max_overflow=30,
-                pool_timeout=30,
-                pool_recycle=1800,
                 pool_pre_ping=True,
                 echo=settings.DEBUG,
                 future=True
             )
             
             @event.listens_for(self.engine.sync_engine, "connect")
-            def set_sqlite_pragma(dbapi_connection, connection_record):
-                if "postgresql" in str(dbapi_connection):
+            def set_postgres_timezone(dbapi_connection, connection_record):
+                try:
                     with dbapi_connection.cursor() as cursor:
-                        cursor.execute("SET timezone = 'UTC'")
+                        cursor.execute("SET TIME ZONE 'UTC'")
+                except Exception:
+                    pass
             
             self.async_session_factory = async_sessionmaker(
                 bind=self.engine,
@@ -131,8 +126,17 @@ def get_db_session() -> AsyncSession:
 @asynccontextmanager
 async def get_db_context():
     """Context manager for database session"""
-    async with get_db() as session:
-        yield session
+    if not db_manager._initialized:
+        await db_manager.initialize()
+    async with db_manager.async_session_factory() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Database session error: {e}")
+            raise
+        finally:
+            await session.close()
 
 async def test_connection() -> bool:
     """Test database connection health"""

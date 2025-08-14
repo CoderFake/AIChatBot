@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
@@ -112,10 +110,10 @@ services:
     container_name: milvus_public
     restart: unless-stopped
     ports:
-      - "${MILVUS_PUBLIC_PORT:-19530}:19530"
       - "9091:9091"
     environment:
       ETCD_ENDPOINTS: etcd:2379
+      ETCD_ROOT_PATH: by-public
       MINIO_ADDRESS: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
@@ -127,7 +125,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -139,6 +137,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    command: milvus run standalone
 
   # Milvus Private Instance
   milvus_private:
@@ -147,9 +146,9 @@ services:
     restart: unless-stopped
     ports:
       - "${MILVUS_PRIVATE_PORT:-19531}:19530"
-      - "9092:9091"
     environment:
       ETCD_ENDPOINTS: etcd:2379
+      ETCD_ROOT_PATH: by-private
       MINIO_ADDRESS: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
@@ -161,7 +160,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -173,6 +172,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    command: milvus run standalone
 
   # Zookeeper
   zookeeper:
@@ -244,13 +244,13 @@ services:
   # Main API Application
   api:
     build:
-      context: .
+      context: ./api
       dockerfile: Dockerfile
       target: ${ENV:-development}
     container_name: api
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${HOST_APP_PORT:-15000}:8000"
     environment:
       # Application Settings
       - APP_NAME=${APP_NAME}
@@ -332,12 +332,27 @@ services:
       
       # CORS
       - CORS_ORIGINS=${BASE_URL},${API_URL},http://localhost:3000
+
+      # MAINTAINER
+      - MAINTAINER_USERNAME=${MAINTAINER_USERNAME}
+      - MAINTAINER_EMAIL=${MAINTAINER_EMAIL}
+      - MAINTAINER_PASSWORD=${MAINTAINER_PASSWORD}
+
+      # Email SMTP
+      - EMAIL_TEMPLATES_DIR=${EMAIL_TEMPLATES_DIR}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_TLS=${SMTP_TLS}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - EMAIL_FROM_NAME=${EMAIL_FROM_NAME}
+      - EMAIL_FROM=${EMAIL_FROM}
       
     volumes:
+      - ./api:/app
       - ./logs:/app/logs
       - ./uploads:/app/uploads
       - document_storage:/app/documents
-      - ./api:/app:ro  
     depends_on:
       postgres:
         condition: service_healthy
@@ -352,7 +367,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "${PROTOCOL}://${DOMAIN}:${MAIN_PORT}/api/v1/health/live"]
+      test: ["CMD-SHELL", "curl -fsS \"$PROTOCOL://$DOMAIN:${APP_PORT:-8000}/api/v1/health/live\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -374,6 +389,7 @@ services:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -418,6 +434,116 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  grafana-loader:
+    image: alpine:3.19
+    container_name: grafana-loader
+    restart: "no"
+    depends_on:
+      grafana:
+        condition: service_started
+    environment:
+      - GRAFANA_API_URL=${GRAFANA_INTERNAL_URL:-http://grafana:3000}
+      - GRAFANA_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - DASHBOARD_IDS=${GRAFANA_DASHBOARD_IDS:-2204}
+      - PROM_DS_UID=${PROM_DS_UID:-prometheus}
+      - LOKI_DS_UID=${LOKI_DS_UID:-loki}
+    command: >
+      sh -lc "apk add --no-cache curl jq >/dev/null &&
+      echo 'Waiting Grafana...' &&
+      until curl -sf $$GRAFANA_API_URL/api/health >/dev/null; do sleep 3; done &&
+      for id in $$(echo $$DASHBOARD_IDS | tr ',' ' '); do
+        echo Importing dashboard $$id;
+        json=$$(curl -sf https://grafana.com/api/dashboards/$$id/revisions/latest/download);
+        payload=$$(jq -n --argjson db \"$$json\" --arg prom \"$$PROM_DS_UID\" --arg loki \"$$LOKI_DS_UID\" '{dashboard: $$db, overwrite: true, inputs: [ {name:\"DS_PROMETHEUS\", type:\"datasource\", pluginId:\"prometheus\", value:$$prom}, {name:\"DS_LOKI\", type:\"datasource\", pluginId:\"loki\", value:$$loki} ] }');
+        curl -sf -u \"$$GRAFANA_ADMIN_USER:$$GRAFANA_ADMIN_PASSWORD\" -H 'Content-Type: application/json' -X POST \"$$GRAFANA_API_URL/api/dashboards/import\" -d \"$$payload\" || true;
+      done && echo 'Done'"
+    networks:
+      - rag_network
+
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    command: -config.file=/etc/loki/config.yml
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    networks:
+      - rag_network
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: promtail
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/promtail/config.yml
+      - -config.expand-env=true
+    volumes:
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+      - ./logs:/app/logs:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    environment:
+      - LOKI_URL=${LOKI_URL}
+    depends_on:
+      - loki
+    networks:
+      - rag_network
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - rag_network
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: redis-exporter
+    restart: unless-stopped
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      - redis
+    networks:
+      - rag_network
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    restart: unless-stopped
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - rag_network
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    restart: unless-stopped
+    command:
+      - --kafka.server=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - rag_network
+
 # Named Volumes
 volumes:
   postgres_data:
@@ -446,14 +572,13 @@ volumes:
     driver: local
   document_storage:
     driver: local
+  loki_data:
+    driver: local
 
 # Networks
 networks:
   rag_network:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
     labels:
       - "project=multi-agent-rag"
       - "environment=${ENV:-development}"

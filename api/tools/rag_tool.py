@@ -7,9 +7,7 @@ from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackMan
 from pydantic import BaseModel
 
 from common.types import AccessLevel, DBDocumentPermissionLevel
-from services.auth.permission_service import RAGPermissionService
-from services.vector.milvus_service import milvus_service
-from config.database import get_db_context
+
 from models.models import RAGSearchInput
 from utils.logging import get_logger
 import json
@@ -22,8 +20,8 @@ class RAGSearchTool(BaseTool):
     RAG search tool wrapper for LangChain integration
     Returns raw JSON results without formatting to preserve full context
     """
-    name = "rag_search"
-    description = "Search through documents using semantic similarity based on user's department and access levels. Returns relevant information from knowledge base."
+    name: str = "rag_search"
+    description: str = "Search through documents using semantic similarity based on user's department and access levels. Returns relevant information from knowledge base."
     args_schema: Type[BaseModel] = RAGSearchInput
     
     def __init__(self, **kwargs):
@@ -150,6 +148,10 @@ class RAGSearchTool(BaseTool):
             JSON string containing search results, context, and metadata
         """
         try:
+            from config.database import get_db_context
+            from services.auth.permission_service import RAGPermissionService
+            from services.vector.milvus_service import milvus_service
+
             valid_levels = [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]
             access_levels = [level for level in access_levels if level in valid_levels]
             
