@@ -60,3 +60,22 @@ class ChangePasswordRequest(BaseModel):
             raise ValueError('Passwords do not match')
         return v
 
+
+class MaintainerInviteRequest(BaseModel):
+    """Maintainer invites list of emails to become tenant admins"""
+    tenant_id: Optional[str] = Field(None, description="Target tenant ID (optional for MAINTAINER invites)")
+    emails: list[EmailStr] = Field(..., min_length=1)
+
+
+class AcceptInviteRequest(BaseModel):
+    token: str = Field(..., description="Opaque invite token")
+    new_password: Optional[str] = Field(None, description="Optional new password to set on accept")
+
+
+class ForgotPasswordRequest(BaseModel):
+    username_or_email: str = Field(..., description="Username or email to send reset link")
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., description="Opaque reset token")
+    new_password: str = Field(..., min_length=6)

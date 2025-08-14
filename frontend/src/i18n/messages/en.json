@@ -1,0 +1,10 @@
+{
+  "app": {
+    "title": "AIChatBot",
+    "welcome": "Welcome. Configure tenants and login from your subdomain."
+  },
+  "nav": {
+    "home": "Home"
+  }
+}
+

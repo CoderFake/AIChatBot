@@ -1,12 +1,14 @@
 
-from fastapi import APIRouter, HTTPException, Depends, status
-from typing import Dict, Any, List, Optional
-from config.config_manager import config_manager
-from services.llm.provider_manager import llm_provider_manager
-from services.tools.tool_manager import tool_manager
+from fastapi import APIRouter
+from typing import List
+from models.schemas.responses.locale import LocaleListResponse
 from utils.logging import get_logger
 
-router = APIRouter()
+router = APIRouter(prefix="/others", tags=["Others"])
 logger = get_logger(__name__)
 
-#get health, current config, update config in cache
+@router.get("/locales", response_model=LocaleListResponse, summary="List supported UI languages")
+async def get_locales() -> LocaleListResponse:
+    languages: List[str] = ["vi", "en", "kr", "ja"]
+    default_language = "en"
+    return LocaleListResponse(languages=languages, default_language=default_language)

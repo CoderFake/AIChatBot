@@ -130,6 +130,9 @@ class ValidatePermission:
                 group = membership.group
                 if group.is_deleted:
                     continue
+                    
+                if user.tenant_id and getattr(group, 'tenant_id', None) and str(group.tenant_id) != str(user.tenant_id):
+                    continue
                 for group_perm in group.permissions:
                     if not group_perm.is_deleted and not group_perm.permission.is_deleted:
                         permissions.add(group_perm.permission.permission_code)
@@ -259,11 +262,10 @@ class ValidatePermission:
     ) -> List[str]:
         """Compute or fetch from cache the effective permission codes for a user within a tenant."""
         try:
-            # Build cache key: include tenant id if available
+            if user_role == UserRole.MAINTAINER.value:
+                tenant_id = None
             if not tenant_id:
-                # Try load from DB to find tenant of user once
-                from models.database.user import User as DBUser
-                res = await self.db.execute(select(DBUser.tenant_id).where(DBUser.id == user_id))
+                res = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
                 row = res.first()
                 if row and row[0]:
                     tenant_id = str(row[0])

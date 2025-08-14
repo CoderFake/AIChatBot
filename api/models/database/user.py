@@ -18,7 +18,6 @@ class User(BaseModel):
     username = Column(
         String(100),
         nullable=False,
-        unique=True,
         index=True,
         comment="Username for login"
     )
@@ -82,6 +81,9 @@ class User(BaseModel):
         comment="Whether user account is active"
     )
     
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'username', name='uq_user_tenant_username'),
+    )
     is_verified = Column(
         Boolean,
         nullable=False,
@@ -89,20 +91,12 @@ class User(BaseModel):
         comment="Whether email is verified"
     )
     
-    # Tracking fields
     last_login = Column(
         DateTime(timezone=True),
         nullable=True,
         comment="Last login timestamp"
     )
     
-    password_changed_at = Column(
-        DateTime(timezone=True),
-        nullable=True,
-        comment="When password was last changed"
-    )
-    
-    # Optional profile data
     profile_data = Column(
         JSONB,
         nullable=True,

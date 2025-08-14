@@ -1,0 +1,10 @@
+{
+  "app": {
+    "title": "Quản trị AIChatBot",
+    "welcome": "Chào mừng. Cấu hình tenant và đăng nhập qua subdomain."
+  },
+  "nav": {
+    "home": "Trang chủ"
+  }
+}
+

@@ -25,20 +25,36 @@ class AuthService:
         self.db = db
         self.blacklist_service = TokenBlacklistService(db)
     
-    async def authenticate_user(self, username: str, password: str) -> Optional[Dict[str, Any]]:
+    async def authenticate_user(self, username: str, password: str, tenant_id: Optional[str] = None, sub_domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Authenticate user with username and password
         Only checks authentication, not authorization
         """
         try:
-            result = await self.db.execute(
-                select(User).where(
+            query = select(User).where(
+                User.username == username,
+                User.is_active == True,
+                User.is_deleted == False
+            )
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+
+            if sub_domain and not tenant_id:
+                from models.database.tenant import Tenant
+                query = query.join(Tenant, Tenant.id == User.tenant_id, isouter=True).where(Tenant.sub_domain == sub_domain)
+            result = await self.db.execute(query)
+            user = result.scalar_one_or_none()
+
+            if not user:
+                from common.types import UserRole
+                fallback_query = select(User).where(
                     User.username == username,
+                    User.role == UserRole.MAINTAINER.value,
                     User.is_active == True,
                     User.is_deleted == False
                 )
-            )
-            user = result.scalar_one_or_none()
+                result = await self.db.execute(fallback_query)
+                user = result.scalar_one_or_none()
             
             if not user:
                 logger.warning(f"Authentication failed: user not found or inactive - {username}")
@@ -135,7 +151,6 @@ class AuthService:
                     "message": "Token has been revoked"
                 }
             
-            # Check user status
             user_status = await self.validate_user_status(user_id)
             if not user_status["valid"]:
                 logger.warning(f"Token validation failed: {user_status['reason']} - User: {user_id}")

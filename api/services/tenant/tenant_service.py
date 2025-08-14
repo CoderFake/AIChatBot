@@ -1,12 +1,12 @@
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.orm import selectinload
 
 from models.database.tenant import Tenant
-from models.database.provider import WorkflowAgent
+from models.database.agent import WorkflowAgent
 from services.auth.permission_service import PermissionService
-from services.cache.redis_service import redis_service
+from services.cache.redis_service import redis_client
 from utils.datetime_utils import DateTimeManager
 from common.types import DefaultProviderConfig
 from utils.logging import get_logger
@@ -30,6 +30,8 @@ class TenantService:
         tenant_name: str,
         timezone: str = "UTC",
         locale: str = "en_US",
+        sub_domain: Optional[str] = None,
+        description: Optional[str] = None,
         created_by: str = "system",
         config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -45,6 +47,8 @@ class TenantService:
                 tenant_name=tenant_name,
                 timezone=timezone,
                 locale=locale,
+                sub_domain=sub_domain,
+                description=description,
                 settings=config or {},
                 created_by=created_by
             )
@@ -75,6 +79,8 @@ class TenantService:
                 "tenant_name": tenant.tenant_name,
                 "timezone": tenant.timezone,
                 "locale": tenant.locale,
+                "sub_domain": tenant.sub_domain,
+                "description": tenant.description,
                 "default_groups": default_groups,
                 "created_at": tenant.created_at.isoformat()
             }
@@ -162,6 +168,7 @@ class TenantService:
                 "locale": tenant.locale,
                 "is_active": tenant.is_active,
                 "settings": tenant.settings,
+                "sub_domain": tenant.sub_domain,
                 "workflow_agent": {
                     "id": str(tenant.workflow_agent.id),
                     "provider_name": tenant.workflow_agent.provider_name,
@@ -237,7 +244,10 @@ class TenantService:
             
             await self.db.commit()
             
-            await redis_service.delete_tenant_cache(tenant_id)
+            try:
+                await redis_client.delete_tenant_data(tenant_id)
+            except Exception:
+                pass
             
             logger.info(f"Updated WorkflowAgent for tenant {tenant_id}")
             return True
@@ -257,10 +267,10 @@ class TenantService:
                 "timezone": tenant.timezone
             }
             
-            await redis_service.cache_tenant_data(
-                tenant_id=str(tenant.id),
-                data=tenant_cache_data
-            )
+            try:
+                await redis_client.set_tenant_data(str(tenant.id), "basic", tenant_cache_data)
+            except Exception:
+                pass
             
             logger.info(f"Loaded tenant {tenant.tenant_name} timezone {tenant.timezone} to cache")
             
@@ -313,20 +323,18 @@ class TenantService:
         List tenants with pagination
         """
         try:
-            query = select(Tenant).options(selectinload(Tenant.workflow_agent))
-            
+            # Build base query and count separately (SQLAlchemy 2.0)
+            base_query = select(Tenant)
             if is_active is not None:
-                query = query.where(Tenant.is_active == is_active)
-            
-            count_result = await self.db.execute(
-                select(select(Tenant).count()).select_from(
-                    query.subquery()
-                )
-            )
-            total = count_result.scalar()
-            
-            query = query.offset((page - 1) * limit).limit(limit)
-            result = await self.db.execute(query)
+                base_query = base_query.where(Tenant.is_active == is_active)
+
+            count_stmt = select(func.count()).select_from(base_query.subquery())
+            count_result = await self.db.execute(count_stmt)
+            total = count_result.scalar() or 0
+
+            data_query = base_query.options(selectinload(Tenant.workflow_agent))
+            data_query = data_query.offset((page - 1) * limit).limit(limit)
+            result = await self.db.execute(data_query)
             tenants = result.scalars().all()
             
             tenant_list = []
@@ -337,6 +345,7 @@ class TenantService:
                     "timezone": tenant.timezone,
                     "locale": tenant.locale,
                     "is_active": tenant.is_active,
+                        "sub_domain": tenant.sub_domain,
                     "created_at": tenant.created_at.isoformat(),
                     "workflow_agent_active": tenant.workflow_agent.is_active if tenant.workflow_agent else False
                 }

@@ -28,14 +28,13 @@ def render_template(template_name: str, context: Dict[str, object]) -> str:
 
 
 def _detect_frontend_origin(request: Optional[Request]) -> Optional[str]:
-    """Try to detect FE origin from request or fallback PUBLIC_BASE_URL"""
-    settings = get_settings()
+    """Detect FE origin strictly from the incoming request (no static fallback)."""
     if request is not None:
         try:
             return get_request_origin(request)
         except Exception:
-            pass
-    return settings.PUBLIC_BASE_URL
+            return None
+    return None
 
 
 def send_mail(

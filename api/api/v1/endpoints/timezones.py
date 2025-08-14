@@ -9,10 +9,10 @@ from models.schemas.responses.timezone import (
 from common.timezones import TimezoneGroups
 from utils.logging import get_logger
 
-router = APIRouter()
+router = APIRouter(prefix="/others", tags=["Others"])
 logger = get_logger(__name__)
 
-@router.get("/", response_model=TimezoneListResponse)
+@router.get("/timezones", response_model=TimezoneListResponse, summary="List supported timezones by region")
 async def get_timezones():
     """
     Get all supported timezones grouped by region

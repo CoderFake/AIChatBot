@@ -7,6 +7,9 @@ from models.database.user import User
 from utils.password_utils import hash_password
 from utils.logging import get_logger
 from common.types import UserRole
+from common.types import Permission as PermissionEnum
+from models.database.permission import Permission as PermissionModel
+from services.auth.permission_service import PermissionService
 
 logger = get_logger(__name__)
 
@@ -49,3 +52,37 @@ async def seed_global_maintainer(db: AsyncSession) -> Optional[str]:
 
     logger.info(f"Maintainer account created: {username}")
     return str(user.id) 
+
+
+async def seed_permissions(db: AsyncSession) -> None:
+    """Seed fixed permission catalog based on common.types.Permission enum."""
+    try:
+        service = PermissionService(db)
+        existing = await db.execute(select(PermissionModel.permission_code))
+        existing_codes = {row[0] for row in existing.all()}
+
+        created = 0
+        for perm in PermissionEnum:
+            code = perm.value
+            if code in existing_codes:
+                continue
+                
+            parts = code.split('.')
+            resource_type = parts[0] if parts else code
+            action = parts[-1] if parts else code
+            name = code.replace('.', ' ').title()
+            await service.create_permission(
+                permission_code=code,
+                permission_name=name,
+                resource_type=resource_type,
+                action=action,
+                is_system=True,
+                created_by=None
+            )
+            created += 1
+        if created:
+            logger.info(f"Seeded {created} permissions into catalog")
+        else:
+            logger.info("Permissions already seeded; no changes")
+    except Exception as e:
+        logger.error(f"Failed to seed permissions: {e}")

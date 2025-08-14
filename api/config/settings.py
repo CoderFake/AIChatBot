@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     EMAIL_FROM_NAME: str = Field(default_factory=lambda: os.environ.get("APP_NAME", "AI Chatbot"), env="EMAIL_FROM_NAME")
     EMAIL_FROM: str = Field(default="no-reply@example.com", env="EMAIL_FROM")
     
+    # Reset token TTL minutes
+    RESET_TOKEN_TTL_MINUTES: int = Field(default=20, env="RESET_TOKEN_TTL_MINUTES")
+    
     @field_validator('CORS_ORIGINS', mode='before')
     @classmethod
     def parse_cors_origins(cls, v):

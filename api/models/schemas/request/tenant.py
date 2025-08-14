@@ -5,7 +5,10 @@ from pydantic import BaseModel, Field
 class CreateTenantRequest(BaseModel):
     """Request model for creating tenant"""
     tenant_name: str = Field(..., min_length=1, max_length=200)
-    timezone: str = Field(default="UTC")
+    timezone: str = Field(..., min_length=1)
+    sub_domain: str = Field(..., min_length=1)
+    locale: Optional[str] = Field(default="en_US")
+    description: Optional[str] = Field(default=None)
     workflow_provider: Optional[str] = Field(default=None)
     workflow_model: Optional[str] = Field(default=None)
 
@@ -15,6 +18,9 @@ class UpdateTenantRequest(BaseModel):
     tenant_name: Optional[str] = Field(None, min_length=1, max_length=200)
     timezone: Optional[str] = Field(None)
     is_active: Optional[bool] = Field(None)
+    sub_domain: Optional[str] = Field(None)
+    locale: Optional[str] = Field(None)
+    description: Optional[str] = Field(None)
 
 
 class UpdateWorkflowAgentRequest(BaseModel):

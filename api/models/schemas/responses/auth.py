@@ -74,3 +74,13 @@ class TokenValidationResponse(BaseModel):
     user_id: Optional[str] = None
     role: Optional[str] = None
     expires_at: Optional[str] = None
+
+
+class InviteResponse(BaseModel):
+    """Invite response containing generated links"""
+    links: List[str]
+
+
+class OperationResult(BaseModel):
+    success: bool = True
+    detail: str = "OK"

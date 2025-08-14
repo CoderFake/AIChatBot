@@ -24,6 +24,14 @@ class UserRole(Enum):
     DEPT_MANAGER = "DEPT_MANAGER"
     USER = "USER"
 
+ROLE_LEVEL = {
+    "MAINTAINER": 5,
+    "ADMIN": 4,
+    "DEPT_ADMIN": 3,
+    "DEPT_MANAGER": 2,
+    "USER": 1,
+}
+
 
 class ProcessingStatus(Enum):
     """Enum define processing status"""

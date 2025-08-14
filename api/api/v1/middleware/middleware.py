@@ -4,22 +4,24 @@ JWT-based authentication with role verification for Depends()
 Integrates AuthService for authentication and ValidatePermission for authorization
 """
 from typing import Optional, Dict, Any, List
-from fastapi import HTTPException, Depends, status
+from fastapi import HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
 from config.settings import get_settings
-from common.types import UserRole
+from common.types import UserRole, ROLE_LEVEL
 from services.auth.auth_service import AuthService
 from services.auth.validate_permission import ValidatePermission
 from utils.logging import get_logger
+from utils.request_utils import get_tenant_identifier_from_request
 
 logger = get_logger(__name__)
 settings = get_settings()
 
 security = HTTPBearer()
+
 
 
 class JWTAuth:
@@ -49,7 +51,8 @@ class JWTAuth:
     @staticmethod
     async def get_current_user(
         credentials: HTTPAuthorizationCredentials = Depends(security),
-        db: AsyncSession = Depends(get_db)
+        db: AsyncSession = Depends(get_db),
+        request: Request = None,
     ) -> Dict[str, Any]:
         """
         Get current user from JWT token with comprehensive validation:
@@ -65,6 +68,10 @@ class JWTAuth:
             jti = payload.get("jti")  
             role = payload.get("role")
             tenant_id = payload.get("tenant_id")
+            sub_domain, path_tenant = get_tenant_identifier_from_request(request) if request is not None else (None, None)
+            resolved_tenant = path_tenant or tenant_id
+            if role == UserRole.MAINTAINER.value:
+                resolved_tenant = None
             department_id = payload.get("department_id")
             
             if not user_id or not role or not jti:
@@ -73,10 +80,8 @@ class JWTAuth:
                     detail="Invalid token payload - missing required fields"
                 )
             
-            # Use AuthService for comprehensive token validation
             auth_service = AuthService(db)
             
-            # Check token blacklist and user status
             token_validation = await auth_service.validate_token(jti, user_id)
             
             if not token_validation.get("valid"):
@@ -85,7 +90,6 @@ class JWTAuth:
                 
                 logger.warning(f"Token validation failed for user {user_id}: {reason}")
                 
-                # Map different failure reasons to appropriate HTTP status
                 if reason == "token_blacklisted":
                     status_code = status.HTTP_401_UNAUTHORIZED
                     detail = "Token has been revoked"
@@ -102,7 +106,7 @@ class JWTAuth:
                 "user_id": user_id,
                 "jti": jti,
                 "role": role,
-                "tenant_id": tenant_id,
+                "tenant_id": resolved_tenant,
                 "department_id": department_id,
                 "email": payload.get("email"),
                 "username": payload.get("username"),
@@ -254,8 +258,7 @@ class MaintainerOnly:
 
 class AdminOnly:
     """
-    Require ADMIN role (or higher) with specific permissions
-    Uses AuthService for authentication and ValidatePermission for authorization
+    Require ADMIN role strictly (no MAINTAINER override) with optional permissions check.
     """
     def __init__(self, required_permissions: List[str] = None):
         self.required_permissions = required_permissions or []
@@ -265,20 +268,15 @@ class AdminOnly:
         credentials: HTTPAuthorizationCredentials = Depends(security),
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        # Step 1: Authentication via JWTAuth (includes token blacklist + user status check)
         user_context = await JWTAuth.get_current_user(credentials, db)
-        
         user_role = user_context.get("role")
         
-        # Step 2: Role hierarchy check - MAINTAINER can also access ADMIN endpoints
-        allowed_roles = [UserRole.ADMIN.value, UserRole.MAINTAINER.value]
-        if user_role not in allowed_roles:
+        if user_role != UserRole.ADMIN.value:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="ADMIN role or higher required"
+                detail="ADMIN role required"
             )
         
-        # Step 3: Specific permissions check if provided
         if self.required_permissions:
             validate_permission = ValidatePermission(db)
             result = await validate_permission.check_user_has_permissions(
@@ -287,19 +285,62 @@ class AdminOnly:
                 user_role=user_role,
                 require_all=True
             )
-            
             if not result.get("allowed"):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=result.get("reason", "Missing required permissions")
                 )
-            
             user_context.update({
                 "validated_permissions": result.get("matched_permissions", []),
                 "permission_validation": result
             })
         
         logger.info(f"Admin access granted for user {user_context.get('user_id')}")
+        return user_context
+
+
+class AdminOrDeptAdminOnly:
+    """
+    Require ADMIN or DEPT_ADMIN role (explicitly exclude MAINTAINER).
+    Optional permissions check (ALL required).
+    """
+    def __init__(self, required_permissions: List[str] = None):
+        self.required_permissions = required_permissions or []
+    
+    async def __call__(
+        self,
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: AsyncSession = Depends(get_db)
+    ) -> Dict[str, Any]:
+        user_context = await JWTAuth.get_current_user(credentials, db)
+        user_role = user_context.get("role")
+        
+        allowed_roles = [UserRole.ADMIN.value, UserRole.DEPT_ADMIN.value]
+        if user_role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ADMIN or DEPT_ADMIN role required"
+            )
+        
+        if self.required_permissions:
+            validate_permission = ValidatePermission(db)
+            result = await validate_permission.check_user_has_permissions(
+                user_id=user_context.get("user_id"),
+                required_permissions=self.required_permissions,
+                user_role=user_role,
+                require_all=True
+            )
+            if not result.get("allowed"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=result.get("reason", "Missing required permissions")
+                )
+            user_context.update({
+                "validated_permissions": result.get("matched_permissions", []),
+                "permission_validation": result
+            })
+        
+        logger.info(f"Admin/DeptAdmin access granted for user {user_context.get('user_id')}")
         return user_context
 
 
@@ -317,7 +358,6 @@ class DeptAdminOnly:
     ) -> Dict[str, Any]:
         user_role = user_context.get("role")
         
-        # Check role hierarchy
         allowed_roles = [UserRole.DEPT_ADMIN.value, UserRole.ADMIN.value, UserRole.MAINTAINER.value]
         if user_role not in allowed_roles:
             raise HTTPException(
@@ -325,7 +365,6 @@ class DeptAdminOnly:
                 detail="DEPT_ADMIN role or higher required"
             )
         
-        # Check department assignment for non-global roles
         if user_role not in [UserRole.MAINTAINER.value, UserRole.ADMIN.value]:
             if not user_context.get("department_id"):
                 raise HTTPException(
@@ -333,14 +372,13 @@ class DeptAdminOnly:
                     detail="Department assignment required"
                 )
         
-        # Check specific permissions if provided
         if self.required_permissions:
             validate_permission = ValidatePermission(db)
             result = await validate_permission.check_user_has_permissions(
                 user_id=user_context.get("user_id"),
                 required_permissions=self.required_permissions,
                 user_role=user_role,
-                require_all=False  # DeptAdmin might need ANY of the permissions
+                require_all=False 
             )
             
             if not result.get("allowed"):
@@ -385,7 +423,6 @@ class DeptManagerOnly:
                 detail="DEPT_MANAGER role or higher required"
             )
         
-        # Check department assignment for non-global roles
         if user_role not in [UserRole.MAINTAINER.value, UserRole.ADMIN.value]:
             if not user_context.get("department_id"):
                 raise HTTPException(
@@ -393,14 +430,13 @@ class DeptManagerOnly:
                     detail="Department assignment required"
                 )
         
-        # Check specific permissions if provided
         if self.required_permissions:
             validate_permission = ValidatePermission(db)
             result = await validate_permission.check_user_has_permissions(
                 user_id=user_context.get("user_id"),
                 required_permissions=self.required_permissions,
                 user_role=user_role,
-                require_all=False  # DeptManager might need ANY of the permissions
+                require_all=False 
             )
             
             if not result.get("allowed"):
@@ -415,6 +451,86 @@ class DeptManagerOnly:
             })
         
         logger.info(f"Dept manager access granted for user {user_context.get('user_id')}")
+        return user_context
+
+
+# ==================== GENERIC ROLE GUARDS ====================
+
+class RoleOnly:
+    """
+    Strict role guard: only the exact role is allowed (no inheritance).
+    Optional permissions check (ALL required by default).
+    """
+    def __init__(self, required_role: str, required_permissions: List[str] | None = None, require_all: bool = True):
+        self.required_role = required_role
+        self.required_permissions = required_permissions or []
+        self.require_all = require_all
+
+    async def __call__(
+        self,
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: AsyncSession = Depends(get_db)
+    ) -> Dict[str, Any]:
+        user_context = await JWTAuth.get_current_user(credentials, db)
+        user_role = user_context.get("role")
+
+        if user_role != self.required_role:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"{self.required_role} role required")
+
+        if self.required_permissions:
+            validate_permission = ValidatePermission(db)
+            result = await validate_permission.check_user_has_permissions(
+                user_id=user_context.get("user_id"),
+                required_permissions=self.required_permissions,
+                user_role=user_role,
+                require_all=self.require_all,
+            )
+            if not result.get("allowed"):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=result.get("reason", "Missing required permissions"))
+            user_context.update({
+                "validated_permissions": result.get("matched_permissions", []),
+                "permission_validation": result
+            })
+
+        return user_context
+
+
+class RoleAtLeast:
+    """
+    Hierarchical role guard: allow min_role or higher (e.g., DeptAdmin -> Admin/Maintainer also allowed).
+    Optional permissions check (ALL required by default).
+    """
+    def __init__(self, min_role: str, required_permissions: List[str] | None = None, require_all: bool = True):
+        self.min_role = min_role
+        self.required_permissions = required_permissions or []
+        self.require_all = require_all
+
+    async def __call__(
+        self,
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: AsyncSession = Depends(get_db)
+    ) -> Dict[str, Any]:
+        user_context = await JWTAuth.get_current_user(credentials, db)
+        user_role = user_context.get("role")
+
+        if ROLE_LEVEL.get(user_role, 0) < ROLE_LEVEL.get(self.min_role, 0):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"{self.min_role} or higher required")
+
+        if self.required_permissions:
+            validate_permission = ValidatePermission(db)
+            result = await validate_permission.check_user_has_permissions(
+                user_id=user_context.get("user_id"),
+                required_permissions=self.required_permissions,
+                user_role=user_role,
+                require_all=self.require_all,
+            )
+            if not result.get("allowed"):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=result.get("reason", "Missing required permissions"))
+            user_context.update({
+                "validated_permissions": result.get("matched_permissions", []),
+                "permission_validation": result
+            })
+
         return user_context
 
 
@@ -572,7 +688,7 @@ def RequireMaintainer(required_permissions: List[str] = None):
     return Depends(MaintainerOnly(required_permissions))
 
 def RequireAdmin(required_permissions: List[str] = None):
-    """Factory function for ADMIN role (or higher) with specific permissions"""
+    """Factory function for ADMIN role (strict) with specific permissions"""
     return Depends(AdminOnly(required_permissions))
 
 def RequireDeptAdmin(required_permissions: List[str] = None):
@@ -582,3 +698,28 @@ def RequireDeptAdmin(required_permissions: List[str] = None):
 def RequireDeptManager(required_permissions: List[str] = None):
     """Factory function for DEPT_MANAGER role (or higher) with specific permissions"""
     return Depends(DeptManagerOnly(required_permissions))
+
+def RequireAdminOrDeptAdmin(required_permissions: List[str] = None):
+    """Factory function for ADMIN or DEPT_ADMIN roles (MAINTAINER excluded)."""
+    return Depends(AdminOrDeptAdminOnly(required_permissions))
+
+def RequireOnlyMaintainer(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleOnly(UserRole.MAINTAINER.value, required_permissions, require_all))
+
+def RequireOnlyAdmin(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleOnly(UserRole.ADMIN.value, required_permissions, require_all))
+
+def RequireOnlyDeptAdmin(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleOnly(UserRole.DEPT_ADMIN.value, required_permissions, require_all))
+
+def RequireOnlyDeptManager(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleOnly(UserRole.DEPT_MANAGER.value, required_permissions, require_all))
+
+def RequireAtLeastAdmin(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleAtLeast(UserRole.ADMIN.value, required_permissions, require_all))
+
+def RequireAtLeastDeptAdmin(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleAtLeast(UserRole.DEPT_ADMIN.value, required_permissions, require_all))
+
+def RequireAtLeastDeptManager(required_permissions: List[str] = None, require_all: bool = True):
+    return Depends(RoleAtLeast(UserRole.DEPT_MANAGER.value, required_permissions, require_all))

@@ -87,6 +87,14 @@ class Group(BaseModel):
     
     __tablename__ = "groups"
     
+    tenant_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Tenant ID"
+    )
+
     group_code = Column(
         String(100),
         nullable=False,
@@ -150,6 +158,7 @@ class Group(BaseModel):
     
     __table_args__ = (
         Index('idx_group_type_dept', 'group_type', 'department_id'),
+        Index('idx_group_tenant', 'tenant_id'),
     )
     
     def __repr__(self) -> str:

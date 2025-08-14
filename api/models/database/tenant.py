@@ -21,6 +21,14 @@ class Tenant(BaseModel):
         comment="Tenant display name"
     )
     
+    sub_domain = Column(
+        String(255),
+        nullable=True,
+        unique=True,
+        index=True,
+        comment="Subdomain for tenant"
+    )
+    
     description = Column(
         Text,
         nullable=True,
@@ -97,6 +105,7 @@ class Tenant(BaseModel):
     __table_args__ = (
         Index('idx_tenant_active', 'is_active'),
         Index('idx_tenant_timezone', 'timezone'),
+        Index('idx_tenant_subdomain', 'sub_domain'),
     )
     
     def __repr__(self) -> str:

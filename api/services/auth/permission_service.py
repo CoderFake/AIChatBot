@@ -293,6 +293,7 @@ class PermissionService:
         group_type: str,
         description: Optional[str] = None,
         department_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         is_system: bool = False,
         settings: Optional[Dict[str, Any]] = None,
         created_by: Optional[str] = None
@@ -306,10 +307,11 @@ class PermissionService:
                 description=description,
                 group_type=group_type,
                 department_id=department_id,
+                tenant_id=tenant_id,
                 is_system=is_system,
                 settings=settings,
                 created_by=created_by,
-                created_at=await DateTimeManager.tenant_now_cached((await self._get_tenant_id_from_department(department_id)) if department_id else None, self.db)
+                created_at=await DateTimeManager.tenant_now_cached(tenant_id or (await self._get_tenant_id_from_department(department_id)) if department_id else None, self.db)
             )
             
             self.db.add(group)
@@ -358,6 +360,7 @@ class PermissionService:
         self,
         group_type: Optional[str] = None,
         department_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         is_system: Optional[bool] = None,
         limit: int = 100,
         offset: int = 0
@@ -370,6 +373,8 @@ class PermissionService:
                 query = query.where(Group.group_type == group_type)
             if department_id:
                 query = query.where(Group.department_id == department_id)
+            if tenant_id:
+                query = query.where(Group.tenant_id == tenant_id)
             if is_system is not None:
                 query = query.where(Group.is_system == is_system)
             
@@ -405,12 +410,10 @@ class PermissionService:
             if updated_by:
                 group.updated_by = updated_by
             
-            tenant_id_for_group: Optional[str] = None
-            if group.department_id:
+            tenant_id_for_group: Optional[str] = group.tenant_id
+            if not tenant_id_for_group and group.department_id:
                 tenant_id_for_group = await self._get_tenant_id_from_department(group.department_id)
-                group.updated_at = await DateTimeManager.tenant_now_cached(tenant_id_for_group, self.db)
-            else:
-                group.updated_at = await DateTimeManager.tenant_now_cached(None, self.db)
+            group.updated_at = await DateTimeManager.tenant_now_cached(tenant_id_for_group, self.db)
             
             await self.db.commit()
             await self.db.refresh(group)
@@ -822,6 +825,7 @@ class PermissionService:
                     group_name=group_name,
                     description=DefaultGroupNames.DESCRIPTIONS.get(group_name, f"Default {group_name} group"),
                     group_type=group_type,
+                    tenant_id=tenant_id,
                     is_system=True,
                     created_at=tz_now
                 )

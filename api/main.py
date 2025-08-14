@@ -29,10 +29,11 @@ async def _sync_registries() -> None:
         from config.database import get_db_context
         from services.llm.provider_service import ProviderService
         from services.tools.tool_service import ToolService
-        from services.bootstrap.seed_maintainer import seed_global_maintainer
+        from services.bootstrap.seed_maintainer import seed_global_maintainer, seed_permissions
 
         async with get_db_context() as session:
             await seed_global_maintainer(session)
+            await seed_permissions(session)
 
             provider_service = ProviderService(session)
             await provider_service.initialize()
