@@ -11,7 +11,7 @@ from services.send_mail.invite_service import InviteService
 from services.send_mail.reset_service import ResetService
 from models.database.user import User
 from utils.password_utils import verify_password, hash_password
-from api.api.v1.middleware.middleware import RequireOnlyMaintainer
+from api.v1.middleware.middleware import RequireOnlyMaintainer
 from models.schemas.request.auth import (
     LoginRequest,
     LogoutRequest,
