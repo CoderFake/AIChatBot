@@ -1,0 +1,61 @@
+{
+  "title": "Observability Overview",
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "tags": ["observability", "loki", "prometheus"],
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "container",
+        "label": "Container",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "refresh": 1,
+        "query": "label_values(container_memory_usage_bytes, name)",
+        "includeAll": true,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "logs",
+      "title": "Live App Logs",
+      "options": {"showLabels": true, "showTime": true},
+      "targets": [
+        { "expr": "{job=\"app\"}", "datasource": {"type": "loki", "uid": "loki"} },
+        { "expr": "{job=\"docker\", container=~\"api.*\"}", "datasource": {"type": "loki", "uid": "loki"} }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Log Count (5m)",
+      "targets": [
+        { "expr": "sum(rate({job=\"app\"}[5m]))", "datasource": {"type": "loki", "uid": "loki"} },
+        { "expr": "sum(rate({job=\"docker\", container=~\"api.*\"}[5m]))", "datasource": {"type": "loki", "uid": "loki"} }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Recent Errors",
+      "targets": [
+        { "expr": "{job=\"app\", level=\"ERROR\"}", "datasource": {"type": "loki", "uid": "loki"} },
+        { "expr": "{job=\"docker\", container=~\"api.*\", level=\"ERROR\"}", "datasource": {"type": "loki", "uid": "loki"} }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "CPU Usage (%)",
+      "targets": [
+        { "expr": "sum by (name)(irate(container_cpu_usage_seconds_total{name=~\"$container\"}[5m])) * 100", "datasource": {"type": "prometheus", "uid": "prometheus"} }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Memory Usage (MiB)",
+      "targets": [
+        { "expr": "container_memory_usage_bytes{name=~\"$container\"} / 1024 / 1024", "datasource": {"type": "prometheus", "uid": "prometheus"} }
+      ]
+    }
+  ]
+} 

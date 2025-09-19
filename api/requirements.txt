@@ -1,0 +1,90 @@
+# Core Framework
+fastapi==0.115.0
+uvicorn[standard]==0.24.0
+pydantic==2.9.2
+python-multipart==0.0.6
+pydantic-settings==2.5.2
+email-validator==2.2.0
+python-jose==3.4.0
+
+# Database
+SQLAlchemy==2.0.31
+asyncpg==0.29.0
+pymilvus>=2.6.0
+alembic==1.13.2
+
+# ML/AI Libraries
+sentence-transformers==2.6.0
+google-generativeai==0.8.4
+langchain==0.3.19
+langgraph==0.6.7
+langchain-docling==1.0.0
+langchain-community==0.3.18
+langchain-milvus==0.2.1
+langchain-huggingface==0.1.2
+langchain-google-genai==2.0.5
+langchain-text-splitters==0.3.6
+
+# Text Processing
+pypdf==5.1.0
+pymupdf==1.26.1
+python-docx==1.1.2
+python-pptx==1.0.2
+docx2txt==0.9
+pdfplumber==0.11.6
+pandas==2.2.3
+openpyxl==3.1.5
+xlrd==2.0.1
+rank-bm25==0.2.2
+unstructured==0.17.2
+
+# HTTP Client
+aiohttp==3.9.1
+httpx==0.25.2
+requests==2.32.2
+dnspython==2.7.0
+
+# Authentication & Security
+PyJWT==2.9.0
+passlib[bcrypt]==1.7.4
+cryptography==41.0.7
+
+# Storage
+minio==7.2.0
+
+# Configuration
+python-dotenv==1.0.1
+
+# Caching
+redis==5.0.4
+
+# Messaging
+aiokafka==0.10.0
+
+# Observability / Metrics
+prometheus-fastapi-instrumentator==7.0.0
+prometheus-client==0.20.0
+
+# Language Detection
+langdetect==1.0.9
+
+# Web Scraping & Content Extraction
+beautifulsoup4==4.13.4
+lxml==5.4.0
+duckduckgo-search==8.0.2
+
+# Email Templates
+Jinja2==3.1.4
+
+# Development Dependencies (Optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.12.0
+isort==5.13.2
+
+# Production Deployment
+gunicorn>=21.2.0
+
+# For ragas evaluation metrics
+ragas==0.1.18
+datasets==2.16.1

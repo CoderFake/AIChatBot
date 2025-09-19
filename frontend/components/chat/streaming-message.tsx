@@ -1,0 +1,443 @@
+"use client"
+
+import { useState, useEffect, useRef } from "react"
+import { ChevronRight, ChevronDown, CheckCircle, Clock, AlertCircle, ChevronLeft } from "lucide-react"
+import { MarkdownMessage } from "./markdown-message"
+
+interface ThinkingIndicatorProps {
+  className?: string
+  planningData?: PlanningData
+  executionData?: ExecutionData
+  progress?: number
+}
+
+export function ThinkingIndicator({ className = "", planningData, executionData, progress }: ThinkingIndicatorProps) {
+  const [currentDot, setCurrentDot] = useState(0)
+  const [showDropdown, setShowDropdown] = useState(false)
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentDot((prev) => (prev + 1) % 3)
+    }, 500)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (showDropdown && !(event.target as Element).closest('.thinking-dropdown')) {
+        setShowDropdown(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [showDropdown])
+
+  return (
+    <div className={`thinking-dropdown flex items-center gap-2 ${className}`}>
+      {/* Thinking text with cursor-like underline effect */}
+      <div className="relative flex items-center">
+        <span className="shimmer-text font-semibold text-base tracking-wide select-none">
+          thinking
+        </span>
+
+        {/* Animated dots (smaller and subtle) */}
+        <div className="flex gap-1 ml-2">
+          {[...Array(3)].map((_, i) => (
+            <div
+              key={i}
+              className="w-1.5 h-1.5 rounded-full bg-blue-500 transition-all duration-500 ease-in-out"
+              style={{
+                transform: `scale(${currentDot === i ? 1.2 : 0.85})`,
+                opacity: currentDot === i ? 0.9 : 0.5,
+                ...(currentDot === i ? {
+                  animation: `bounce 0.8s ease-in-out infinite`,
+                  animationDelay: `${i * 0.15}s`
+                } : {
+                  animation: 'none'
+                })
+              }}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Expand arrow button to reveal plan list/details */}
+      <button
+        onClick={() => setShowDropdown(!showDropdown)}
+        className="ml-1 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors opacity-70 hover:opacity-100"
+        title="View execution details"
+      >
+        <ChevronRight
+          size={12}
+          className={`text-gray-500 transition-transform duration-200 ${showDropdown ? 'rotate-90' : ''}`}
+        />
+      </button>
+
+      {/* Dropdown with plan/progress, compact typography */}
+      {showDropdown && (
+        <div
+          className="absolute top-full left-0 mt-2 w-80 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10"
+          style={{
+            animation: 'dropdown-fade-in 0.2s ease-out'
+          }}
+        >
+          <div className="p-3">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="font-medium text-xs text-gray-900 dark:text-gray-100">Execution Details</h4>
+              <button
+                onClick={() => setShowDropdown(false)}
+                className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+              >
+                <ChevronLeft size={12} className="text-gray-500" />
+              </button>
+            </div>
+
+            {/* Progress bar */}
+            {progress !== undefined && (
+              <div className="mb-2">
+                <div className="flex justify-between text-[10px] text-gray-600 dark:text-gray-400 mb-1">
+                  <span>Progress</span>
+                  <span>{progress}%</span>
+                </div>
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+                  <div
+                    className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Planning Section (compact) */}
+            {planningData && (
+              <div className="mb-2">
+                <div className="flex items-center gap-2 text-[11px] font-medium text-blue-600 dark:text-blue-400 mb-1">
+                  <Clock size={12} />
+                  <span>Planning</span>
+                </div>
+                {planningData.execution_plan && (
+                  <div className="text-[11px] text-gray-600 dark:text-gray-400 bg-blue-50 dark:bg-blue-950 p-2 rounded">
+                    <div>Tasks: {planningData.execution_plan.execution_flow?.planning?.tasks?.length || 0}</div>
+                    <div>Total Steps: {planningData.execution_plan.total_steps || 0}</div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Plan list details when available */}
+            {planningData?.execution_plan?.steps?.length > 0 && (
+              <div className="space-y-1 max-h-56 overflow-auto pr-1">
+                {(planningData?.execution_plan?.steps ?? []).map((step: any, index: number) => (
+                  <div
+                    key={index}
+                    className={`flex items-start gap-2 p-2 rounded text-[11px] border ${
+                      step.status === 'completed'
+                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
+                        : step.status === 'running'
+                        ? 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800'
+                        : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                    }`}
+                  >
+                    {step.status === 'completed' ? (
+                      <CheckCircle size={10} className="text-green-600 flex-shrink-0 mt-0.5" />
+                    ) : step.status === 'running' ? (
+                      <div className="w-2.5 h-2.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0 mt-0.5"></div>
+                    ) : (
+                      <div className="w-2.5 h-2.5 border-2 border-gray-300 rounded-full flex-shrink-0 mt-0.5"></div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium truncate">Step {index + 1}: {step.step_id || `Step ${index + 1}`}</div>
+                      {step.tasks?.length > 0 && (
+                        <div className="text-gray-600 dark:text-gray-400 mt-0.5 truncate">
+                          {step.tasks.length} task{step.tasks.length > 1 ? 's' : ''}: {step.tasks.map((task: any) => `${task.agent || 'Agent'} (${task.tool || 'Tool'})`).join(', ')}
+                        </div>
+                      )}
+                    </div>
+                    <div className={`text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap ${
+                      step.status === 'completed'
+                        ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
+                        : step.status === 'running'
+                        ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
+                        : 'bg-gray-100 dark:bg-gray-900 text-gray-700 dark:text-gray-300'
+                    }`}>
+                      {step.status || 'pending'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Execution Section (compact) */}
+            {executionData && (
+              <div className="mt-2">
+                <div className="flex items-center gap-2 text-[11px] font-medium text-green-600 dark:text-green-400 mb-1">
+                  <CheckCircle size={12} />
+                  <span>Execution</span>
+                </div>
+                <div className="space-y-1">
+                  {executionData.agent_responses?.map((response, index) => (
+                    <div key={index} className="flex items-center gap-2 text-[11px] bg-green-50 dark:bg-green-950 p-2 rounded">
+                      <CheckCircle size={10} className="text-green-600" />
+                      <span className="font-medium truncate">{response.agent || 'Agent'}</span>
+                      <span className="text-gray-600 dark:text-gray-400 truncate">
+                        {response.tool || 'Tool'} - {response.status || 'Completed'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {!planningData && !executionData && (
+              <div className="text-[11px] text-gray-500 dark:text-gray-400 text-center py-3">
+                No execution details available yet
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface PlanningData {
+  semantic_routing?: any
+  execution_plan?: any
+}
+
+interface ExecutionData {
+  current_step_results?: any[]
+  agent_responses?: any[]
+  execution_plan?: any
+}
+
+interface StreamingMessageProps {
+  content: string
+  isStreaming: boolean
+  planningData?: PlanningData
+  executionData?: ExecutionData
+  progress?: number
+  status?: string
+  onDocumentClick?: (documentId: string, url: string, title?: string) => void
+}
+
+export function StreamingMessage({
+  content,
+  isStreaming,
+  planningData,
+  executionData,
+  progress,
+  status,
+  onDocumentClick
+}: StreamingMessageProps) {
+  const [displayedContent, setDisplayedContent] = useState("")
+  const [isPlanningExpanded, setIsPlanningExpanded] = useState(false)
+  const [isExecutionExpanded, setIsExecutionExpanded] = useState(true) // Auto expand execution
+  const messageRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (isStreaming) {
+      setDisplayedContent(content)
+    } else {
+      setDisplayedContent(content)
+    }
+  }, [content, isStreaming])
+
+  // Blinking cursor effect - DISABLED
+  // useEffect(() => {
+  //   if (!isStreaming) {
+  //     setShowCursor(false)
+  //     return
+  //   }
+
+  //   const interval = setInterval(() => {
+  //     setShowCursor((prev) => !prev)
+  //   }, 500)
+
+  //   return () => clearInterval(interval)
+  // }, [isStreaming])
+
+  // Auto-scroll to keep message in view
+  useEffect(() => {
+    if (messageRef.current) {
+      messageRef.current.scrollIntoView({ behavior: "smooth", block: "end" })
+    }
+  }, [displayedContent])
+
+  const renderPlanningSection = () => {
+    if (!planningData) return null
+
+    return (
+      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950">
+        <button
+          onClick={() => setIsPlanningExpanded(!isPlanningExpanded)}
+          className="flex items-center gap-2 text-blue-700 dark:text-blue-300 font-medium hover:text-blue-800 dark:hover:text-blue-200 transition-colors"
+        >
+          {isPlanningExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+          <span>Planning & Analysis</span>
+          <span className="text-xs bg-blue-200 dark:bg-blue-800 px-2 py-1 rounded flex items-center gap-1">
+            {progress === 100 ? (
+              <>
+                <CheckCircle size={10} className="text-green-600" />
+                <span>Completed</span>
+              </>
+            ) : (
+              `${progress || 0}%`
+            )}
+          </span>
+        </button>
+
+        {isPlanningExpanded && (
+          <div className="mt-3 space-y-3">
+            {planningData.execution_plan && (
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border">
+                <h4 className="font-medium text-sm mb-2">Execution Plan Steps</h4>
+                <div className="space-y-2">
+                  {planningData.execution_plan.steps && planningData.execution_plan.steps.length > 0 ? (
+                    planningData.execution_plan.steps.map((step: any, index: number) => (
+                      <div
+                        key={index}
+                        className={`flex items-center gap-2 p-2 rounded text-xs border ${
+                          step.status === 'completed'
+                            ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
+                            : step.status === 'running'
+                            ? 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800'
+                            : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                        }`}
+                      >
+                        {step.status === 'completed' ? (
+                          <CheckCircle size={12} className="text-green-600 flex-shrink-0" />
+                        ) : step.status === 'running' ? (
+                          <div className="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0"></div>
+                        ) : (
+                          <div className="w-3 h-3 border-2 border-gray-300 rounded-full flex-shrink-0"></div>
+                        )}
+                        <div className="flex-1">
+                          <div className="font-medium">
+                            Step {index + 1}: {step.step_id || `Step ${index + 1}`}
+                          </div>
+                          {step.tasks && step.tasks.length > 0 && (
+                            <div className="text-gray-600 dark:text-gray-400 mt-1">
+                              {step.tasks.length} task{step.tasks.length > 1 ? 's' : ''}: {step.tasks.map((task: any, taskIndex: number) =>
+                                `${task.agent || 'Agent'} (${task.tool || 'Tool'})`
+                              ).join(', ')}
+                            </div>
+                          )}
+                        </div>
+                        <div className={`text-xs px-2 py-1 rounded ${
+                          step.status === 'completed'
+                            ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
+                            : step.status === 'running'
+                            ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
+                            : 'bg-gray-100 dark:bg-gray-900 text-gray-700 dark:text-gray-300'
+                        }`}>
+                          {step.status || 'pending'}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      No steps available yet
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-3 pt-2 border-t border-gray-200 dark:border-gray-700">
+                  <div className="text-xs space-y-1">
+                    <div>Total Steps: {planningData.execution_plan.total_steps || 0}</div>
+                    <div>Current Step: {planningData.execution_plan.current_step || 0}</div>
+                    <div>Status: {planningData.execution_plan.aggregate_status || 'pending'}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {planningData.semantic_routing && (
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border">
+                <h4 className="font-medium text-sm mb-2">Semantic Routing</h4>
+                <div className="text-xs">
+                  {planningData.semantic_routing.is_chitchat ? (
+                    <span className="text-green-600">Chitchat detected - Direct response</span>
+                  ) : (
+                    <span className="text-blue-600">Complex query - Multi-agent execution</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const renderExecutionSection = () => {
+    if (!executionData) return null
+
+    return (
+      <div className="border border-green-200 rounded-lg p-3 mb-3 bg-green-50 dark:bg-green-950">
+        <div className="flex items-center gap-2 text-green-700 dark:text-green-300 font-medium mb-2">
+          <Clock size={16} />
+          <span>Executing Plan</span>
+          {progress && (
+            <span className="text-xs bg-green-200 dark:bg-green-800 px-2 py-1 rounded">
+              {progress}%
+            </span>
+          )}
+        </div>
+
+        {isExecutionExpanded && (
+          <div className="space-y-2">
+            {executionData.agent_responses?.map((response, index) => (
+              <div key={index} className="flex items-center gap-2 bg-white dark:bg-gray-800 rounded p-2 border text-xs">
+                <CheckCircle size={12} className="text-green-600" />
+                <span className="font-medium">{response.agent || 'Agent'}</span>
+                <span className="text-gray-600 dark:text-gray-400">
+                  {response.tool || 'Tool'} - {response.status || 'Completed'}
+                </span>
+              </div>
+            ))}
+
+            {executionData.current_step_results?.map((step, index) => (
+              <div key={index} className="flex items-center gap-2 bg-white dark:bg-gray-800 rounded p-2 border text-xs">
+                <AlertCircle size={12} className="text-yellow-600" />
+                <span>Step {index + 1}: {step.description || 'Processing...'}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div ref={messageRef} className="flex items-start gap-3">
+      <div className="flex-1 space-y-2">
+        {/* Planning Section */}
+        {renderPlanningSection()}
+
+        {/* Execution Section */}
+        {renderExecutionSection()}
+
+        {/* Main Content */}
+        {(content || isStreaming) && (
+          <div className="prose prose-sm max-w-none dark:prose-invert">
+            <MarkdownMessage content={displayedContent} onDocumentClick={onDocumentClick} />
+          </div>
+        )}
+
+        {/* Thinking Indicator - show when streaming and processing */}
+        {isStreaming && (
+          <div className="mt-3 relative">
+            <ThinkingIndicator
+              planningData={planningData}
+              executionData={executionData}
+              progress={progress}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
