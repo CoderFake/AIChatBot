@@ -106,7 +106,6 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
       setProviders(dynamicData.providers || [])
       setAvailableTools(dynamicData.tools || [])
     } catch (error) {
-      console.error('Failed to load dynamic data:', error)
     }
   }
 
@@ -127,11 +126,9 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
           }
         })
       }
-      
+
       setExistingAgentNames(agentNames)
-      console.log('Loaded existing agent names:', agentNames)
     } catch (error) {
-      console.error('Failed to load existing agent names:', error)
       setExistingAgentNames([])
     }
   }
@@ -139,25 +136,22 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
   const loadModelsForProvider = async (providerId: string) => {
     try {
       const provider = providers.find(p => p.id === providerId)
-      console.log('Loading models for provider:', providerId, 'Found provider:', provider)
       if (provider) {
         setModels(provider.models || [])
         setSelectedModel('')
       }
     } catch (error) {
-      console.error('Failed to load models:', error)
+      // Failed to load models
     }
   }
 
   const loadModelsForEditProvider = async (providerId: string) => {
     try {
       const provider = providers.find(p => p.id === providerId)
-      console.log('Loading models for edit provider:', providerId, 'Found provider:', provider)
       if (provider) {
         setModels(provider.models || [])
       }
     } catch (error) {
-      console.error('Failed to load models for edit:', error)
     }
   }
 
@@ -273,8 +267,6 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
       resetCreateForm()
       loadDepartments()
     } catch (error: any) {
-      console.error('Error creating department:', error)
-      
       let errorMessage = t('messages.errors.failedToCreateDepartment')
       
       if (error?.response?.data?.detail) {
@@ -352,8 +344,6 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
       resetEditForm()
       loadDepartments()
     } catch (error: any) {
-      console.error('Error updating department:', error)
-
       let errorMessage = t('messages.errors.failedToUpdateDepartment')
 
       if (error?.response?.data?.detail) {
@@ -459,7 +449,6 @@ export function DepartmentManagement({ tenantId }: DepartmentManagementProps) {
 
       setIsEditDialogOpen(true)
     } catch (error) {
-      console.error('Failed to load department data for editing:', error)
       toast({
         title: t('notifications.error'),
         description: t('messages.errors.failedToLoadDepartmentData'),

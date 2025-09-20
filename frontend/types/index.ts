@@ -285,3 +285,92 @@ export interface Notification {
   message: string
   duration?: number
 }
+
+export interface FolderInfoContext {
+  department_id: string
+  folder_id?: string | null
+  role: string
+  department_name: string
+  is_root: boolean
+  queried_at: string
+}
+
+export interface FolderInfoBreadcrumb {
+  id: string
+  name: string
+  path_display: string
+}
+
+export interface FolderInfoPermissions {
+  can_access: boolean
+  reason: string
+}
+
+export interface FolderInfoCollection {
+  id?: string | null
+  collection_type?: string | null
+  is_active?: boolean | null
+  vector_config?: Record<string, any> | null
+  document_count?: number | null
+}
+
+export interface FolderInfoDocument {
+  id: string
+  department_id: string
+  folder_id?: string | null
+  collection_id?: string | null
+  title: string
+  filename: string
+  description?: string | null
+  access_level: string
+  uploaded_by: string
+  file_size: number
+  file_type: string
+  bucket_name: string
+  storage_key: string
+  storage_path: string
+  processing_status: string
+  vector_status: string
+  chunk_count: number
+  collection?: FolderInfoCollection | null
+  path_display: string
+  permissions: FolderInfoPermissions
+  created_at: string
+  updated_at?: string | null
+}
+
+export interface FolderInfoFolder {
+  id: string
+  department_id: string
+  folder_name: string
+  folder_path: string
+  path_display: string
+  parent_folder_id?: string | null
+  access_level: string
+  created_by?: string | null
+  created_at: string
+  updated_at?: string | null
+}
+
+export interface FolderInfoCounts {
+  folders: number
+  documents: number
+}
+
+export interface FolderInfoPagination {
+  page: number
+  page_size: number
+  total_folders: number
+  total_documents: number
+}
+
+export interface FolderInfoResponse {
+  context: FolderInfoContext
+  folder_child_ids: string[]
+  document_ids: string[]
+  breadcrumbs: FolderInfoBreadcrumb[]
+  folders: FolderInfoFolder[]
+  documents: FolderInfoDocument[]
+  counts: FolderInfoCounts
+  pagination: FolderInfoPagination
+}

@@ -101,7 +101,7 @@ export default function ChatPage() {
     try {
       await logout()
     } catch (error) {
-      console.error("Logout failed:", error)
+      // Logout failed
     }
   }
 
@@ -144,7 +144,6 @@ export default function ChatPage() {
 
       setMessages(msgs)
     } catch (error) {
-      console.error("Failed to load messages:", error)
       setMessages([{
         id: "error",
         content: t("chat.failedToLoadMessages"),
@@ -169,7 +168,6 @@ export default function ChatPage() {
             setCurrentSessionId(sessionResult.session_id)
             setMessages([])
           } catch (error) {
-            console.error("Failed to create initial session:", error)
             setCurrentSessionId(null)
             setMessages([
               {
@@ -209,7 +207,6 @@ export default function ChatPage() {
       const sess = Array.isArray(response) ? response : (response.sessions || response || [])
       setSessions(sess)
     } catch (error) {
-      console.error("Failed to create session:", error)
       setMessages([
         {
           id: "error",
@@ -255,7 +252,6 @@ export default function ChatPage() {
             setCurrentSessionId(sessionResult.session_id)
             setMessages([])
           } catch (error) {
-            console.error("Failed to create new session after delete:", error)
             setCurrentSessionId(null)
             setMessages([])
           }
@@ -263,8 +259,6 @@ export default function ChatPage() {
       }
 
     } catch (error) {
-      console.error("Failed to delete session:", error)
-      // You might want to show a toast notification here
     } finally {
       setDeleteConfirmOpen(false)
       setSessionToDelete(null)
@@ -288,8 +282,6 @@ export default function ChatPage() {
       setSessions(updatedSessions)
 
     } catch (error) {
-      console.error("Failed to update title:", error)
-      // You might want to show a toast notification here
     } finally {
       setEditingSession(null)
       setEditTitleValue("")
@@ -361,7 +353,6 @@ export default function ChatPage() {
                       updatedMsg.isStreaming = true
                       
                       if (eventData.session_title && isFirstMessageOfNewSession) {
-                        console.log('Updating session title:', eventData.session_title, 'for session:', actualSessionId)
                         setSessions(prevSessions => 
                           prevSessions.map(session => 
                             (session.session_id === actualSessionId || session.id === actualSessionId) 
@@ -369,13 +360,7 @@ export default function ChatPage() {
                               : session
                           )
                         )
-                      } else if (eventData.session_title) {
-                        console.log('Received session_title but not first message:', {
-                          title: eventData.session_title,
-                          isFirst: isFirstMessageOfNewSession,
-                          messagesLength: messages.length
-                        })
-                      }
+                      } 
                       break
                     case 2:
                     case 'plan_execution':
@@ -433,11 +418,9 @@ export default function ChatPage() {
                         }))
                       }
 
-                      console.log('SSE End event received:', eventData)
                       break
 
                     default:
-                      // For unknown types, only update if it's actual content
                       if (eventData.content && !eventData.type?.includes('plan')) {
                         updatedMsg.content = eventData.content
                       }
@@ -483,7 +466,6 @@ export default function ChatPage() {
          }
       )
     } catch (error) {
-      console.error("Failed to send message:", error)
       setStreamingMessageId(null)
       setIsLoading(false)
       setCurrentPlanningData(null)

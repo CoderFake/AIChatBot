@@ -49,7 +49,6 @@ function TenantLoginContent({ params }: TenantLoginPageProps) {
             description: data.description
           })
         } else {
-          // Fallback to just tenant name
           setTenantInfo({
             tenant_name: tenantId,
             logo_url: undefined,

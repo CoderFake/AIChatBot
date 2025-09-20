@@ -74,7 +74,6 @@ export function TenantProvider({ children, initialTenantId }: TenantProviderProp
 
     // Skip if not authenticated
     if (!isAuthenticated) {
-      console.log("⏳ Skipping tenant fetch - not authenticated")
       setTenant(null)
       setError(null)
       setIsLoading(false)
@@ -85,7 +84,6 @@ export function TenantProvider({ children, initialTenantId }: TenantProviderProp
     setError(null)
 
     try {
-      console.log("🔍 Fetching tenant details for authenticated user")
       const tenantData = await apiService.tenants.getDetail(id)
       setTenant(tenantData)
 
@@ -98,7 +96,6 @@ export function TenantProvider({ children, initialTenantId }: TenantProviderProp
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Failed to load tenant"
       setError(errorMessage)
-      console.error("Failed to fetch tenant details:", err)
     } finally {
       setIsLoading(false)
     }
