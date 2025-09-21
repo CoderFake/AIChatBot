@@ -35,7 +35,7 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
   }, [showDropdown])
 
   return (
-    <div className={`thinking-dropdown flex items-center gap-2 ${className}`}>
+    <div className={`thinking-dropdown relative flex items-center gap-2 max-w-full ${className}`}>
       {/* Thinking text with cursor-like underline effect */}
       <div className="relative flex items-center">
         <span className="shimmer-text font-semibold text-base tracking-wide select-none">
@@ -78,9 +78,10 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
       {/* Dropdown with plan/progress, compact typography */}
       {showDropdown && (
         <div
-          className="absolute top-full left-0 mt-2 w-80 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10"
+          className="absolute top-full left-0 mt-2 w-full max-w-xs sm:max-w-sm md:max-w-md bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10 overflow-hidden"
           style={{
-            animation: 'dropdown-fade-in 0.2s ease-out'
+            animation: 'dropdown-fade-in 0.2s ease-out',
+            maxWidth: 'min(20rem, calc(100% - 0.5rem))'
           }}
         >
           <div className="p-3">
@@ -106,6 +107,62 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                     className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
                     style={{ width: `${progress}%` }}
                   />
+                </div>
+              </div>
+            )}
+
+            {/* Task status list */}
+            {planningData?.formatted_tasks?.length > 0 && (
+              <div className="mb-3">
+                <div className="flex items-center gap-2 text-[11px] font-medium text-gray-800 dark:text-gray-100 mb-1">
+                  <ChevronRight size={12} className="text-blue-500" />
+                  <span>Task execution timeline</span>
+                </div>
+                <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                  {planningData.formatted_tasks.map((task: any, index: number) => {
+                    const status = task.status || 'pending'
+                    const isCompleted = status === 'completed'
+                    const isFailed = status === 'failed'
+                    const isRunning = status === 'in_progress'
+                    const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+                    const baseClasses = isCompleted
+                      ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                      : isFailed
+                      ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                      : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+
+                    return (
+                      <div
+                        key={task.task_index ?? index}
+                        className={`flex items-start gap-2 border rounded-md px-2 py-2 text-[11px] ${baseClasses}`}
+                      >
+                        {isCompleted ? (
+                          <CheckCircle size={12} className="mt-0.5 text-green-500" />
+                        ) : isFailed ? (
+                          <AlertCircle size={12} className="mt-0.5 text-red-500" />
+                        ) : (
+                          <div className={`mt-0.5 w-2 h-2 rounded-full bg-blue-500 ${isRunning ? 'animate-pulse' : ''}`} />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="font-semibold truncate">{task.task_name || `Task ${index + 1}`}</div>
+                          <div className="text-[10px] opacity-80 truncate">
+                            {task.agent ? `${task.agent}` : 'Agent'}
+                            {task.messages && Object.keys(task.messages).length > 0 && (
+                              <span className="ml-1">
+                                — {Object.values(task.messages).join(' › ')}
+                              </span>
+                            )}
+                          </div>
+                          {task.error && (
+                            <div className="text-[10px] mt-1 text-red-500 dark:text-red-300 truncate">
+                              {task.error}
+                            </div>
+                          )}
+                        </div>
+                        <span className="text-[10px] font-medium whitespace-nowrap">{statusText}</span>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}
@@ -205,6 +262,10 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
 interface PlanningData {
   semantic_routing?: any
   execution_plan?: any
+  formatted_tasks?: any[]
+  progress?: number
+  status?: string
+  message?: string
 }
 
 interface ExecutionData {
@@ -270,7 +331,7 @@ export function StreamingMessage({
     if (!planningData) return null
 
     return (
-      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950">
+      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950 w-full max-w-full overflow-hidden">
         <button
           onClick={() => setIsPlanningExpanded(!isPlanningExpanded)}
           className="flex items-center gap-2 text-blue-700 dark:text-blue-300 font-medium hover:text-blue-800 dark:hover:text-blue-200 transition-colors"
@@ -291,6 +352,54 @@ export function StreamingMessage({
 
         {isPlanningExpanded && (
           <div className="mt-3 space-y-3">
+            {planningData.formatted_tasks?.length > 0 && (
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden">
+                <h4 className="font-medium text-sm mb-2">Task Progress</h4>
+                <div className="space-y-2">
+                  {planningData.formatted_tasks.map((task: any, index: number) => {
+                    const status = task.status || 'pending'
+                    const isCompleted = status === 'completed'
+                    const isFailed = status === 'failed'
+                    const isRunning = status === 'in_progress'
+                    const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+                    return (
+                      <div
+                        key={task.task_index ?? index}
+                        className={`flex items-start gap-3 p-2 rounded text-xs border ${
+                          isCompleted
+                            ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                            : isFailed
+                            ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                            : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                        }`}
+                      >
+                        {isCompleted ? (
+                          <CheckCircle size={12} className="mt-0.5 text-green-500" />
+                        ) : isFailed ? (
+                          <AlertCircle size={12} className="mt-0.5 text-red-500" />
+                        ) : (
+                          <div className={`mt-0.5 w-2 h-2 rounded-full bg-blue-500 ${isRunning ? 'animate-pulse' : ''}`} />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="font-semibold truncate">{task.task_name || `Task ${index + 1}`}</div>
+                          <div className="text-gray-600 dark:text-gray-400 mt-0.5 truncate">
+                            {task.agent || 'Agent'}
+                            {task.messages && Object.keys(task.messages).length > 0 && (
+                              <span className="ml-1">— {Object.values(task.messages).join(' › ')}</span>
+                            )}
+                          </div>
+                          {task.error && (
+                            <div className="text-red-500 dark:text-red-300 text-[11px] mt-1 truncate">{task.error}</div>
+                          )}
+                        </div>
+                        <span className="text-[11px] font-medium whitespace-nowrap">{statusText}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             {planningData.execution_plan && (
               <div className="bg-white dark:bg-gray-800 rounded p-3 border">
                 <h4 className="font-medium text-sm mb-2">Execution Plan Steps</h4>
@@ -299,7 +408,7 @@ export function StreamingMessage({
                     planningData.execution_plan.steps.map((step: any, index: number) => (
                       <div
                         key={index}
-                        className={`flex items-center gap-2 p-2 rounded text-xs border ${
+                        className={`flex items-center gap-2 p-2 rounded text-xs border overflow-hidden ${
                           step.status === 'completed'
                             ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
                             : step.status === 'running'
@@ -314,12 +423,12 @@ export function StreamingMessage({
                         ) : (
                           <div className="w-3 h-3 border-2 border-gray-300 rounded-full flex-shrink-0"></div>
                         )}
-                        <div className="flex-1">
-                          <div className="font-medium">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium break-words">
                             Step {index + 1}: {step.step_id || `Step ${index + 1}`}
                           </div>
                           {step.tasks && step.tasks.length > 0 && (
-                            <div className="text-gray-600 dark:text-gray-400 mt-1">
+                            <div className="text-gray-600 dark:text-gray-400 mt-1 break-words">
                               {step.tasks.length} task{step.tasks.length > 1 ? 's' : ''}: {step.tasks.map((task: any, taskIndex: number) =>
                                 `${task.agent || 'Agent'} (${task.tool || 'Tool'})`
                               ).join(', ')}

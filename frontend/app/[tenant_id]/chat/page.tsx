@@ -365,18 +365,27 @@ export default function ChatPage() {
                     case 2:
                     case 'plan_execution':
                     case 'plan':
-                      setCurrentPlanningData({
+                      const planUpdate = {
                         semantic_routing: eventData.semantic_routing,
                         execution_plan: eventData.execution_plan,
-                        progress: eventData.progress || 0,
+                        formatted_tasks: eventData.formatted_tasks || [],
+                        progress: eventData.progress ?? updatedMsg.progress ?? 0,
                         status: eventData.status || 'running',
-                        message: eventData.message || 'Planning execution...',
-                        ...eventData.planningData
-                      })
+                        message: eventData.message || 'Planning execution...'
+                      }
+
+                      setCurrentPlanningData((prev: any) => ({
+                        ...(prev || {}),
+                        ...planUpdate
+                      }))
 
                       updatedMsg.isStreaming = true
-                      updatedMsg.progress = eventData.progress || 0
-                      updatedMsg.status = eventData.status || 'running'
+                      updatedMsg.progress = planUpdate.progress
+                      updatedMsg.status = planUpdate.status
+                      updatedMsg.planningData = {
+                        ...(updatedMsg.planningData || {}),
+                        ...planUpdate
+                      }
                       break
 
                     case 3:
@@ -463,7 +472,8 @@ export default function ChatPage() {
           setStreamingMessageId(null)
           setIsLoading(false)
           setCurrentPlanningData(null) 
-         }
+        },
+        isManager ? scope : "public"
       )
     } catch (error) {
       setStreamingMessageId(null)
@@ -716,6 +726,8 @@ export default function ChatPage() {
                       <StreamingMessage
                         content={message.content}
                         isStreaming={message.isStreaming || false}
+                        planningData={message.planningData}
+                        executionData={message.executionData}
                         progress={message.progress}
                         status={message.status}
                         onDocumentClick={handleDocumentClick}

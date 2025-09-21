@@ -2,6 +2,7 @@
 RAG Tool implementation
 """
 from typing import List, Optional, Type
+import uuid
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from pydantic import BaseModel
@@ -11,6 +12,9 @@ from models.models import RAGSearchInput
 from utils.logging import get_logger
 from config.settings import get_settings
 import json
+from sqlalchemy import select
+
+from models.database.document import Document
 
 settings = get_settings()
 
@@ -32,12 +36,12 @@ class RAGSearchTool(BaseTool):
 
     def _run(
         self,
-        query: str, 
-        department: str, 
+        query: str,
+        department: str,
         user_id: str,
         access_levels: List[str] = ["public"],
         run_manager: Optional[CallbackManagerForToolRun] = None,
-    ) -> str:
+    ) -> dict:
         """
         Execute RAG search synchronously
         
@@ -57,23 +61,25 @@ class RAGSearchTool(BaseTool):
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self._async_search(query, department, user_id, access_levels))
-                    results = future.result()
-            else:
-                results = asyncio.run(self._async_search(query, department, user_id, access_levels))
-            
-            return results
+                    future = executor.submit(
+                        asyncio.run,
+                        self._async_search(query, department, user_id, access_levels)
+                    )
+                    return future.result()
+
+            return asyncio.run(self._async_search(query, department, user_id, access_levels))
             
         except Exception as e:
             error_msg = f"RAG search failed: {str(e)}"
             logger.error(f"RAG search error for user {user_id}: {e}")
-            return json.dumps({
+            return {
                 "context": "",
                 "documents": [],
+                "sources": [],
                 "error": error_msg,
                 "department": department,
                 "user_id": user_id
-            }, ensure_ascii=False, indent=2)
+            }
 
     async def _arun(
         self,
@@ -83,7 +89,7 @@ class RAGSearchTool(BaseTool):
         access_levels: List[str] = ["public"],
         access_scope_override: Optional[str] = None,
         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
-    ) -> str:
+    ) -> dict:
         """
         Execute RAG search asynchronously
 
@@ -96,7 +102,7 @@ class RAGSearchTool(BaseTool):
             run_manager: Async callback manager for tool run
 
         Returns:
-            JSON string containing search results, context, and metadata
+            Dict containing search results, sources, and metadata
         """
         try:
             if run_manager:
@@ -121,10 +127,10 @@ class RAGSearchTool(BaseTool):
                 effective_access_levels = access_levels
 
             results = await self._async_search(query, department, user_id, effective_access_levels, access_scope_override)
-            
+
             if run_manager:
-                await run_manager.on_tool_end(results)
-            
+                await run_manager.on_tool_end(json.dumps(results, ensure_ascii=False))
+
             return results
             
         except Exception as e:
@@ -133,14 +139,15 @@ class RAGSearchTool(BaseTool):
             
             if run_manager:
                 await run_manager.on_tool_error(e)
-            
-            return json.dumps({
+
+            return {
                 "context": "",
                 "documents": [],
+                "sources": [],
                 "error": error_msg,
                 "department": department,
                 "user_id": user_id
-            }, ensure_ascii=False, indent=2)
+            }
 
     async def _async_search(
         self,
@@ -171,16 +178,16 @@ class RAGSearchTool(BaseTool):
 
             valid_levels = [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]
             access_levels = [level for level in access_levels if level in valid_levels]
-            
+
             if not access_levels:
                 access_levels = [AccessLevel.PUBLIC.value]
-            
+
             async with get_db_context() as db_session:
                 permission_service = RAGPermissionService(db_session)
-                
+
                 all_accessible_collections = []
                 effective_access_levels = []
-                
+
                 for access_level in access_levels:
                     has_access, accessible_collections, effective_level = await permission_service.check_rag_access_with_override(
                         user_id=user_id,
@@ -188,23 +195,24 @@ class RAGSearchTool(BaseTool):
                         requested_access_level=access_level,
                         access_scope_override=access_scope_override
                     )
-                    
+
                     if has_access and accessible_collections:
                         all_accessible_collections.extend(accessible_collections)
                         if effective_level not in effective_access_levels:
                             effective_access_levels.append(effective_level)
-                
+
                 all_accessible_collections = list(dict.fromkeys(all_accessible_collections))
-                
+
                 if not all_accessible_collections:
-                    return json.dumps({
+                    return {
                         "context": "",
                         "documents": [],
+                        "sources": [],
                         "error": "Access denied: No accessible collections found for requested access levels",
                         "department": department,
                         "requested_access_levels": access_levels,
                         "effective_access_levels": []
-                    }, ensure_ascii=False, indent=2)
+                    }
                 
                 all_results = []
                 search_summary = {
@@ -251,26 +259,27 @@ class RAGSearchTool(BaseTool):
                         continue
                 
                 if not all_results:
-                    return json.dumps({
+                    return {
                         "context": "",
                         "documents": [],
+                        "sources": [],
                         "message": f"No relevant documents found in {department} collections for your query",
                         "department": department,
                         "requested_access_levels": access_levels,
                         "effective_access_levels": effective_access_levels,
                         "search_summary": search_summary
-                    }, ensure_ascii=False, indent=2)
+                    }
                 
                 all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
                 top_results = all_results[:15]  
 
                 context_parts = []
                 documents = []
-                
+
                 for result in top_results:
                     content = result.get("content", "")
                     metadata = result.get("metadata", {})
-                    
+
                     if content and content not in context_parts: 
                         context_parts.append(content)
                     
@@ -285,9 +294,64 @@ class RAGSearchTool(BaseTool):
                         "datetime": metadata.get("created_at", metadata.get("timestamp", "Unknown")),
                         "metadata": metadata
                     })
-                
+
                 context = "\n\n---\n\n".join(context_parts)
-                
+
+                document_details = {}
+                document_ids: List[str] = []
+                for doc in documents:
+                    doc_id = doc.get("document_id")
+                    if doc_id and doc_id not in ["unknown", ""]:
+                        document_ids.append(doc_id)
+
+                if document_ids:
+                    unique_ids = []
+                    for doc_id in document_ids:
+                        try:
+                            unique_ids.append(uuid.UUID(doc_id))
+                        except (TypeError, ValueError):
+                            continue
+
+                    if unique_ids:
+                        db_documents = await db_session.execute(
+                            select(Document).where(Document.id.in_(unique_ids))
+                        )
+                        for db_doc in db_documents.scalars().all():
+                            document_details[str(db_doc.id)] = {
+                                "title": db_doc.title or db_doc.filename,
+                                "filename": db_doc.filename,
+                            }
+
+                sources = []
+                seen_keys = set()
+
+                for doc in documents:
+                    doc_id = str(doc.get("document_id", ""))
+                    detail_info = document_details.get(doc_id, {})
+                    title = detail_info.get("title") or doc.get("source") or doc.get("metadata", {}).get("source") or "Document"
+                    evidence_url = None
+                    if doc_id and doc_id not in ["", "unknown"]:
+                        evidence_url = f"/api/v1/documents/{doc_id}/download"
+
+                    doc["title"] = title
+                    if evidence_url:
+                        doc["url"] = evidence_url
+                        doc["evidence_url"] = evidence_url
+
+                    evidence_entry = {
+                        "document_id": doc_id,
+                        "title": title,
+                        "url": evidence_url,
+                        "score": doc.get("score"),
+                        "collection": doc.get("collection"),
+                        "access_level": doc.get("collection_type")
+                    }
+
+                    dedup_key = evidence_url or doc_id or title
+                    if dedup_key and dedup_key not in seen_keys:
+                        sources.append(evidence_entry)
+                        seen_keys.add(dedup_key)
+
                 results_by_access_level = {}
                 for level in effective_access_levels:
                     level_results = [doc for doc in documents if (
@@ -295,10 +359,11 @@ class RAGSearchTool(BaseTool):
                         (level == AccessLevel.PRIVATE.value and doc["collection_type"] == "private")
                     )]
                     results_by_access_level[level] = len(level_results)
-                
+
                 result = {
                     "context": context,
                     "documents": documents,
+                    "sources": sources,
                     "total_results": len(all_results),
                     "displayed_results": len(top_results),
                     "department": department,
@@ -316,15 +381,16 @@ class RAGSearchTool(BaseTool):
                     }
                 }
                 
-                return json.dumps(result, ensure_ascii=False, indent=2)
-                
+                return result
+
         except Exception as e:
             logger.error(f"RAG search failed: {e}")
             error_result = {
                 "context": "",
                 "documents": [],
+                "sources": [],
                 "error": f"Search failed: {str(e)}",
                 "department": department,
                 "requested_access_levels": access_levels if 'access_levels' in locals() else ["public"]
             }
-            return json.dumps(error_result, ensure_ascii=False, indent=2)
+            return error_result

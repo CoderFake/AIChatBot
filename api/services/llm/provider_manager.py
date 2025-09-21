@@ -16,6 +16,19 @@ import httpx
 logger = get_logger(__name__)
 
 
+DEFAULT_GEMINI_SAFETY_SETTINGS: List[Dict[str, str]] = [
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUAL_CONTENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
+DEFAULT_GEMINI_SYSTEM_INSTRUCTION = (
+    "You are a helpful enterprise assistant. Provide concise, policy-compliant answers "
+    "using the user's language when possible."
+)
+
+
 class BaseLLMProvider(ABC):
     """Base class for LLM providers"""
     
@@ -142,11 +155,45 @@ class GeminiProvider(BaseLLMProvider):
         response_format = kwargs.get("response_format")
         temperature = kwargs.get("temperature")
         markdown = kwargs.get("markdown", False)
+        system_instruction = kwargs.get("system_instruction")
+        safety_settings = kwargs.get("safety_settings")
+        generation_overrides = kwargs.get("generation_config_overrides") or {}
+        stop_sequences = kwargs.get("stop_sequences")
+        top_p = kwargs.get("top_p")
+        top_k = kwargs.get("top_k")
 
         generation_config = {
             "max_output_tokens": kwargs.get("max_tokens", self.config.config.get("max_tokens", 8192)),
             "temperature": temperature,
+            "top_p": top_p if top_p is not None else self.config.config.get("top_p"),
+            "top_k": top_k if top_k is not None else self.config.config.get("top_k"),
         }
+
+        if stop_sequences:
+            generation_config["stop_sequences"] = stop_sequences
+
+        if generation_overrides and isinstance(generation_overrides, dict):
+            generation_config.update({k: v for k, v in generation_overrides.items() if v is not None})
+
+        generation_config = {k: v for k, v in generation_config.items() if v is not None}
+
+        if not safety_settings:
+            safety_settings = DEFAULT_GEMINI_SAFETY_SETTINGS
+
+        if not system_instruction:
+            system_instruction = DEFAULT_GEMINI_SYSTEM_INSTRUCTION
+
+        model_kwargs: Dict[str, Any] = {}
+        if safety_settings:
+            model_kwargs["safety_settings"] = safety_settings
+        if system_instruction:
+            model_kwargs["system_instruction"] = system_instruction
+        if kwargs.get("tools"):
+            model_kwargs["tools"] = kwargs["tools"]
+        if kwargs.get("tool_config"):
+            model_kwargs["tool_config"] = kwargs["tool_config"]
+        if kwargs.get("tool_configuration"):
+            model_kwargs["tool_config"] = kwargs["tool_configuration"]
         
         if response_format == "json_object" or kwargs.get("json_mode", False):
             generation_config["response_mime_type"] = "application/json"
@@ -154,7 +201,7 @@ class GeminiProvider(BaseLLMProvider):
                 prompt = f"{prompt}\n\nPlease respond in valid JSON format."
         
         if markdown:
-            return self._stream_response(prompt, model_name, keys, generation_config)
+            return self._stream_response(prompt, model_name, keys, generation_config, model_kwargs)
         
         for attempt in range(max_retries):
             try:
@@ -163,7 +210,8 @@ class GeminiProvider(BaseLLMProvider):
                 
                 llm_model = genai.GenerativeModel(
                     model_name=model_name,
-                    generation_config=genai.GenerationConfig(**generation_config)
+                    generation_config=genai.GenerationConfig(**generation_config),
+                    **model_kwargs
                 )
 
                 try:
@@ -231,7 +279,14 @@ class GeminiProvider(BaseLLMProvider):
         
         raise RuntimeError("Gemini provider exhausted all retry attempts")
 
-    async def _stream_response(self, prompt: str, model_name: str, keys: List[str], generation_config: Dict) -> AsyncGenerator[str, None]:
+    async def _stream_response(
+        self,
+        prompt: str,
+        model_name: str,
+        keys: List[str],
+        generation_config: Dict,
+        model_kwargs: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
         """Stream Gemini response chunks"""
         import google.generativeai as genai
         
@@ -241,7 +296,8 @@ class GeminiProvider(BaseLLMProvider):
         
         llm_model = genai.GenerativeModel(
             model_name=model_name,
-            generation_config=genai.GenerationConfig(**generation_config)
+            generation_config=genai.GenerationConfig(**generation_config),
+            **model_kwargs
         )
 
         try:

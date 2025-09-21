@@ -28,6 +28,37 @@ class RedisService:
         self._max_retries = 3
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    async def close(self):
+        """Close redis connections and reset state"""
+        try:
+            if self.redis_client:
+                try:
+                    await asyncio.shield(self.redis_client.close())
+                except Exception as close_error:
+                    logger.debug(f"Error closing redis client: {close_error}")
+
+            if self.redis_pool:
+                try:
+                    disconnect_result = self.redis_pool.disconnect(inuse_connections=True)
+                    if asyncio.iscoroutine(disconnect_result):
+                        await asyncio.shield(disconnect_result)
+                except TypeError:
+                    # Older redis versions don't accept keyword arguments
+                    try:
+                        disconnect_result = self.redis_pool.disconnect()
+                        if asyncio.iscoroutine(disconnect_result):
+                            await asyncio.shield(disconnect_result)
+                    except Exception as pool_error:
+                        logger.debug(f"Error disconnecting redis pool: {pool_error}")
+                except Exception as pool_error:
+                    logger.debug(f"Error disconnecting redis pool: {pool_error}")
+        finally:
+            self.redis_client = None
+            self.redis_pool = None
+            self._initialized = False
+            self._loop = None
+            logger.info("Redis service connections closed")
+
     async def initialize(self):
         """Initialize Redis connection pool"""
         try:
@@ -86,9 +117,21 @@ class RedisService:
             current_loop = asyncio.get_event_loop()
 
         if self._loop is not None and current_loop is not self._loop:
-            logger.warning("Redis event loop changed; skipping reinitialization to prevent blocking I/O")
-            
-            pass
+            logger.warning(
+                "Redis event loop changed; reinitializing connections for the new loop"
+            )
+
+            try:
+                await self.close()
+            except Exception as close_error:
+                logger.warning(f"Failed to close Redis client during loop switch: {close_error}")
+
+            self._loop = current_loop
+
+            try:
+                await self.initialize()
+            except Exception as e:
+                logger.warning(f"Failed to reinitialize Redis connection on loop change: {e}")
 
     async def ping(self) -> bool:
         """Test Redis connection"""
@@ -341,35 +384,5 @@ class RedisService:
         """Get all cache keys for specific tenant"""
         pattern = f"tenant:{tenant_id}:*"
         return await self.scan_keys(pattern)
-
-    async def close(self):
-        """Close Redis connections"""
-        try:
-            try:
-                current_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                current_loop = asyncio.get_event_loop()
-
-            same_loop = (self._loop is None) or (current_loop is self._loop)
-
-            if same_loop:
-                if self.redis_client:
-                    try:
-                        await asyncio.shield(self.redis_client.close())
-                    except Exception:
-                        pass
-                if self.redis_pool:
-                    try:
-                        await asyncio.shield(self.redis_pool.disconnect())
-                    except Exception:
-                        pass
-            self.redis_client = None
-            self.redis_pool = None
-            self._initialized = False
-            self._loop = None
-            logger.info("Redis service connections closed")
-            
-        except Exception as e:
-            logger.error(f"Error closing Redis connections: {e}")
 
 redis_client = RedisService()

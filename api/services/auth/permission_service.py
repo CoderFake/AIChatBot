@@ -24,6 +24,7 @@ from common.types import (
     AccessLevel,
     DBDocumentPermissionLevel,
     DocumentConstants,
+    ROLE_LEVEL,
 )
 from config.settings import get_settings
 from utils.logging import get_logger
@@ -1037,55 +1038,61 @@ class RAGPermissionService:
         requested_access_level: str
     ) -> tuple[bool, List[str], str]:
         """
-        Check if user has access to RAG collections for a specific access level
-        Returns: (has_access, accessible_collections, effective_access_level)
+        Determine accessible RAG collections for a user and department.
 
-        Logic:
-        - PUBLIC access: Always allowed for all users
-        - PRIVATE access: Only for DEPT_MANAGER, DEPT_ADMIN, ADMIN, MAINTAINER roles in the same department
+        ADMIN/MAINTAINER -> full access (public/private) for any department.
+        DEPT_ADMIN/DEPT_MANAGER -> public for any department, private only for their own department.
+        USER -> public collections only.
         """
         try:
-            from sqlalchemy import select, and_, or_
-
             if requested_access_level not in [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]:
+                logger.warning(
+                    f"Unsupported requested access level '{requested_access_level}' for user {user_id}; falling back to public"
+                )
                 return False, [], AccessLevel.PUBLIC.value
 
             user_result = await self.db.execute(
                 select(User)
-                .options(selectinload(User.group_memberships).joinedload(UserGroupMembership.group))
+                .options(
+                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
+                    selectinload(User.department),
+                )
                 .where(User.id == user_id)
                 .where(User.is_active == True)
                 .where(User.is_deleted == False)
             )
             user = user_result.scalar_one_or_none()
 
-            if not user:
+            if not user or not user.tenant_id:
                 logger.warning(f"User {user_id} not found or inactive for RAG access check")
                 return False, [], AccessLevel.PUBLIC.value
 
-            user_roles = set()
+            resolved_roles: Set[UserRole] = set()
+            if user.role:
+                try:
+                    resolved_roles.add(UserRole(user.role))
+                except ValueError:
+                    logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
+
             for membership in user.group_memberships:
                 if membership.is_deleted:
                     continue
                 group = membership.group
-                if group and group.group_code:
-                    if "_DEPT_MANAGER" in group.group_code:
-                        user_roles.add(UserRole.DEPT_MANAGER)
-                    elif "_DEPT_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.DEPT_ADMIN)
-                    elif "_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.ADMIN)
-                    elif "_MAINTAINER" in group.group_code:
-                        user_roles.add(UserRole.MAINTAINER)
+                if not group or not group.group_code:
+                    continue
+                if "_MAINTAINER" in group.group_code:
+                    resolved_roles.add(UserRole.MAINTAINER)
+                elif "_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.ADMIN)
+                elif "_DEPT_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_ADMIN)
+                elif "_DEPT_MANAGER" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_MANAGER)
 
-            has_private_access = False
-            if requested_access_level == AccessLevel.PRIVATE.value:
-                private_access_roles = {UserRole.DEPT_MANAGER, UserRole.DEPT_ADMIN, UserRole.ADMIN, UserRole.MAINTAINER}
-                has_private_access = bool(user_roles & private_access_roles)
+            if not resolved_roles:
+                resolved_roles.add(UserRole.USER)
 
-                if not has_private_access:
-                    logger.info(f"User {user_id} denied private access - insufficient role. Roles: {user_roles}")
-                    requested_access_level = AccessLevel.PUBLIC.value
+            highest_role = max(resolved_roles, key=lambda role: ROLE_LEVEL.get(role.value, 0))
 
             dept_result = await self.db.execute(
                 select(Department)
@@ -1096,53 +1103,42 @@ class RAGPermissionService:
             department = dept_result.scalar_one_or_none()
 
             if not department:
-                logger.warning(f"Department {department_name} not found for tenant {user.tenant_id}")
+                logger.warning(
+                    f"Department {department_name} not found for tenant {user.tenant_id} when checking RAG access for user {user_id}"
+                )
                 return False, [], AccessLevel.PUBLIC.value
 
-            accessible_collections = []
-            tenant_id = str(user.tenant_id)
             department_id = str(department.id)
+            public_collection = DocumentConstants.public_collection_name(department_id)
+            private_collection = DocumentConstants.private_collection_name(department_id)
+
+            if highest_role in {UserRole.MAINTAINER, UserRole.ADMIN}:
+                if requested_access_level == AccessLevel.PUBLIC.value:
+                    return True, [public_collection], AccessLevel.PUBLIC.value
+                return True, [private_collection], AccessLevel.PRIVATE.value
+
+            if highest_role in {UserRole.DEPT_ADMIN, UserRole.DEPT_MANAGER}:
+                if requested_access_level == AccessLevel.PUBLIC.value:
+                    return True, [public_collection], AccessLevel.PUBLIC.value
+
+                user_department_id = str(user.department_id) if user.department_id else None
+                if user_department_id and user_department_id == department_id:
+                    return True, [private_collection], AccessLevel.PRIVATE.value
+
+                logger.info(
+                    f"User {user_id} with role {highest_role.value} denied private access to department {department_name}"
+                )
+                return False, [], AccessLevel.PUBLIC.value
 
             if requested_access_level == AccessLevel.PUBLIC.value:
-                public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
-                accessible_collections.append(public_collection)
-                effective_access_level = AccessLevel.PUBLIC.value
+                return True, [public_collection], AccessLevel.PUBLIC.value
 
-            elif requested_access_level == AccessLevel.PRIVATE.value and has_private_access:
-                private_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PRIVATE.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
-                accessible_collections.append(private_collection)
-                effective_access_level = AccessLevel.PRIVATE.value
-
-                public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
-                accessible_collections.append(public_collection)
-            else:
-                public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
-                accessible_collections.append(public_collection)
-                effective_access_level = AccessLevel.PUBLIC.value
-
-            has_access = len(accessible_collections) > 0
-
-            logger.debug(
-                f"RAG access check for user {user_id}: "
-                f"requested={requested_access_level}, "
-                f"effective={effective_access_level}, "
-                f"collections={accessible_collections}, "
-                f"roles={user_roles}"
-            )
-
-            return has_access, accessible_collections, effective_access_level
+            logger.info(f"User {user_id} denied private access due to insufficient role: {highest_role.value}")
+            return False, [], AccessLevel.PUBLIC.value
 
         except Exception as e:
-            logger.error(f"Failed to check RAG access permission for user {user_id}: {e}")
-            return True, [], AccessLevel.PUBLIC.value
+            logger.error(f"Failed to check RAG access for user {user_id}: {e}")
+            return False, [], AccessLevel.PUBLIC.value
 
     async def check_rag_access_with_override(
         self,
@@ -1170,37 +1166,45 @@ class RAGPermissionService:
             if admin_cross_department_access:
                 user_result = await self.db.execute(
                     select(User)
-                    .options(selectinload(User.group_memberships).joinedload(UserGroupMembership.group))
+                    .options(
+                        selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
+                        selectinload(User.department),
+                    )
                     .where(User.id == user_id)
                     .where(User.is_active == True)
                     .where(User.is_deleted == False)
                 )
                 user = user_result.scalar_one_or_none()
 
-                if user:
-                    user_roles = set()
+                if user and user.tenant_id:
+                    resolved_roles: Set[UserRole] = set()
+                    if user.role:
+                        try:
+                            resolved_roles.add(UserRole(user.role))
+                        except ValueError:
+                            logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
+
                     for membership in user.group_memberships:
                         if membership.is_deleted:
                             continue
                         group = membership.group
-                        if group and group.group_code:
-                            if "_ADMIN" in group.group_code:
-                                user_roles.add(UserRole.ADMIN)
-                            elif "_MAINTAINER" in group.group_code:
-                                user_roles.add(UserRole.MAINTAINER)
-                            elif "_DEPT_ADMIN" in group.group_code:
-                                user_roles.add(UserRole.DEPT_ADMIN)
+                        if not group or not group.group_code:
+                            continue
+                        if "_MAINTAINER" in group.group_code:
+                            resolved_roles.add(UserRole.MAINTAINER)
+                        elif "_ADMIN" in group.group_code:
+                            resolved_roles.add(UserRole.ADMIN)
+                        elif "_DEPT_ADMIN" in group.group_code:
+                            resolved_roles.add(UserRole.DEPT_ADMIN)
+                        elif "_DEPT_MANAGER" in group.group_code:
+                            resolved_roles.add(UserRole.DEPT_MANAGER)
 
-                    admin_roles = {UserRole.ADMIN, UserRole.MAINTAINER}
-                    dept_admin_roles = {UserRole.DEPT_ADMIN}
+                    if not resolved_roles:
+                        resolved_roles.add(UserRole.USER)
 
-                    if user_roles & admin_roles:
-                        # Use admin cross-department access (all departments)
-                        return await self.check_admin_rag_access_all_departments(
-                            user_id, str(user.tenant_id), requested_access_level
-                        )
-                    elif user_roles & dept_admin_roles:
-                        # Use dept_admin access (own department only)
+                    highest_role = max(resolved_roles, key=lambda role: ROLE_LEVEL.get(role.value, 0))
+
+                    if highest_role in {UserRole.ADMIN, UserRole.MAINTAINER}:
                         return await self.check_admin_rag_access_all_departments(
                             user_id, str(user.tenant_id), requested_access_level
                         )
@@ -1255,11 +1259,8 @@ class RAGPermissionService:
                 return False, [], AccessLevel.PUBLIC.value
 
             # Return only public collection
-            tenant_id = str(user.tenant_id)
             department_id = str(department.id)
-            public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                tenant_id=tenant_id, department_id=department_id
-            )
+            public_collection = DocumentConstants.public_collection_name(department_id)
 
             logger.info(f"Access scope override: User {user_id} forced to public access only")
             return True, [public_collection], AccessLevel.PUBLIC.value
@@ -1276,34 +1277,46 @@ class RAGPermissionService:
             # Get user with roles
             user_result = await self.db.execute(
                 select(User)
-                .options(selectinload(User.group_memberships).joinedload(UserGroupMembership.group))
+                .options(
+                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
+                    selectinload(User.department),
+                )
                 .where(User.id == user_id)
                 .where(User.is_active == True)
                 .where(User.is_deleted == False)
             )
             user = user_result.scalar_one_or_none()
 
-            if not user:
+            if not user or not user.tenant_id:
                 return False, [], AccessLevel.PUBLIC.value
 
-            # Check if user has private access roles
-            user_roles = set()
+            resolved_roles: Set[UserRole] = set()
+            if user.role:
+                try:
+                    resolved_roles.add(UserRole(user.role))
+                except ValueError:
+                    logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
+
             for membership in user.group_memberships:
                 if membership.is_deleted:
                     continue
                 group = membership.group
-                if group and group.group_code:
-                    if "_DEPT_MANAGER" in group.group_code:
-                        user_roles.add(UserRole.DEPT_MANAGER)
-                    elif "_DEPT_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.DEPT_ADMIN)
-                    elif "_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.ADMIN)
-                    elif "_MAINTAINER" in group.group_code:
-                        user_roles.add(UserRole.MAINTAINER)
+                if not group or not group.group_code:
+                    continue
+                if "_MAINTAINER" in group.group_code:
+                    resolved_roles.add(UserRole.MAINTAINER)
+                elif "_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.ADMIN)
+                elif "_DEPT_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_ADMIN)
+                elif "_DEPT_MANAGER" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_MANAGER)
+
+            if not resolved_roles:
+                resolved_roles.add(UserRole.USER)
 
             private_access_roles = {UserRole.DEPT_MANAGER, UserRole.DEPT_ADMIN, UserRole.ADMIN, UserRole.MAINTAINER}
-            has_private_access = bool(user_roles & private_access_roles)
+            has_private_access = bool(resolved_roles & private_access_roles)
 
             dept_result = await self.db.execute(
                 select(Department)
@@ -1316,21 +1329,17 @@ class RAGPermissionService:
             if not department:
                 return False, [], AccessLevel.PUBLIC.value
 
-            tenant_id = str(user.tenant_id)
             department_id = str(department.id)
 
             if has_private_access:
-                private_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PRIVATE.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
+                private_collection = DocumentConstants.private_collection_name(department_id)
                 logger.info(f"Access scope override: User {user_id} forced to private access (has permission)")
                 return True, [private_collection], AccessLevel.PRIVATE.value
-            else:
-                public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
-                logger.warning(f"Access scope override: User {user_id} requested private but no permission, falling back to public")
-                return True, [public_collection], AccessLevel.PUBLIC.value
+
+            logger.warning(
+                f"Access scope override: User {user_id} requested private but lacks permission; denying private access"
+            )
+            return False, [], AccessLevel.PUBLIC.value
 
         except Exception as e:
             logger.error(f"Failed to get private access only for user {user_id}: {e}")
@@ -1344,33 +1353,46 @@ class RAGPermissionService:
             # Get user with roles
             user_result = await self.db.execute(
                 select(User)
-                .options(selectinload(User.group_memberships).joinedload(UserGroupMembership.group))
+                .options(
+                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
+                    selectinload(User.department),
+                )
                 .where(User.id == user_id)
                 .where(User.is_active == True)
                 .where(User.is_deleted == False)
             )
             user = user_result.scalar_one_or_none()
 
-            if not user:
+            if not user or not user.tenant_id:
                 return False, [], AccessLevel.PUBLIC.value
 
-            user_roles = set()
+            resolved_roles: Set[UserRole] = set()
+            if user.role:
+                try:
+                    resolved_roles.add(UserRole(user.role))
+                except ValueError:
+                    logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
+
             for membership in user.group_memberships:
                 if membership.is_deleted:
                     continue
                 group = membership.group
-                if group and group.group_code:
-                    if "_DEPT_MANAGER" in group.group_code:
-                        user_roles.add(UserRole.DEPT_MANAGER)
-                    elif "_DEPT_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.DEPT_ADMIN)
-                    elif "_ADMIN" in group.group_code:
-                        user_roles.add(UserRole.ADMIN)
-                    elif "_MAINTAINER" in group.group_code:
-                        user_roles.add(UserRole.MAINTAINER)
+                if not group or not group.group_code:
+                    continue
+                if "_MAINTAINER" in group.group_code:
+                    resolved_roles.add(UserRole.MAINTAINER)
+                elif "_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.ADMIN)
+                elif "_DEPT_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_ADMIN)
+                elif "_DEPT_MANAGER" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_MANAGER)
+
+            if not resolved_roles:
+                resolved_roles.add(UserRole.USER)
 
             private_access_roles = {UserRole.DEPT_MANAGER, UserRole.DEPT_ADMIN, UserRole.ADMIN, UserRole.MAINTAINER}
-            has_private_access = bool(user_roles & private_access_roles)
+            has_private_access = bool(resolved_roles & private_access_roles)
 
             dept_result = await self.db.execute(
                 select(Department)
@@ -1383,20 +1405,15 @@ class RAGPermissionService:
             if not department:
                 return False, [], AccessLevel.PUBLIC.value
 
-            tenant_id = str(user.tenant_id)
             department_id = str(department.id)
 
             accessible_collections = []
 
-            public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                tenant_id=tenant_id, department_id=department_id
-            )
+            public_collection = DocumentConstants.public_collection_name(department_id)
             accessible_collections.append(public_collection)
 
             if has_private_access:
-                private_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PRIVATE.format(
-                    tenant_id=tenant_id, department_id=department_id
-                )
+                private_collection = DocumentConstants.private_collection_name(department_id)
                 accessible_collections.append(private_collection)
                 logger.info(f"Access scope override: User {user_id} forced to both public+private access")
                 return True, accessible_collections, "both"
@@ -1543,16 +1560,14 @@ class RAGPermissionService:
                 dept_id_str = str(department.id)
 
                 if requested_access_level in [AccessLevel.PUBLIC.value, "both"]:
-                    public_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                        tenant_id=tenant_id_str, department_id=dept_id_str
+                    accessible_collections.append(
+                        DocumentConstants.public_collection_name(dept_id_str)
                     )
-                    accessible_collections.append(public_collection)
 
                 if requested_access_level in [AccessLevel.PRIVATE.value, "both"]:
-                    private_collection = DocumentConstants.COLLECTION_NAME_TEMPLATE_PRIVATE.format(
-                        tenant_id=tenant_id_str, department_id=dept_id_str
+                    accessible_collections.append(
+                        DocumentConstants.private_collection_name(dept_id_str)
                     )
-                    accessible_collections.append(private_collection)
 
             effective_access_level = requested_access_level
             has_access = len(accessible_collections) > 0

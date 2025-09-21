@@ -11,7 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from models.database.tenant import Department, Tenant
 from models.database.agent import Agent, AgentToolConfig
 from services.agents.agent_service import AgentService
-from common.types import DocumentAccessLevel
+from common.types import DocumentAccessLevel, DocumentConstants
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -115,17 +115,18 @@ class DepartmentService:
                         access_level=DocumentAccessLevel.PUBLIC.value,
                     )
 
-                if not await document_service.get_collection(dept_result['id'], f"{dept_result['id']}-{DocumentAccessLevel.PRIVATE.value}", DocumentAccessLevel.PRIVATE.value):
+                private_collection_name = DocumentConstants.private_collection_name(str(dept_result['id']))
+                if not await document_service.get_collection(dept_result['id'], private_collection_name, DocumentAccessLevel.PRIVATE.value):
                     await document_service.create_collection(
                         department_id=dept_result['id'],
-                        collection_name=f"{dept_result['id']}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"),
+                        collection_name=private_collection_name,
                         collection_type=DocumentAccessLevel.PRIVATE.value,
                     )
 
                 if not await document_service.get_collection(dept_result['id'], f"{dept_result['id']}-{DocumentAccessLevel.PUBLIC.value}", DocumentAccessLevel.PUBLIC.value):
                     await document_service.create_collection(
                         department_id=dept_result['id'],
-                        collection_name=f"{dept_result['id']}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"),
+                        collection_name=DocumentConstants.public_collection_name(str(dept_result['id'])),
                         collection_type=DocumentAccessLevel.PUBLIC.value,
                     )
 
@@ -344,16 +345,18 @@ class DepartmentService:
                     )
 
 
-                if not await document_service.get_collection(department_id, f"{department_id}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"), DocumentAccessLevel.PRIVATE.value):
+                private_collection_name = DocumentConstants.private_collection_name(str(department_id))
+                if not await document_service.get_collection(department_id, private_collection_name, DocumentAccessLevel.PRIVATE.value):
                     await document_service.create_collection(
                         department_id=department_id,
-                        collection_name=f"{department_id}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"),
+                        collection_name=private_collection_name,
                         collection_type=DocumentAccessLevel.PRIVATE.value,
                     )
-                if not await document_service.get_collection(department_id, f"{department_id}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"), DocumentAccessLevel.PUBLIC.value):
+                public_collection_name = DocumentConstants.public_collection_name(str(department_id))
+                if not await document_service.get_collection(department_id, public_collection_name, DocumentAccessLevel.PUBLIC.value):
                     await document_service.create_collection(
                         department_id=department_id,
-                        collection_name=f"{department_id}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"),
+                        collection_name=public_collection_name,
                         collection_type=DocumentAccessLevel.PUBLIC.value,
                     )
 

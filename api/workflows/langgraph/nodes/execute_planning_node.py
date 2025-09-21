@@ -88,12 +88,22 @@ class ExecutePlanningNode(ExecutionNode):
 
             execution_results = []
             async for progress_update in self._execute_parallel_steps(
-                state, execution_plan, original_query, user_context, detected_language, semantic_routing
+                state,
+                execution_plan,
+                original_query,
+                user_context,
+                detected_language,
+                formatted_tasks,
+                semantic_routing
             ):
                 if progress_update.get("type") == "progress":
+                    if progress_update.get("formatted_tasks") is not None:
+                        formatted_tasks = progress_update["formatted_tasks"]
                     yield progress_update
                 elif progress_update.get("type") == "result":
                     execution_results = progress_update.get("results", [])
+                    if progress_update.get("formatted_tasks") is not None:
+                        formatted_tasks = progress_update["formatted_tasks"]
 
             successful_responses = [r for r in execution_results if r.get("status") == "completed"]
             failed_responses = [r for r in execution_results if r.get("status") == "failed"]
@@ -110,6 +120,7 @@ class ExecutePlanningNode(ExecutionNode):
                     "processing_status": "failed",
                     "progress_percentage": self._calculate_progress_percentage("failed"),
                     "progress_message": progress_msg,
+                    "formatted_tasks": formatted_tasks,
                     "should_yield": True
                 }
                 return
@@ -127,6 +138,7 @@ class ExecutePlanningNode(ExecutionNode):
                     "processing_status": "completed",
                     "progress_percentage": self._calculate_progress_percentage("completed"),
                     "progress_message": progress_msg,
+                    "formatted_tasks": formatted_tasks,
                     "should_yield": True
                 }
 
@@ -139,6 +151,7 @@ class ExecutePlanningNode(ExecutionNode):
                     "processing_status": "ready_for_resolution",
                     "progress_percentage": self._calculate_progress_percentage("conflict_resolution_needed"),
                     "progress_message": get_workflow_message("conflict_resolution_needed", detected_language),
+                    "formatted_tasks": formatted_tasks,
                     "should_yield": True
                 }
 
@@ -151,6 +164,7 @@ class ExecutePlanningNode(ExecutionNode):
                     "processing_status": "ready_for_resolution",
                     "progress_percentage": self._calculate_progress_percentage("conflict_resolution_needed"),
                     "progress_message": get_workflow_message("conflict_resolution_needed", detected_language),
+                    "formatted_tasks": formatted_tasks,
                     "should_yield": True
                 }
 
@@ -161,6 +175,7 @@ class ExecutePlanningNode(ExecutionNode):
                 "next_action": "error",
                 "processing_status": "failed",
                 "progress_percentage": self._calculate_progress_percentage("failed"),
+                "formatted_tasks": formatted_tasks if 'formatted_tasks' in locals() else None,
                 "should_yield": True
             }
 
@@ -214,6 +229,7 @@ class ExecutePlanningNode(ExecutionNode):
         original_query: str,
         user_context: Dict[str, Any],
         detected_language: str,
+        formatted_tasks: List[Dict[str, Any]],
         semantic_routing: Dict[str, Any] = None
     ):
         """
@@ -242,57 +258,134 @@ class ExecutePlanningNode(ExecutionNode):
 
             logger.info(f"Found {len(all_tasks)} tasks to execute in parallel")
 
+            latest_formatted = self._format_tasks_for_display(execution_plan)
+            formatted_tasks.clear()
+            formatted_tasks.extend(latest_formatted)
+
+            for task_info in formatted_tasks:
+                task_info["status"] = "pending"
+                task_info.pop("result", None)
+                task_info.pop("error", None)
+
+            initial_progress = self._calculate_progress_percentage("executing_agents")
             yield {
                 "type": "progress",
                 "node": "execute_planning",
                 "output": {
                     "processing_status": "executing_agents",
-                    "progress_percentage": self._calculate_progress_percentage("executing_agents"),
-                    "progress_message": get_workflow_message("execution_started", detected_language, total=len(all_tasks)),
+                    "progress_percentage": initial_progress,
+                    "progress_message": get_workflow_message(
+                        "execution_started",
+                        detected_language,
+                        total=len(all_tasks)
+                    ),
                     "current_step": 0,
                     "total_steps": len(all_tasks),
-                    "formatted_tasks": self._format_tasks_for_display(execution_plan),
+                    "formatted_tasks": formatted_tasks,
                     "should_yield": True
                 }
             }
 
             execution_tasks = []
+            future_to_index = {}
             for i, task in enumerate(all_tasks):
                 if isinstance(task, dict):
-                    task_future = self._execute_single_task(state, task, i)
+                    if i < len(formatted_tasks):
+                        formatted_tasks[i]["status"] = "in_progress"
+                        formatted_tasks[i]["agent"] = task.get("agent", formatted_tasks[i].get("agent", ""))
+                    task_future = asyncio.create_task(self._execute_single_task(state, task, i))
                     execution_tasks.append(task_future)
+                    future_to_index[task_future] = i
 
-            if execution_tasks:
-                results = await asyncio.gather(*execution_tasks, return_exceptions=True)
+            if not execution_tasks:
+                yield {"type": "result", "results": [], "formatted_tasks": formatted_tasks}
+                return
 
-                processed_results = []
-                completed_count = 0
+            processed_results: List[Any] = [None] * len(all_tasks)
+            completed_success = 0
+            processed_count = 0
 
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Task {i} failed with exception: {result}")
-                        processed_results.append({
-                            "agent_name": f"Task_{i}",
-                            "content": f"Task execution failed: {str(result)}",
-                            "status": "failed",
-                            "confidence": 0.0,
-                            "sources": [],
-                            "execution_time": 0.0,
-                            "error": str(result),
-                            "task_index": i
-                        })
-                    else:
-                        processed_results.append(result)
-                        completed_count += 1
+            for future in asyncio.as_completed(list(future_to_index.keys())):
+                idx = future_to_index[future]
+                try:
+                    result = await future
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.error(f"Task {idx} failed with exception: {exc}")
+                    result = {
+                        "agent_name": f"Task_{idx}",
+                        "content": f"Task execution failed: {str(exc)}",
+                        "status": "failed",
+                        "confidence": 0.0,
+                        "sources": [],
+                        "execution_time": 0.0,
+                        "error": str(exc),
+                        "task_index": idx
+                    }
 
-                logger.info(f"Parallel execution completed: {completed_count}/{len(all_tasks)} tasks successful")
-                yield {"type": "result", "results": processed_results}
-            else:
-                yield {"type": "result", "results": []}
+                processed_results[idx] = result
+                processed_count += 1
+
+                status = result.get("status", "completed")
+                if status == "completed":
+                    completed_success += 1
+
+                if idx < len(formatted_tasks):
+                    formatted_tasks[idx]["status"] = "completed" if status == "completed" else "failed"
+                    formatted_tasks[idx]["result"] = result
+                    if status != "completed":
+                        formatted_tasks[idx]["error"] = result.get("error") or result.get("content")
+
+                tools_used = result.get("tools_used") or []
+                tool_display = ", ".join(tools_used) if isinstance(tools_used, list) and tools_used else result.get("tool") or "tool"
+                agent_display = result.get("agent_name") or result.get("agent") or "Agent"
+
+                if status == "completed":
+                    progress_message = get_workflow_message(
+                        "task_completed_sequential",
+                        detected_language,
+                        current=completed_success,
+                        total=len(all_tasks),
+                        agent=agent_display,
+                        tool=tool_display
+                    )
+                else:
+                    error_detail = result.get("error") or result.get("content", "")
+                    progress_message = (
+                        f"Task {agent_display} failed: {error_detail}" if error_detail else get_workflow_message(
+                            "generic_error",
+                            detected_language
+                        )
+                    )
+
+                yield {
+                    "type": "progress",
+                    "node": "execute_planning",
+                    "output": {
+                        "processing_status": "task_completed" if status == "completed" else "task_failed",
+                        "progress_percentage": self._calculate_progress_percentage(
+                            "task_completed", processed_count, len(all_tasks)
+                        ),
+                        "progress_message": progress_message,
+                        "current_step": processed_count,
+                        "total_steps": len(all_tasks),
+                        "formatted_tasks": formatted_tasks,
+                        "should_yield": True
+                    }
+                }
+
+            filtered_results = [res for res in processed_results if res is not None]
+            logger.info(
+                f"Parallel execution completed: {completed_success}/{len(all_tasks)} tasks successful"
+            )
+            yield {
+                "type": "result",
+                "results": filtered_results,
+                "formatted_tasks": formatted_tasks
+            }
 
         except Exception as e:
             logger.error(f"Parallel execution failed: {e}")
-            yield {"type": "result", "results": []}
+            yield {"type": "result", "results": [], "formatted_tasks": formatted_tasks}
 
     async def _execute_single_task(
         self,
