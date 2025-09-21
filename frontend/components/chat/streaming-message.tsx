@@ -35,7 +35,7 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
   }, [showDropdown])
 
   return (
-    <div className={`thinking-dropdown flex items-center gap-2 ${className}`}>
+    <div className={`thinking-dropdown relative flex items-center gap-2 max-w-full ${className}`}>
       {/* Thinking text with cursor-like underline effect */}
       <div className="relative flex items-center">
         <span className="shimmer-text font-semibold text-base tracking-wide select-none">
@@ -78,9 +78,10 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
       {/* Dropdown with plan/progress, compact typography */}
       {showDropdown && (
         <div
-          className="absolute top-full left-0 mt-2 w-80 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10"
+          className="absolute top-full left-0 mt-2 w-full max-w-xs sm:max-w-sm md:max-w-md bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10 overflow-hidden"
           style={{
-            animation: 'dropdown-fade-in 0.2s ease-out'
+            animation: 'dropdown-fade-in 0.2s ease-out',
+            maxWidth: 'min(20rem, calc(100% - 0.5rem))'
           }}
         >
           <div className="p-3">
@@ -111,7 +112,7 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
             )}
 
             {/* Task status list */}
-            {planningData?.formatted_tasks?.length > 0 && (
+            {planningData?.formatted_tasks && planningData.formatted_tasks.length > 0 && (
               <div className="mb-3">
                 <div className="flex items-center gap-2 text-[11px] font-medium text-gray-800 dark:text-gray-100 mb-1">
                   <ChevronRight size={12} className="text-blue-500" />
@@ -330,7 +331,7 @@ export function StreamingMessage({
     if (!planningData) return null
 
     return (
-      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950">
+      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950 w-full max-w-full overflow-hidden">
         <button
           onClick={() => setIsPlanningExpanded(!isPlanningExpanded)}
           className="flex items-center gap-2 text-blue-700 dark:text-blue-300 font-medium hover:text-blue-800 dark:hover:text-blue-200 transition-colors"
@@ -351,8 +352,8 @@ export function StreamingMessage({
 
         {isPlanningExpanded && (
           <div className="mt-3 space-y-3">
-            {planningData.formatted_tasks?.length > 0 && (
-              <div className="bg-white dark:bg-gray-800 rounded p-3 border">
+            {planningData.formatted_tasks && planningData.formatted_tasks.length > 0 && (
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden">
                 <h4 className="font-medium text-sm mb-2">Task Progress</h4>
                 <div className="space-y-2">
                   {planningData.formatted_tasks.map((task: any, index: number) => {
@@ -407,7 +408,7 @@ export function StreamingMessage({
                     planningData.execution_plan.steps.map((step: any, index: number) => (
                       <div
                         key={index}
-                        className={`flex items-center gap-2 p-2 rounded text-xs border ${
+                        className={`flex items-center gap-2 p-2 rounded text-xs border overflow-hidden ${
                           step.status === 'completed'
                             ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
                             : step.status === 'running'
@@ -422,12 +423,12 @@ export function StreamingMessage({
                         ) : (
                           <div className="w-3 h-3 border-2 border-gray-300 rounded-full flex-shrink-0"></div>
                         )}
-                        <div className="flex-1">
-                          <div className="font-medium">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium break-words">
                             Step {index + 1}: {step.step_id || `Step ${index + 1}`}
                           </div>
                           {step.tasks && step.tasks.length > 0 && (
-                            <div className="text-gray-600 dark:text-gray-400 mt-1">
+                            <div className="text-gray-600 dark:text-gray-400 mt-1 break-words">
                               {step.tasks.length} task{step.tasks.length > 1 ? 's' : ''}: {step.tasks.map((task: any, taskIndex: number) =>
                                 `${task.agent || 'Agent'} (${task.tool || 'Tool'})`
                               ).join(', ')}
