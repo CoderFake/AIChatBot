@@ -152,7 +152,7 @@ class ProviderApiKeysService:
             await self._ensure_cache_initialized()
 
             cache_keys = [
-                f"provider_api_keys_{tenant_id}_{provider_name}"
+                f"provider_api_keys_{tenant_id}_{provider_name}",
                 f"tenant_provider_config:{tenant_id}:{provider_name}"
             ]
 

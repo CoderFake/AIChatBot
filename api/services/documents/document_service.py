@@ -358,7 +358,7 @@ class DocumentService:
         try:
             new_collection = DocumentCollection(
                 department_id=department_id,
-                collection_name=collection_name.replace("-", "_"),
+                collection_name=DocumentConstants.sanitize_identifier(collection_name),
                 collection_type=collection_type,
                 is_active=True,
                 vector_config=None,
@@ -376,11 +376,12 @@ class DocumentService:
 
     async def get_collection(self, department_id: str, collection_name: str, collection_type: str) -> Optional[DocumentCollection]:
         """Get a collection by department ID and collection name"""
+        normalized_name = DocumentConstants.sanitize_identifier(collection_name)
         collection = await self.db.execute(
             select(DocumentCollection)
             .where(
                 DocumentCollection.department_id == department_id,
-                DocumentCollection.collection_name == collection_name.replace("-", "_"),
+                DocumentCollection.collection_name == normalized_name,
                 DocumentCollection.collection_type == collection_type
             )
         )
@@ -535,7 +536,8 @@ class DocumentService:
             else:
                 raise ValueError(f"Folder {file_folder_id} not found")
 
-            collection_name = f"{department_id}_{access_level}".replace("-", "_")
+            department_id_str = str(department_id)
+            collection_name = DocumentConstants.format_collection_name(department_id_str, access_level)
             result = await self.db.execute(
                 select(DocumentCollection).where(
                     DocumentCollection.department_id == department_id,

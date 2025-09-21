@@ -45,8 +45,19 @@ class Orchestrator:
 
     async def agents_structure(self, user_context: Dict[str, Any]):
         from services.agents.agent_service import AgentService
-        agent_service = AgentService(self.db)
-        return await agent_service.get_agents_structure_for_user(user_context)
+        if self.db is not None:
+            agent_service = AgentService(self.db)
+            return await agent_service.get_agents_structure_for_user(user_context)
+
+        from config.database import get_db_context
+
+        try:
+            async with get_db_context() as db:
+                agent_service = AgentService(db)
+                return await agent_service.get_agents_structure_for_user(user_context)
+        except Exception as exc:
+            logger.error(f"Failed to load agents structure: {exc}")
+            return {}
 
     def cache_manager(self):
         """
@@ -67,10 +78,10 @@ class LLMProviderWrapper:
     async def ainvoke(self, prompt: str, tenant_id: str, model: Optional[str] = None, **kwargs):
         """Invoke LLM với API keys của tenant - chỉ truyền API keys, không re-initialize"""
         from services.providers.provider_api_keys_service import ProviderApiKeysService
-        from config.database import get_db_session
+        from config.database import get_db_context
 
         if tenant_id and self.provider:
-            async with get_db_session() as db:
+            async with get_db_context() as db:
                 api_keys_service = ProviderApiKeysService(db)
                 api_keys_result = await api_keys_service.get_provider_api_keys(tenant_id, self.provider.name)
                 tenant_api_keys = api_keys_result.get("api_keys", [])

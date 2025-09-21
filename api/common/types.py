@@ -413,12 +413,57 @@ class KafkaMessageStatus(Enum):
 
 class DocumentConstants:
     """Constants for document operations to avoid hardcoding"""
-    
+
     ROOT_FOLDER_PATH = "/"
     ROOT_FOLDER_NAME = "root"
-    
-    COLLECTION_NAME_TEMPLATE_PUBLIC = "{department_id}_public"
-    COLLECTION_NAME_TEMPLATE_PRIVATE = "{department_id}_private"
+
+    COLLECTION_NAME_TEMPLATE_PUBLIC = "{department_id}-public"
+    COLLECTION_NAME_TEMPLATE_PRIVATE = "{department_id}-private"
+
+    @staticmethod
+    def sanitize_identifier(identifier: str) -> str:
+        """Normalize identifiers so they are safe for collection names."""
+
+        if not identifier:
+            return ""
+        return identifier.replace("-", "_")
+
+    @classmethod
+    def format_collection_name(cls, department_id: str, access_level: str) -> str:
+        """Return canonical Milvus collection name for a department/access level."""
+
+        sanitized_department = cls.sanitize_identifier(department_id)
+        normalized_access = cls.sanitize_identifier(access_level)
+        # Ensure the final identifier never carries hyphenated UUID segments.
+        return cls.sanitize_identifier(f"{sanitized_department}_{normalized_access}")
+
+    @classmethod
+    def render_public_template(cls, department_id: str) -> str:
+        """Render the legacy public template while preserving sanitization."""
+
+        return cls.sanitize_identifier(
+            cls.COLLECTION_NAME_TEMPLATE_PUBLIC.format(department_id=department_id)
+        )
+
+    @classmethod
+    def render_private_template(cls, department_id: str) -> str:
+        """Render the legacy private template while preserving sanitization."""
+
+        return cls.sanitize_identifier(
+            cls.COLLECTION_NAME_TEMPLATE_PRIVATE.format(department_id=department_id)
+        )
+
+    @classmethod
+    def public_collection_name(cls, department_id: str) -> str:
+        """Convenience helper for public collection names."""
+
+        return cls.format_collection_name(department_id, AccessLevel.PUBLIC.value)
+
+    @classmethod
+    def private_collection_name(cls, department_id: str) -> str:
+        """Convenience helper for private collection names."""
+
+        return cls.format_collection_name(department_id, AccessLevel.PRIVATE.value)
     
     # Bucket name template
     BUCKET_NAME_TEMPLATE = "{prefix}-{tenant_id}"
