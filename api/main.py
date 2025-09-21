@@ -28,12 +28,21 @@ async def _sync_registries() -> None:
     try:
         from config.database import get_db_context
         from services.llm.provider_service import ProviderService
+        from services.llm.provider_manager import LLMProviderManager
         from services.tools.tool_service import ToolService
         from services.bootstrap.seed_maintainer import seed_global_maintainer, seed_permissions
         from services.cache.cache_manager import cache_manager
 
         await cache_manager.initialize()
-        logger.info("Cache manager initialized")
+        logger.info("Cache manager initialized globally")
+
+        import services.orchestrator.orchestrator as orch_module
+        orch_module.global_cache_manager = cache_manager
+
+        global_provider_manager = LLMProviderManager()
+        await global_provider_manager.initialize()
+        orch_module.global_provider_manager = global_provider_manager
+        logger.info("LLM Provider Manager initialized globally")
 
         async with get_db_context() as session:
             await seed_global_maintainer(session)
@@ -44,11 +53,10 @@ async def _sync_registries() -> None:
 
             tool_service = ToolService(session)
             await tool_service.initialize()
-            
+
         logger.info("Registry sync completed (providers/models/tools)")
     except Exception as e:
         logger.error(f"Failed to sync registries: {e}")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -70,9 +78,15 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down AIChatBot API...")
 
     try:
+        from services.messaging.kafka_service import kafka_service
         from config.database import close_db
 
+        # Cleanup Kafka service
+        await kafka_service.cleanup()
+
+        # Close database
         await close_db()
+
         logger.info("Application shutdown complete")
 
     except Exception as e:

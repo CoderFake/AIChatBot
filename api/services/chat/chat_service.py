@@ -3,13 +3,13 @@ Chat service layer for managing chat sessions and messages
 """
 import uuid
 import inspect
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional, AsyncGenerator     
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from fastapi import HTTPException
 
 from models.database.chat import ChatSession, ChatMessage
-from services.cache.cache_manager import cache_manager
+from services.orchestrator.orchestrator import Orchestrator
 from utils.logging import get_logger
 import asyncio
 import json
@@ -27,14 +27,17 @@ class ChatService:
 
     def __init__(self, db: AsyncSession = None):
         self.db = db
+        self.orchestrator = Orchestrator(db)
         self._cache_initialized = False
 
     async def _ensure_cache_initialized(self):
-        """Ensure cache manager is initialized"""
+        """Ensure cache manager is initialized - only initialize if not already done globally"""
         if not self._cache_initialized:
             try:
-                if not cache_manager._initialized:
-                    await cache_manager.initialize()
+                cache_mgr = self.orchestrator.cache_manager()
+                if not cache_mgr._initialized:
+                    logger.warning("Cache manager not initialized globally, initializing locally")
+                    await cache_mgr.initialize()
                 self._cache_initialized = True
             except Exception as e:
                 logger.warning(f"Cache initialization failed: {e}")
@@ -45,7 +48,8 @@ class ChatService:
         try:
             await self._ensure_cache_initialized()
             pattern = f"chat_sessions_{tenant_id}_{user_id or 'anonymous'}_*"
-            deleted_count = await cache_manager.delete_pattern(pattern)
+            cache_mgr = self.orchestrator.cache_manager()
+            deleted_count = await cache_mgr.delete_pattern(pattern)
             if deleted_count > 0:
                 logger.info(f"Invalidated {deleted_count} chat session cache keys for user {user_id or 'anonymous'}")
         except Exception as e:
@@ -56,7 +60,8 @@ class ChatService:
         try:
             await self._ensure_cache_initialized()
             pattern = f"chat_messages_{session_id}_*"
-            deleted_count = await cache_manager.delete_pattern(pattern)
+            cache_mgr = self.orchestrator.cache_manager()
+            deleted_count = await cache_mgr.delete_pattern(pattern)
             if deleted_count > 0:
                 logger.info(f"Invalidated {deleted_count} chat message cache keys for session {session_id}")
         except Exception as e:
@@ -176,110 +181,6 @@ class ChatService:
             await self.db.rollback()
             raise HTTPException(status_code=500, detail=f"Failed to save message: {str(e)}")
 
-    async def save_user_query(
-        self,
-        session_id: uuid.UUID,
-        query: str,
-        language: Optional[str] = None
-    ) -> ChatMessage:
-        """
-        Save user query (no response yet)
-        """
-        return await self.save_message(
-            session_id=session_id,
-            query=query.strip(),
-            language=language,
-            response=None
-        )
-
-    async def save_assistant_response(
-        self,
-        session_id: uuid.UUID,
-        query: str,
-        response: str,
-        processing_time: Optional[float] = None,
-        model_used: Optional[str] = None,
-        confidence_score: Optional[float] = None,
-        chat_metadata: Optional[Dict[str, Any]] = None,
-        workflow_data: Optional[Dict[str, Any]] = None,
-        user_message_id: Optional[str] = None
-    ) -> ChatMessage:
-        """
-        Save assistant response with final answer and workflow metadata
-        Update existing message by ID if user_message_id provided, otherwise create new
-        """
-        logger.info(f"SAVE_ASSISTANT_RESPONSE_START: session_id={session_id}, response_length={len(response)}, user_message_id={user_message_id}")
-        try:
-            from models.database.chat import ChatMessage
-            from sqlalchemy import select
-
-            existing_message = None
-
-            if user_message_id:
-                stmt = select(ChatMessage).where(ChatMessage.id == user_message_id)
-                result = await self.db.execute(stmt)
-                existing_message = result.scalar_one_or_none()
-                logger.info(f"SEARCH_BY_ID: user_message_id={user_message_id}, found={existing_message is not None}")
-           
-            if existing_message:
-                existing_message.response = response
-                if processing_time is not None:
-                    existing_message.processing_time = processing_time
-                if model_used:
-                    existing_message.model_used = model_used
-                if confidence_score is not None:
-                    existing_message.confidence_score = confidence_score
-
-                if workflow_data:
-                    if existing_message.chat_metadata is None:
-                        existing_message.chat_metadata = {}
-                    existing_message.chat_metadata["workflow"] = workflow_data
-
-                if chat_metadata:
-                    if existing_message.chat_metadata is None:
-                        existing_message.chat_metadata = {}
-                    existing_message.chat_metadata.update(chat_metadata)
-
-                await self.db.flush()
-                await self.db.commit()
-                message = existing_message
-            else:
-                if workflow_data:
-                    if chat_metadata is None:
-                        chat_metadata = {}
-                    chat_metadata["workflow"] = workflow_data
-
-                message = await self.save_message(
-                    session_id=session_id,
-                    query=query,
-                    processing_time=processing_time,
-                    model_used=model_used,
-                    confidence_score=confidence_score,
-                    chat_metadata=chat_metadata,
-                    response=response
-                )
-
-            await self.invalidate_message_cache(session_id)
-            logger.info(f"SAVE_ASSISTANT_RESPONSE_SUCCESS: message_id={message.id}, session_id={session_id}")
-            return message
-
-        except Exception as e:
-            logger.error(f"Failed to save/update assistant response: {e}")
-            logger.error(f"SAVE_ASSISTANT_RESPONSE_ERROR_DETAILS: session_id={session_id}, user_message_id={user_message_id}, response_length={len(response) if response else 0}")
-            if workflow_data:
-                if chat_metadata is None:
-                    chat_metadata = {}
-                chat_metadata["workflow"] = workflow_data
-
-            return await self.save_message(
-                session_id=session_id,
-                query=query,
-                processing_time=processing_time,
-                model_used=model_used,
-                confidence_score=confidence_score,
-                chat_metadata=chat_metadata,
-                response=response
-            )
 
     async def get_chat_sessions(
         self,
@@ -295,7 +196,8 @@ class ChatService:
             await self._ensure_cache_initialized()
 
             cache_key = f"chat_sessions_{tenant_id}_{user_id or 'anonymous'}_{skip}_{limit}"
-            cached_sessions = await cache_manager.get(cache_key)
+            cache_mgr = self.orchestrator.cache_manager()
+            cached_sessions = await cache_mgr.get(cache_key)
             if cached_sessions:
                 logger.info(f"Retrieved chat sessions from cache for user {user_id or 'anonymous'} in tenant {tenant_id}")
                 return cached_sessions
@@ -333,7 +235,7 @@ class ChatService:
                 "limit": limit
             }
 
-            await cache_manager.set(cache_key, sessions_data, ttl=3600)
+            await cache_mgr.set(cache_key, sessions_data, ttl=3600)
             logger.info(f"Cached chat sessions for user {user_id or 'anonymous'} in tenant {tenant_id}")
 
             return sessions_data
@@ -357,7 +259,8 @@ class ChatService:
             await self._ensure_cache_initialized()
 
             cache_key = f"chat_messages_{session_id}_{skip}_{limit}"
-            cached_messages = await cache_manager.get(cache_key)
+            cache_mgr = self.orchestrator.cache_manager()
+            cached_messages = await cache_mgr.get(cache_key)
             if cached_messages:
                 logger.info(f"Retrieved chat messages from cache for session {session_id}")
                 return cached_messages
@@ -411,7 +314,7 @@ class ChatService:
                 "limit": limit
             }
 
-            await cache_manager.set(cache_key, messages_data, ttl=3600)
+            await cache_mgr.set(cache_key, messages_data, ttl=3600)
             logger.info(f"Cached chat messages for session {session_id}")
 
             return messages_data
@@ -431,7 +334,8 @@ class ChatService:
             await self._ensure_cache_initialized()
 
             cache_key = f"chat_recent_messages_{session_id}"
-            cached_messages = await cache_manager.get(cache_key)
+            cache_mgr = self.orchestrator.cache_manager()
+            cached_messages = await cache_mgr.get(cache_key)
             if cached_messages:
                 logger.info(f"Retrieved {len(cached_messages)} recent messages from cache for session {session_id}")
                 return cached_messages
@@ -481,7 +385,7 @@ class ChatService:
                 for pair in conversation_pairs[-limit:]:
                     recent_messages.extend([pair["user"], pair["assistant"]])
 
-            await cache_manager.set(cache_key, recent_messages, ttl=3600)
+            await cache_mgr.set(cache_key, recent_messages, ttl=3600)
             logger.info(f"Cached {len(recent_messages)} recent messages for session {session_id}")
 
             return recent_messages
@@ -497,7 +401,8 @@ class ChatService:
         try:
             await self._ensure_cache_initialized()
             cache_key = f"chat_recent_messages_{session_id}"
-            await cache_manager.delete(cache_key)
+            cache_mgr = self.orchestrator.cache_manager()
+            await cache_mgr.delete(cache_key)
             logger.info(f"Invalidated message cache for session {session_id}")
         except Exception as e:
             logger.error(f"Failed to invalidate message cache: {e}")
@@ -612,7 +517,8 @@ class ChatService:
             session_id = str(message_data["session_id"])
             cache_key = f"chat_message_{session_id}_{message_data.get('created_at', 'temp')}"
 
-            await cache_manager.set(cache_key, message_data, ttl=3600) 
+            cache_mgr = self.orchestrator.cache_manager()
+            await cache_mgr.set(cache_key, message_data, ttl=3600) 
             logger.debug(f"Cached message for session {session_id}")
         except Exception as e:
             logger.warning(f"Failed to cache message: {e}")
@@ -666,13 +572,15 @@ class ChatService:
     async def execute_multi_agent_workflow(
         self,
         query: str,
+        access_level: str,
         session_id: uuid.UUID,
         tenant_id: str,
         department_id: Optional[str],
         user_context: Dict[str, Any],
         detected_language: str,
-        user_message_id: str,
-        session_title: Optional[str] = None
+        user_message_id: Optional[str],
+        session_title: Optional[str] = None,
+        is_first_message: bool = False
     ) -> AsyncGenerator[str, None]:
         """
         Execute multi-agent workflow using existing LangGraph implementation
@@ -691,7 +599,7 @@ class ChatService:
                     "tenant_id": tenant_id,
                     "department_id": department_id,
                     "detected_language": detected_language,
-                    "access_scope": user_context.get("access_scope")
+                    "access_scope": access_level
                 }
             )
 
@@ -720,7 +628,8 @@ class ChatService:
                 config=config,
                 bot_name="AI Assistant",
                 organization_name="Organization",
-                tenant_description=""
+                tenant_description="",
+                access_level=access_level
             ):
                 if chunk.get("type") == "node":
                     node_name = chunk.get("node", "")
@@ -739,72 +648,71 @@ class ChatService:
 
                         if node_name == "final_response":
                             final_response = output.get("final_response", "")
-                            provider = output.get("provider")
+                            provider_name = output.get("provider_name")
 
-                            if final_response and provider:
+                            if final_response and provider_name:
+                                orchestrator = Orchestrator()
+                                provider = await orchestrator.llm(provider_name)
+
                                 try:
                                     full_response = ""
                                     async for stream_event in self._handle_llm_streaming_response(
-                                        final_response, provider, session_id, query
+                                        final_response, provider, tenant_id, session_id, query
                                     ):
                                         yield stream_event
                                         try:
                                             json_str = stream_event.replace('data: ', '').replace('\n\n', '')
                                             event_data = json.loads(json_str)
                                             content_piece = event_data.get('content')
-                                            if content_piece and not self._is_template_scaffold(content_piece):
+                                            if content_piece:
                                                 full_response += content_piece
                                         except Exception as e:
                                             logger.error(f"Failed to extract content from streaming event: {e}")
-                                            pass
 
-                                    try:
-                                        model_used = None
-                                        try:
-                                            prov_name = getattr(provider, 'name', None)
-                                            default_model = getattr(getattr(provider, 'config', None), 'default_model', None)
-                                            if prov_name and default_model:
-                                                model_used = f"{prov_name}:{default_model}"
-                                            else:
-                                                model_used = default_model or prov_name or "unknown"
-                                        except Exception:
-                                            model_used = "unknown"
+                                    model_used = self._get_model_used(provider)
+                                    workflow_metadata = self._create_workflow_metadata(
+                                        output, [], "response", None, output.get("detected_language", "english")
+                                    )
 
-                                        workflow_metadata = {
-                                            "reasoning": output.get("reasoning", ""),
-                                            "execution_metadata": output.get("execution_metadata", {}),
-                                            "sources": output.get("final_sources", []),
-                                            "response_type": "response",
-                                            "confidence_score": output.get("confidence_score", 0.0),
-                                            "follow_up_questions": output.get("follow_up_questions", []),
-                                            "flow_action": output.get("flow_action", []),
-                                            "detected_language": output.get("detected_language", "english"),
-                                            "is_chitchat": output.get("is_chitchat", False),
-                                            "processing_status": output.get("processing_status", "completed"),
-                                            "progress_percentage": output.get("progress_percentage", 100),
-                                            "progress_message": output.get("progress_message", ""),
-                                            "progress_messages": [], 
-                                            "semantic_routing": output.get("semantic_routing", {}),
-                                            "agent_responses": output.get("agent_responses", []),
-                                            "conflict_resolution": output.get("conflict_resolution", {}),
-                                            "execution_plan": output.get("execution_plan", {}),
-                                            "agent_providers_loaded": output.get("agent_providers_loaded", 0)
-                                        }
+                                    logger.info(f"SAVING_FINAL_RESPONSE: session_id={session_id}, response_length={len(full_response.strip())}, is_first_message={is_first_message}")
 
-                                        logger.info(f"SAVING_FINAL_RESPONSE: session_id={session_id}, response_length={len(full_response.strip())}, user_message_id={user_message_id}")
-                                        await self.save_assistant_response(
+                                    if is_first_message:
+                                        await self.save_message(
+                                            session_id=session_id,
+                                            query=query,
+                                            language=detected_language,
+                                            response=None  # User message
+                                        )
+                                        await self.save_message(
+                                            session_id=session_id,
+                                            query=query,
+                                            response=full_response.strip(),
+                                            language=detected_language,
+                                            model_used=model_used,
+                                            chat_metadata={"workflow": workflow_metadata} if workflow_metadata else None
+                                        )
+                                    else:
+                                        if workflow_metadata:
+                                            chat_metadata = {"workflow": workflow_metadata}
+                                        else:
+                                            chat_metadata = None
+
+                                        await self.save_message(
                                             session_id=session_id,
                                             query=query,
                                             response=full_response.strip(),
                                             model_used=model_used,
-                                            workflow_data=workflow_metadata,
-                                            user_message_id=user_message_id
+                                            chat_metadata=chat_metadata
                                         )
-                                        logger.info(f"SUCCESSFULLY_SAVED_FINAL_RESPONSE: session_id={session_id}")
-                                    except Exception as save_err:
-                                        logger.error(f"Failed to save assistant response: {save_err}")
 
-                                    yield self._create_sse_event(4, "end", {
+                                    follow_up_questions = output.get("follow_up_questions", [])
+                                    if follow_up_questions:
+                                        yield self._create_sse_event(4, "followup_question", {
+                                            "follow_up_questions": follow_up_questions,
+                                            "message": "Generated follow-up questions"
+                                        })
+
+                                    yield self._create_sse_event(5, "end", {
                                         "message": "Response completed",
                                         "progress": 100,
                                         "status": "completed",
@@ -812,160 +720,121 @@ class ChatService:
                                         "sources": output.get("final_sources", []),
                                         "reasoning": output.get("reasoning", ""),
                                         "confidence_score": output.get("confidence_score", 0.0),
-                                        "follow_up_questions": output.get("follow_up_questions", []),
                                         "flow_action": output.get("flow_action", []),
                                         "execution_metadata": output.get("execution_metadata", {})
                                     })
                                     return
+
                                 except Exception as stream_err:
                                     logger.error(f"LLM streaming failed: {stream_err}")
-                                    try:
-                                        model_used = None
-                                        try:
-                                            prov_name = getattr(provider, 'name', None)
-                                            default_model = getattr(getattr(provider, 'config', None), 'default_model', None)
-                                            if prov_name and default_model:
-                                                model_used = f"{prov_name}:{default_model}"
-                                            else:
-                                                model_used = default_model or prov_name or "unknown"
-                                        except Exception:
-                                            model_used = "unknown"
 
-                                        workflow_metadata = {
-                                            "reasoning": output.get("reasoning", ""),
-                                            "execution_metadata": output.get("execution_metadata", {}),
-                                            "sources": output.get("final_sources", []),
-                                            "response_type": "response",
-                                            "confidence_score": output.get("confidence_score", 0.0),
-                                            "follow_up_questions": output.get("follow_up_questions", []),
-                                            "flow_action": output.get("flow_action", []),
-                                            "detected_language": output.get("detected_language", "english"),
-                                            "is_chitchat": output.get("is_chitchat", False),
-                                            "processing_status": output.get("processing_status", "completed"),
-                                            "progress_percentage": output.get("progress_percentage", 100),
-                                            "progress_message": output.get("progress_message", ""),
-                                            "progress_messages": progress_messages,
-                                            "semantic_routing": output.get("semantic_routing", {}),
-                                            "agent_responses": output.get("agent_responses", []),
-                                            "conflict_resolution": output.get("conflict_resolution", {}),
-                                            "execution_plan": output.get("execution_plan", {}),
-                                            "agent_providers_loaded": output.get("agent_providers_loaded", 0)
-                                        }
-                                        logger.info(f"SAVING_RESPONSE: progress_messages_count={len(progress_messages)}, detected_language={output.get('detected_language', 'unknown')}")
-                                        await self.save_assistant_response(
+                                    detected_language = output.get("detected_language", "english")
+                                    error_response = self._get_error_response(detected_language, "general")
+                                    model_used = f"{self._get_model_used(provider)} (error)"
+                                    workflow_metadata = self._create_workflow_metadata(
+                                        output, progress_messages, "error", str(stream_err), detected_language
+                                    )
+
+                                    logger.info(f"SAVING_ERROR_RESPONSE: detected_language={detected_language}, error={str(stream_err)}, is_first_message={is_first_message}")
+
+                                    if is_first_message:
+                                        await self.save_message(
                                             session_id=session_id,
                                             query=query,
-                                            response=final_response,
-                                            model_used=model_used,
-                                            workflow_data=workflow_metadata,
-                                            user_message_id=user_message_id
+                                            language=detected_language,
+                                            response=None  # User message
                                         )
-                                    except Exception as save_err:
-                                        logger.error(f"Failed to save assistant response (fallback): {save_err}")
+                                        await self.save_message(
+                                            session_id=session_id,
+                                            query=query,
+                                            response=error_response,
+                                            language=detected_language,
+                                            model_used=model_used,
+                                            chat_metadata={"workflow": workflow_metadata} if workflow_metadata else None
+                                        )
+                                    else:
+                                        if workflow_metadata:
+                                            chat_metadata = {"workflow": workflow_metadata}
+                                        else:
+                                            chat_metadata = None
 
-                                    yield self._create_sse_event(4, "end", {
+                                        await self.save_message(
+                                            session_id=session_id,
+                                            query=query,
+                                            response=error_response,
+                                            model_used=model_used,
+                                            chat_metadata=chat_metadata
+                                        )
+
+                                    yield self._create_sse_event(5, "end", {
                                         "message": "Response completed",
                                         "progress": 100,
                                         "status": "completed",
-                                        "final_response": final_response,
+                                        "final_response": error_response,
                                         "sources": output.get("final_sources", []),
-                                        "reasoning": output.get("reasoning", ""),
-                                        "confidence_score": output.get("confidence_score", 0.0),
-                                        "follow_up_questions": output.get("follow_up_questions", []),
+                                        "reasoning": f"LLM streaming failed: {str(stream_err)}",
+                                        "confidence_score": 0.0,
+                                        "follow_up_questions": [],
                                         "flow_action": output.get("flow_action", []),
                                         "execution_metadata": output.get("execution_metadata", {})
                                     })
                                     return
 
-                            try:
-                                workflow_metadata = {
-                                    "reasoning": output.get("reasoning", ""),
-                                    "execution_metadata": output.get("execution_metadata", {}),
-                                    "sources": output.get("final_sources", []),
-                                    "response_type": "response",
-                                    "progress_messages": progress_messages,
-                                    "agent_responses": output.get("agent_responses", []),
-                                    "semantic_routing": output.get("semantic_routing", {}),
-                                    "execution_plan": output.get("execution_plan", {}),
-                                    "processing_status": "completed",
-                                    "progress_percentage": 100
-                                }
-                                await self.save_assistant_response(
+                            # No provider case
+                            logger.error("No LLM provider available for final response generation")
+                            detected_language = output.get("detected_language", "english")
+                            error_response = self._get_error_response(detected_language, "no_provider")
+                            workflow_metadata = self._create_workflow_metadata(
+                                output, progress_messages, "no_provider_error",
+                                "No LLM provider available for final response generation", detected_language
+                            )
+
+                            logger.info(f"SAVING_NO_PROVIDER_ERROR_RESPONSE: detected_language={detected_language}, is_first_message={is_first_message}")
+
+                            if is_first_message:
+                                await self.save_conversation(
                                     session_id=session_id,
                                     query=query,
-                                    response=(final_response or ""),
-                                    model_used=None,
-                                    workflow_data=workflow_metadata,
-                                    user_message_id=user_message_id
+                                    response=error_response,
+                                    language=detected_language,
+                                    model_used="no_provider",
+                                    workflow_data=workflow_metadata
                                 )
-                            except Exception as save_err:
-                                logger.error(f"Failed to save assistant response (no provider): {save_err}")
+                            else:
+                                if workflow_metadata:
+                                    chat_metadata = {"workflow": workflow_metadata}
+                                else:
+                                    chat_metadata = None
 
-                            yield self._create_sse_event(4, "end", {
+                                await self.save_message(
+                                    session_id=session_id,
+                                    query=query,
+                                    response=error_response,
+                                    model_used="no_provider",
+                                    chat_metadata=chat_metadata
+                                )
+
+                            yield self._create_sse_event(5, "end", {
                                 "message": "Response completed",
                                 "progress": 100,
                                 "status": "completed",
-                                "final_response": final_response or "Hello! How can I help you today?",
+                                "final_response": error_response,
                                 "sources": output.get("final_sources", []),
-                                "reasoning": output.get("reasoning", ""),
-                                "confidence_score": output.get("confidence_score", 0.0),
-                                "follow_up_questions": output.get("follow_up_questions", []),
+                                "reasoning": "No LLM provider available for final response generation",
+                                "confidence_score": 0.0,
+                                "follow_up_questions": [],
                                 "flow_action": output.get("flow_action", []),
                                 "execution_metadata": output.get("execution_metadata", {})
                             })
-                        else:
-                            evt = self._map_node_to_sse_event(node_name, output)
-                            if evt:
-                                event_type, sse_type, data = evt
-                                yield self._create_sse_event(sse_type, event_type, data)
-                            continue
+                        
         except Exception as e:
             logger.error(f"Multi-agent workflow error: {e}")
-            yield self._create_sse_event(4, "end", {
+            yield self._create_sse_event(5, "end", {
                 "message": f"Processing error: {str(e)}",
                 "progress": 0,
                 "status": "error",
                 "error": str(e)
             })
-
-    def _map_node_to_sse_event(self, node_name: str, output: Dict[str, Any]) -> Optional[tuple]:
-        """Map LangGraph node to SSE event format"""
-
-        if output.get("chitchat_response"):
-            return ("chitchat_response", 3, {
-                "message": "Chitchat response generated",
-                "progress": 100,
-                "status": "completed",
-                "content": output.get("chitchat_response")
-            })
-
-        if node_name == "execute_planning":
-            progress = output.get("progress_percentage", 0)
-            if output.get("processing_status") == "plan_ready":
-                progress = 0
-            return ("plan_execution", 2, {
-                "message": output.get("progress_message", "Planning execution"),
-                "progress": progress,
-                "status": output.get("processing_status", "running"),
-                "execution_plan": output.get("execution_plan", {})
-            })
-
-        if node_name == "final_response":
-            final_response = output.get("final_response", "")
-            return ("end", 4, {
-                "message": "Response completed",
-                "progress": 100,
-                "status": "completed",
-                "final_response": final_response,
-                "sources": output.get("final_sources", []),
-                "reasoning": output.get("reasoning", ""),
-                "confidence_score": output.get("confidence_score", 0.0),
-                "follow_up_questions": output.get("follow_up_questions", []),
-                "flow_action": output.get("flow_action", []),
-                "execution_metadata": output.get("execution_metadata", {})
-            })
-
-        return None
 
     def _create_sse_event(self, sse_type: int, event_type: str, data: Dict[str, Any]) -> str:
         """Create standardized SSE event with type numbers"""
@@ -977,26 +846,77 @@ class ChatService:
         }
         return f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
 
-    def _is_template_scaffold(self, text: str) -> bool:
-        """Filter out template/prompt scaffolding chunks so FE doesn't see raw prompt."""
-        if not text:
-            return False
-        lowered = text.lower()
-        scaffolds = [
-            "you are ",
-            "conversation history:",
-            "current user message:",
-            "instructions:",
-            "generate only the response",
-            "no additional formatting",
-            "respond naturally in",
-        ]
-        return any(s in lowered for s in scaffolds)
-
-    async def _handle_llm_streaming_response(self, prompt: str, provider, session_id: uuid.UUID, query: str):
-        """Handle LLM streaming response for prompts from final response node"""
+    def _get_model_used(self, provider) -> str:
+        """Extract model name from provider for logging"""
         try:
-            result = await provider.ainvoke(prompt, markdown=True)
+            prov_name = getattr(provider, 'name', None)
+            default_model = getattr(getattr(provider, 'config', None), 'default_model', None)
+            if prov_name and default_model:
+                return f"{prov_name}:{default_model}"
+            else:
+                return default_model or prov_name or "unknown"
+        except Exception:
+            return "unknown"
+
+    def _get_error_response(self, detected_language: str, error_type: str = "general") -> str:
+        """Get localized error response based on language"""
+        if error_type == "no_provider":
+            responses = {
+                "vietnamese": "Xin lỗi, hiện tại không có mô hình ngôn ngữ nào khả dụng để xử lý yêu cầu của bạn. Vui lòng thử lại sau.",
+                "chinese": "抱歉，目前没有可用的语言模型来处理您的请求。请稍后重试。",
+                "japanese": "申し訳ございませんが、現在リクエストを処理できる言語モデルが利用できません。後ほどお試しください。",
+                "korean": "죄송합니다. 현재 요청을 처리할 수 있는 언어 모델이 없습니다. 나중에 다시 시도해 주세요."
+            }
+            return responses.get(detected_language, "I apologize, but no language model is currently available to process your request. Please try again later.")
+        else:
+            responses = {
+                "vietnamese": "Xin lỗi, tôi gặp sự cố kỹ thuật khi xử lý yêu cầu của bạn. Vui lòng thử lại.",
+                "chinese": "抱歉，我在处理您的请求时遇到技术问题。请重试。",
+                "japanese": "申し訳ございませんが、リクエストの処理中に技術的な問題が発生しました。再度お試しください。",
+                "korean": "죄송합니다. 요청을 처리하는 동안 기술적인 문제가 발생했습니다. 다시 시도해 주세요."
+            }
+            return responses.get(detected_language, "I apologize, but I encountered a technical issue while processing your request. Please try again.")
+
+    def _create_workflow_metadata(self, output: Dict, progress_messages: List, response_type: str = "response",
+                                error_details: str = None, detected_language: str = "english") -> Dict:
+        """Create standardized workflow metadata"""
+        return {
+            "reasoning": output.get("reasoning", error_details or ""),
+            "execution_metadata": output.get("execution_metadata", {}),
+            "sources": output.get("final_sources", []),
+            "response_type": response_type,
+            "confidence_score": output.get("confidence_score", 0.0),
+            "follow_up_questions": output.get("follow_up_questions", []),
+            "flow_action": output.get("flow_action", []),
+            "detected_language": detected_language,
+            "is_chitchat": output.get("is_chitchat", False),
+            "processing_status": output.get("processing_status", "completed"),
+            "progress_percentage": output.get("progress_percentage", 100),
+            "progress_message": output.get("progress_message", ""),
+            "progress_messages": progress_messages,
+            "semantic_routing": output.get("semantic_routing", {}),
+            "agent_responses": output.get("agent_responses", []),
+            "conflict_resolution": output.get("conflict_resolution", {}),
+            "execution_plan": output.get("execution_plan", {}),
+            "agent_providers_loaded": output.get("agent_providers_loaded", 0),
+            "error_details": error_details
+        }
+
+    async def _handle_llm_streaming_response(self, prompt: str, provider, tenant_id: str, session_id: uuid.UUID, query: str):
+        """Handle LLM streaming response for prompts from final response node with connection recovery"""
+        try:
+            try:
+                result = await provider.ainvoke(prompt, tenant_id, markdown=True)
+            except Exception as e:
+                if "Event loop is closed" in str(e) or "unable to perform operation" in str(e):
+                    logger.warning(f"Connection issue detected, retrying with fresh connections: {e}")
+                    
+                    orchestrator = Orchestrator()
+                    fresh_provider = await orchestrator.llm(provider.name)
+                    result = await fresh_provider.ainvoke(prompt, tenant_id, markdown=True)
+                else:
+                    raise
+
             response_type = "response"
 
             if inspect.isasyncgen(result) or hasattr(result, "__aiter__"):

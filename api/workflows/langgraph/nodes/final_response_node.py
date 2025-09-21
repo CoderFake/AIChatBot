@@ -10,6 +10,7 @@ from utils.logging import get_logger
 from utils.datetime_utils import DateTimeManager
 from utils.language_utils import get_workflow_message
 from utils.prompt_utils import PromptUtils
+from services.orchestrator.orchestrator import Orchestrator
 
 logger = get_logger(__name__)
 
@@ -101,7 +102,7 @@ class FinalResponseNode(BaseWorkflowNode):
             return {
                 "final_response": final_content,
                 "final_sources": sources,
-                "provider": state.get("provider"),
+                "provider_name": state.get("provider_name"),
                 "processing_status": "completed",
                 "progress_percentage": 100,
                 "progress_message": get_workflow_message("completed", detected_language),
@@ -546,9 +547,11 @@ Response:"""
     ) -> List[str]:
         """Generate follow-up questions using AI based on query and response"""
         try:
-            llm_provider = state.get("provider") if state else None
+            provider_name = state.get("provider_name") if state else None
 
-            if llm_provider:
+            if provider_name:
+                orchestrator = Orchestrator()
+                llm_provider = await orchestrator.llm(provider_name)
                 try:
                     language_instruction = ""
                     if detected_language and detected_language != "en":
@@ -573,7 +576,8 @@ Return only the questions, one per line, without numbering or bullet points.
 {language_instruction}
 """
 
-                    response = await llm_provider.ainvoke(prompt)
+                    tenant_id = state.get("tenant_id") if state else None
+                    response = await llm_provider.ainvoke(prompt, tenant_id)
 
                     if response and hasattr(response, 'content'):
                         content = response.content.strip()

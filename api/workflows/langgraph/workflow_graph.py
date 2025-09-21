@@ -2,15 +2,11 @@
 Updated Multi-Agent RAG Workflow with streaming and planning execution
 """
 import asyncio
-import concurrent.futures
 from typing import Dict, Any, Optional, List, AsyncGenerator
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-
 from utils.logging import get_logger
 from utils.language_utils import get_workflow_message
-
 from .state.state import RAGState
 from .nodes.nodes import (
     OrchestratorNode,
@@ -27,108 +23,31 @@ from .edges.edges import (
     create_conflict_resolution_router,
     create_error_router
 )
-
+from utils.datetime_utils import DateTimeManager
 logger = get_logger(__name__)
-
 
 def create_sync_wrapper(async_node):
     """Create a sync wrapper for async node functions with proper event loop handling"""
+    
     def sync_wrapper(state, config):
+        """Sync wrapper that ensures execution in current event loop"""
         try:
-            try:
-                running_loop = asyncio.get_running_loop()
-                future = asyncio.run_coroutine_threadsafe(async_node(state, config), running_loop)
-                result = future.result()
-                return result
-            except RuntimeError as loop_error:
-                logger.debug(f"No running event loop ({loop_error}), using isolated execution")
-
-                def run_in_isolation():
-                    """Run async function in completely isolated context"""
-                    isolated_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(isolated_loop)
-                    try:
-                        result = isolated_loop.run_until_complete(async_node(state, config))
-                        return result
-                    finally:
-                        try:
-                            pending = asyncio.all_tasks(isolated_loop)
-                            for task in pending:
-                                if not task.done():
-                                    task.cancel()
-                            if pending:
-                                isolated_loop.run_until_complete(
-                                    asyncio.gather(*pending, return_exceptions=True)
-                                )
-                            isolated_loop.run_until_complete(isolated_loop.shutdown_asyncgens())
-                        except Exception:
-                            pass
-                        isolated_loop.close()
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(run_in_isolation)
-                    timeout_seconds = getattr(async_node, '_timeout', None) or 120
-                    try:
-                        result = future.result(timeout=timeout_seconds)
-                        return result
-                    except concurrent.futures.TimeoutError:
-                        logger.error(f"Node execution timed out after {timeout_seconds} seconds")
-                        future.cancel()
-                        raise TimeoutError(f"Node execution timed out after {timeout_seconds} seconds")
-
-        except asyncio.TimeoutError as timeout_error:
-            logger.error(f"Node execution timed out after {timeout_seconds} seconds: {timeout_error}")
-            error_msg = f"Node execution timed out after {timeout_seconds} seconds"
-            error_state = {
-                "error_message": error_msg,
-                "original_error": str(timeout_error),
-                "exception_type": "TimeoutError",
-                "processing_status": "failed",
-                "should_yield": True,
-                "next_action": "error",
-                "timeout_seconds": timeout_seconds
-            }
-            logger.error(f"Timeout error state: {error_msg}")
-            return error_state
-
-        except RuntimeError as runtime_error:
-            if "no running event loop" in str(runtime_error):
-                logger.warning(f"Event loop issue detected: {runtime_error}")
-                error_msg = "Event loop error: Unable to execute node due to async context issue"
-                error_state = {
-                    "error_message": error_msg,
-                    "original_error": str(runtime_error),
-                    "exception_type": "RuntimeError",
-                    "processing_status": "failed",
-                    "should_yield": True,
-                    "next_action": "error"
-                }
-                logger.error(f"Event loop error state: {error_msg}")
-                return error_state
-            else:
-                raise
-
+            return asyncio.run(async_node(state, config))
         except Exception as e:
             logger.error(f"Node execution failed: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-
+            
             error_msg = str(e) if str(e) else f"Unknown error: {type(e).__name__}"
-            original_err = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
-
-            error_state = {
+            return {
                 "error_message": error_msg,
-                "original_error": original_err,
+                "original_error": str(e),
                 "exception_type": type(e).__name__,
                 "processing_status": "failed",
                 "should_yield": True,
                 "next_action": "error"
             }
-
-            logger.error(f"Node execution failed, returning error state: error_message='{error_msg[:100]}...', exception_type={type(e).__name__}")
-            return error_state
-
-
+    
     return sync_wrapper
 
 
@@ -136,13 +55,11 @@ class MultiAgentRAGWorkflow:
     """
     Complete Multi-Agent RAG Workflow with streaming support
     """
-
     def __init__(self, enable_checkpointing: bool = True):
         self.enable_checkpointing = enable_checkpointing
         self._graph = None
         self._compiled_graph = None
         self._initialized = False
-
         self.nodes = {
             "orchestrator": create_sync_wrapper(OrchestratorNode()),
             "semantic_reflection": create_sync_wrapper(SemanticReflectionNode()),
@@ -237,7 +154,16 @@ class MultiAgentRAGWorkflow:
             if not self._graph:
                 self.build_graph()
             
-            checkpointer = MemorySaver() if self.enable_checkpointing else None
+            if self.enable_checkpointing:
+                try:
+                    from langgraph.checkpoint.memory import MemorySaver
+                    checkpointer = MemorySaver()
+                    logger.info("Using MemorySaver for LangGraph checkpointing")
+                except ImportError:
+                    logger.warning("MemorySaver not available, disabling checkpointing")
+                    checkpointer = None
+            else:
+                checkpointer = None
             
             self._compiled_graph = self._graph.compile(checkpointer=checkpointer)
             self._initialized = True
@@ -254,11 +180,9 @@ class MultiAgentRAGWorkflow:
         """
         if not self._initialized:
             self.compile()
-
         try:
             result = await self._compiled_graph.ainvoke(input_data, config=config)
             return result
-
         except Exception as e:
             logger.error(f"Workflow execution failed: {e}")
             raise
@@ -269,49 +193,25 @@ class MultiAgentRAGWorkflow:
         """
         if not self._initialized:
             self.compile()
-
-        from asyncio import Queue
-        progress_queue = Queue()
-
         try:
             logger.info("Starting workflow streaming...")
-            async for chunk in self._compiled_graph.astream(input_data, config=config):
-                logger.debug(f"Received chunk from astream: {list(chunk.keys())}")
-                for node_name, node_output in chunk.items():
-                    logger.debug(f"Processing node {node_name}, output type: {type(node_output)}")
-                    if isinstance(node_output, dict):
-                        should_yield = node_output.get("should_yield")
-                        logger.debug(f"Node {node_name} should_yield: {should_yield} (type: {type(should_yield)})")
-                        if should_yield:
-                            logger.info(f"Yielding event for node {node_name}: {node_output.get('processing_status', 'unknown')}")
-                            yield {
-                            "type": "node",
-                            "node": node_name,
-                            "output": node_output,
-                            "progress": node_output.get("progress_percentage", 0),
-                            "status": node_output.get("processing_status", "processing"),
-                            "message": node_output.get("progress_message", "")
-                        }
-
-                    elif hasattr(node_output, '__aiter__'):
-                        async for progress_item in node_output:
-                            if isinstance(progress_item, dict) and progress_item.get("should_yield"):
-                                yield {
-                                    "type": "node",
-                                    "node": node_name,
-                                    "output": progress_item,
-                                    "progress": progress_item.get("progress_percentage", 0),
-                                    "status": progress_item.get("processing_status", "processing"),
-                                    "message": progress_item.get("progress_message", "")
-                                }
-
-            while not progress_queue.empty():
-                progress_data = await progress_queue.get()
-                yield progress_data
+            
+            # Use ainvoke instead of astream to avoid threading issues
+            result = await self._compiled_graph.ainvoke(input_data, config=config)
+            
+            if result and isinstance(result, dict):
+                logger.info("Yielding final workflow result")
+                yield {
+                    "type": "node",
+                    "node": "final_response",
+                    "output": result,
+                    "progress": 100,
+                    "status": "completed",
+                    "message": "Workflow completed"
+                }
             
         except Exception as e:
             logger.error(f"Workflow streaming failed: {e}")
-
             yield {
                 "node": "error",
                 "output": {"error_message": str(e)},
@@ -330,7 +230,7 @@ class MultiAgentRAGWorkflow:
             return False
 
 
-multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=False)
+multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=True)
 
 
 async def create_rag_workflow(enable_checkpointing: bool = True) -> MultiAgentRAGWorkflow:
@@ -356,27 +256,28 @@ async def execute_rag_query(
     if not multi_agent_rag_workflow._initialized:
         multi_agent_rag_workflow.compile()
 
-    provider = None
-    agents_structure = None  
+    provider_name = None
+    agents_structure = None
     tenant_bot_name = bot_name
     tenant_org_name = organization_name
 
     if user_context.get("tenant_id"):
         try:
-            from services.orchestrator.provider_helper import get_provider_for_tenant
-            from services.agents.agent_service import AgentService
             from services.tenant.tenant_service import TenantService
+            from services.agents.workflow_agent_service import WorkflowAgentService
             from config.database import get_db_session
 
             async with get_db_session() as db:
-                provider = await get_provider_for_tenant(user_context["tenant_id"], db)
-
-                if provider:
-                    agent_service = AgentService(db)
-                    agents_structure = await agent_service.get_agents_structure_for_user(user_context)
-                else:
-                    logger.warning(f"No provider available for tenant {user_context['tenant_id']}")
+                try:
+                    provider_config = await WorkflowAgentService(db).get_workflow_agent_config(user_context["tenant_id"])
+                    logger.info(f"Provider config for tenant {user_context['tenant_id']}: {provider_config}")
+                    if provider_config:
+                        provider_name = provider_config["provider_name"]
+                except Exception as e:
+                    logger.error(f"Failed to get provider config for tenant {user_context['tenant_id']}: {e}")
+                    provider_name = None
                     agents_structure = None  
+
                 tenant_service = TenantService(db)
                 tenant_info = await tenant_service.get_bot_and_org_info(user_context["tenant_id"])
                 tenant_bot_name = tenant_info["bot_name"]
@@ -384,7 +285,6 @@ async def execute_rag_query(
 
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
-            provider = None
             agents_structure = None
 
     input_data = {
@@ -393,11 +293,11 @@ async def execute_rag_query(
         "user_context": user_context,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
+        "provider_name": provider_name,
         "user_id": user_context.get("user_id"),
         "tenant_id": user_context.get("tenant_id"),
         "department_id": user_context.get("department_id"),
         "access_scope": user_context.get("access_scope"),
-        "provider": provider,
         "agents_structure": agents_structure,
         "current_step": "orchestrator",
         "next_action": "semantic_reflection",
@@ -415,6 +315,7 @@ async def stream_rag_query(
     bot_name: str = "AI Assistant",
     organization_name: str = "Organization",
     tenant_description: str = "",
+    access_level: str = "public"
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Execute a RAG query with streaming using the global workflow instance
@@ -422,38 +323,42 @@ async def stream_rag_query(
     if not multi_agent_rag_workflow._initialized:
         multi_agent_rag_workflow.compile()
 
-    provider = None
+    provider_name = None
     agents_structure = None
     tenant_bot_name = bot_name
     tenant_org_name = organization_name
     tenant_desc = tenant_description
+    tenant_timezone = None
 
     if user_context.get("tenant_id"):
         try:
-            from services.orchestrator.provider_helper import get_provider_for_tenant
-            from services.agents.agent_service import AgentService
             from services.tenant.tenant_service import TenantService
+            from services.agents.workflow_agent_service import WorkflowAgentService
             from config.database import get_db_session
 
             async with get_db_session() as db:
-                provider = await get_provider_for_tenant(user_context["tenant_id"], db)
-
-                if provider:
-                    agent_service = AgentService(db)
-                    agents_structure = await agent_service.get_agents_structure_for_user(user_context)
-                else:
-                    logger.warning(f"No provider available for tenant {user_context['tenant_id']}")
+                try:
+                    provider_config = await WorkflowAgentService(db).get_workflow_agent_config(user_context["tenant_id"])
+                    logger.info(f"Stream provider config for tenant {user_context['tenant_id']}: {provider_config}")
+                    if provider_config:
+                        provider_name = provider_config["provider_name"]
+                    else:
+                        logger.warning(f"Stream no provider config returned for tenant {user_context['tenant_id']}")
+                        provider_name = None
+                except Exception as e:
+                    logger.error(f"Stream failed to get provider config for tenant {user_context['tenant_id']}: {e}")
+                    provider_name = None
                     agents_structure = None
-                    
+
                 tenant_service = TenantService(db)
                 tenant_info = await tenant_service.get_bot_and_org_info(user_context["tenant_id"])
                 tenant_bot_name = tenant_info["bot_name"]
                 tenant_org_name = tenant_info["organization_name"]
                 tenant_desc = tenant_info["description"]
+                tenant_timezone = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
 
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
-            provider = None
             agents_structure = None 
 
     langchain_messages = []
@@ -474,14 +379,15 @@ async def stream_rag_query(
         "query": query,
         "messages": langchain_messages,
         "user_context": user_context,
+        "tenant_timezone": tenant_timezone,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
         "tenant_description": tenant_desc,
         "user_id": user_context.get("user_id"),
         "tenant_id": user_context.get("tenant_id"),
         "department_id": user_context.get("department_id"),
-        "access_scope": user_context.get("access_scope"),
-        "provider": provider,
+        "access_scope": access_level,
+        "provider_name": provider_name,
         "agents_structure": agents_structure,
         "detected_language": detected_language,
         "current_step": "orchestrator",

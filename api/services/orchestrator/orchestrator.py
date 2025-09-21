@@ -4,16 +4,20 @@ Direct workflow system integration
 No config, no fallback, no defaults
 """
 
-from typing import Dict, Any, List
+from typing import Optional, Dict, Any
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+global_provider_manager = None
+global_cache_manager = None
 
 
 class Orchestrator:
     """
     Simplified orchestrator that directly uses the workflow system
     No configuration management, no fallback logic
+    Uses global provider manager instance
     """
 
     def __init__(self, db=None):
@@ -25,119 +29,55 @@ class Orchestrator:
         if not self._cache_initialized:
             self._cache_initialized = True
 
-    async def get_provider_for_tenant(self, tenant_id: str):
+    async def llm(self, provider_name: str):
         """
-        Get LLM provider for tenant
+        Get LLM provider wrapper với API keys injection
+        Trả về wrapper object có method ainvoke(prompt, tenant_id, **kwargs)
+        Uses global provider manager instance
         """
-        try:
-            from services.llm.provider_manager import get_llm_provider_for_tenant
-            return await get_llm_provider_for_tenant(tenant_id)
-        except Exception as e:
-            logger.error(f"Failed to get provider for tenant {tenant_id}: {e}")
-            return None
+        global global_provider_manager
 
-    async def process_query(
-        self,
-        query: str,
-        messages: List[Dict[str, Any]] = None,
-        user_context: Dict[str, Any] = None
-    ) -> str:
+        if global_provider_manager is None:
+            raise RuntimeError("Global provider manager not initialized. Make sure main.py initializes it.")
+
+        provider = await global_provider_manager.get_provider(provider_name)
+        return LLMProviderWrapper(provider)
+
+    async def agents_structure(self, user_context: Dict[str, Any]):
+        from services.agents.agent_service import AgentService
+        agent_service = AgentService(self.db)
+        return await agent_service.get_agents_structure_for_user(user_context)
+
+    def cache_manager(self):
         """
-        Process query using workflow system directly
+        Get global cache manager instance
+        Returns the pre-initialized cache manager from main.py
         """
-        try:
-            await self._ensure_initialized()
+        global global_cache_manager
+        if global_cache_manager is None:
+            raise RuntimeError("Global cache manager not initialized. Make sure main.py initializes it.")
+        return global_cache_manager
 
-            tenant_id = user_context.get("tenant_id") if user_context else None
-            user_id = user_context.get("user_id") if user_context else None
+class LLMProviderWrapper:
+    """Wrapper để inject API keys khi gọi ainvoke"""
 
-            logger.info(f"Processing query for tenant {tenant_id}, user {user_id}")
+    def __init__(self, provider):
+        self.provider = provider
 
-            return await self._process_with_workflow(query, messages or [], user_context)
+    async def ainvoke(self, prompt: str, tenant_id: str, model: Optional[str] = None, **kwargs):
+        """Invoke LLM với API keys của tenant - chỉ truyền API keys, không re-initialize"""
+        from services.providers.provider_api_keys_service import ProviderApiKeysService
+        from config.database import get_db_session
 
-        except ValueError as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Failed to process query: {e}")
-            return f"Error processing query: {str(e)}"
+        if tenant_id and self.provider:
+            async with get_db_session() as db:
+                api_keys_service = ProviderApiKeysService(db)
+                api_keys_result = await api_keys_service.get_provider_api_keys(tenant_id, self.provider.name)
+                tenant_api_keys = api_keys_result.get("api_keys", [])
 
-    async def process_tenant_query(
-        self,
-        query: str,
-        tenant_id: str,
-        user_id: str = None,
-        messages: List[Dict[str, Any]] = None,
-        use_workflow: bool = True
-    ) -> str:
-        """
-        Process query specifically for a tenant using their workflow configuration
-        """
-        try:
-            await self._ensure_initialized()
+                if not tenant_api_keys:
+                    raise ValueError(f"No API keys found for tenant {tenant_id} and provider {self.provider.name}")
 
-            user_context = {
-                "tenant_id": tenant_id,
-                "user_id": user_id or "anonymous"
-            }
+                kwargs['api_keys'] = tenant_api_keys
 
-            logger.info(f"Processing tenant query for tenant {tenant_id}, user {user_id}")
-
-            if use_workflow:
-                return await self._process_with_workflow(query, messages or [], user_context)
-            else:
-                return await self.process_query(query, messages, user_context)
-
-        except ValueError as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Failed to process tenant query for {tenant_id}: {e}")
-            return f"Error processing query for tenant {tenant_id}: {str(e)}"
-
-    async def _process_with_workflow(
-        self,
-        query: str,
-        messages: List[Dict[str, Any]],
-        user_context: Dict[str, Any]
-    ) -> str:
-        """
-        Process query using the RAG workflow system with tenant context
-        """
-        try:
-            from workflows.langgraph.workflow_graph import execute_rag_query
-
-            workflow_messages = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        workflow_messages.append({"type": "human", "content": content})
-                    elif role == "assistant":
-                        workflow_messages.append({"type": "ai", "content": content})
-
-            logger.info(f"Executing RAG workflow for tenant {user_context.get('tenant_id')}")
-
-            result = await execute_rag_query(
-                query=query,
-                user_context=user_context,
-                messages=workflow_messages
-            )
-
-            if result and isinstance(result, dict):
-                if "final_response" in result:
-                    return result["final_response"]
-                elif "answer" in result:
-                    return result["answer"]
-                else:
-                    logger.warning(f"No response found in workflow result: {result}")
-                    return "I apologize, but I couldn't generate a response for your query."
-
-            return str(result) if result else "No response generated."
-
-        except ValueError as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Failed to process with workflow: {e}")
-            return f"Sorry, I encountered an error while processing your request: {str(e)}"
-
-    
+        return await self.provider.ainvoke(prompt, model, **kwargs)

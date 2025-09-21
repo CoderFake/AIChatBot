@@ -8,6 +8,7 @@ from .base import BaseWorkflowNode
 from workflows.langgraph.state.state import RAGState
 from utils.logging import get_logger
 from utils.language_utils import get_workflow_message
+from services.orchestrator.orchestrator import Orchestrator
 
 logger = get_logger(__name__)
 
@@ -77,8 +78,8 @@ class OrchestratorNode(BaseWorkflowNode):
                         try:
                             provider = await agent_service._get_agent_llm_provider(agent_id, tenant_id)
                             if provider:
-                                agent_providers[agent_id] = provider
-                                logger.debug(f"Loaded provider for agent {agent_name} ({agent_id})")
+                                agent_providers[agent_id] = getattr(provider, 'name', f'provider_{agent_id}')
+                                logger.debug(f"Loaded provider name for agent {agent_name} ({agent_id})")
                         except Exception as e:
                             logger.warning(f"Failed to load provider for agent {agent_name}: {e}")
 
@@ -121,10 +122,6 @@ class ErrorHandlerNode(BaseWorkflowNode):
 
             agent_responses = state.get("agent_responses", [])
             detected_language = state.get("detected_language", "english")
-
-            logger.error(f"Error handler activated with error: {error_message}")
-            logger.error(f"Original error: {state.get('original_error', 'N/A')}")
-            logger.error(f"Exception type: {state.get('exception_type', 'N/A')}")
             
             if agent_responses:
                 user_context = state.get("user_context", {})
@@ -261,9 +258,10 @@ class ErrorHandlerNode(BaseWorkflowNode):
                 return get_workflow_message('no_results', detected_language)
 
             try:
-                provider = state.get("provider")
-
-                if provider:
+                provider_name = state.get("provider_name")
+                if provider_name:
+                    orchestrator = Orchestrator()
+                    provider = await orchestrator.llm(provider_name)
                     partial_prompt = f"""
 Create a helpful response from these partial results, acknowledging that some information may be incomplete due to system issues.
 
@@ -281,7 +279,8 @@ INSTRUCTIONS:
 
 Provide ONLY the formatted response.
 """
-                    formatted = await provider.ainvoke(partial_prompt)
+                    tenant_id = state.get("tenant_id")
+                    formatted = await provider.ainvoke(partial_prompt, tenant_id)
                     return formatted.content.strip()
                     
             except Exception as e:

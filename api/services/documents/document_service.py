@@ -1,7 +1,9 @@
 from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_, select, delete
+from sqlalchemy.orm import selectinload
 from utils.logging import get_logger
+from utils.datetime_utils import DateTimeManager
 import asyncio
 import tempfile
 import os
@@ -15,18 +17,15 @@ from services.storage.minio_service import minio_service
 from common.types import (
     DBDocumentPermissionLevel, 
     DocumentAccessLevel, 
-    DocumentProcessingStatus, 
+    DocumentProcessingStatus,
     VectorProcessingStatus,
     KafkaMessageStatus,
     DocumentConstants
 )
 from common.dataclasses import (
-    DocumentUploadRequest,
     DocumentUploadResult, 
-    DocumentProgressEvent,
     BatchUploadProgress,
-    DocumentDeleteResult,
-    MilvusCollectionInfo
+    DocumentDeleteResult
 )
 from config.settings import get_settings
 from utils.file_processor import FileProcessor
@@ -60,152 +59,15 @@ class DocumentService:
             await asyncio.gather(
                 milvus_service.ensure_collection_exists(
                     collection_name=public_name,
-                    milvus_instance=DBDocumentPermissionLevel.PUBLIC.value,
+                    access_level=DocumentAccessLevel.PUBLIC.value,
                 ),
                 milvus_service.ensure_collection_exists(
                     collection_name=private_name,
-                    milvus_instance=DBDocumentPermissionLevel.PRIVATE.value,
+                    access_level=DBDocumentPermissionLevel.PRIVATE.value,
                 ),
             )
         except Exception as e:
             logger.warning(f"Milvus ensure collections failed: {e}")
-
-    async def create_department_root(self, tenant_id: str, department_id: str) -> Optional[Dict[str, str]]:
-        """
-        Create root folders and two collections (public/private) for a department.
-        Creates separate root folders for public and private access levels.
-        Returns dict with document_root_ids and collection names if success.
-        """
-        try:
-            result = await self.db.execute(select(Department).where(Department.id == department_id))
-            department: Optional[Department] = result.scalar_one_or_none()
-            if not department:
-                logger.error(f"Department {department_id} not found for document root")
-                return None
-
-            # Create or get public root folder
-            result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.folder_path == DocumentConstants.ROOT_FOLDER_PATH,
-                        DocumentFolder.access_level == DocumentAccessLevel.PUBLIC.value,
-                    )
-                )
-            )
-            existing_public_root: Optional[DocumentFolder] = result.scalar_one_or_none()
-
-            if existing_public_root:
-                public_root_folder = existing_public_root
-            else:
-                public_root_folder = DocumentFolder(
-                    department_id=department_id,
-                    folder_name=f"{DocumentConstants.ROOT_FOLDER_NAME}_public",
-                    folder_path=DocumentConstants.ROOT_FOLDER_PATH,
-                    access_level=DocumentAccessLevel.PUBLIC.value,
-                )
-                self.db.add(public_root_folder)
-
-            # Create or get private root folder
-            result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.folder_path == DocumentConstants.ROOT_FOLDER_PATH,
-                        DocumentFolder.access_level == DocumentAccessLevel.PRIVATE.value,
-                    )
-                )
-            )
-            existing_private_root: Optional[DocumentFolder] = result.scalar_one_or_none()
-
-            if existing_private_root:
-                private_root_folder = existing_private_root
-            else:
-                private_root_folder = DocumentFolder(
-                    department_id=department_id,
-                    folder_name=f"{DocumentConstants.ROOT_FOLDER_NAME}_private",
-                    folder_path=DocumentConstants.ROOT_FOLDER_PATH,
-                    access_level=DocumentAccessLevel.PRIVATE.value,
-                )
-                self.db.add(private_root_folder)
-
-            await self.db.flush()
-
-            public_name = DocumentConstants.COLLECTION_NAME_TEMPLATE_PUBLIC.format(
-                tenant_id=tenant_id, department_id=department_id
-            )
-            private_name = DocumentConstants.COLLECTION_NAME_TEMPLATE_PRIVATE.format(
-                tenant_id=tenant_id, department_id=department_id
-            )
-
-            result = await self.db.execute(
-                select(DocumentCollection).where(
-                    and_(
-                        DocumentCollection.department_id == department_id,
-                        DocumentCollection.collection_type == DBDocumentPermissionLevel.PUBLIC.value,
-                    )
-                )
-            )
-            existing_public: Optional[DocumentCollection] = result.scalar_one_or_none()
-            if not existing_public:
-                public_collection = DocumentCollection(
-                    department_id=department_id,
-                    collection_name=public_name,
-                    collection_type=DBDocumentPermissionLevel.PUBLIC.value,
-                    is_active=True,
-                )
-                self.db.add(public_collection)
-            else:
-                public_name = existing_public.collection_name
-
-            result = await self.db.execute(
-                select(DocumentCollection).where(
-                    and_(
-                        DocumentCollection.department_id == department_id,
-                        DocumentCollection.collection_type == DBDocumentPermissionLevel.PRIVATE.value,
-                    )
-                )
-            )
-            existing_private: Optional[DocumentCollection] = result.scalar_one_or_none()
-            if not existing_private:
-                private_collection = DocumentCollection(
-                    department_id=department_id,
-                    collection_name=private_name,
-                    collection_type=DBDocumentPermissionLevel.PRIVATE.value,
-                    is_active=True,
-                )
-                self.db.add(private_collection)
-            else:
-                private_name = existing_private.collection_name
-
-            await self._ensure_milvus_collections(public_name, private_name)
-
-            try:
-                bucket_name = self._build_bucket_name(tenant_id)
-                await minio_service.ensure_bucket(bucket_name)
-
-                public_dir_key = f"{tenant_id}/{department_id}/public/"
-                private_dir_key = f"{tenant_id}/{department_id}/private/"
-
-                await minio_service.put_bytes(bucket_name, f"{public_dir_key}.keep", b"", "text/plain")
-                await minio_service.put_bytes(bucket_name, f"{private_dir_key}.keep", b"", "text/plain")
-
-                logger.info(f"Created MinIO directories: {public_dir_key}, {private_dir_key}")
-
-            except Exception as e:
-                logger.warning(f"Failed to create MinIO directories: {e}")
-
-            return {
-                "public_root_id": str(public_root_folder.id),
-                "private_root_id": str(private_root_folder.id),
-                "public_collection": public_name,
-                "private_collection": private_name,
-            }
-        except Exception as e:
-            logger.error(f"Failed to create department root for {department_id}: {e}")
-            return None
-
-    # ------------------- Folder Management -------------------
 
     async def create_folder(
         self,
@@ -217,64 +79,58 @@ class DocumentService:
     ) -> Optional[Dict[str, Any]]:
         """Create a new folder in the hierarchy"""
         try:
-            if not access_level:
-                if parent_folder_id:
-                    parent_result = await self.db.execute(
-                        select(DocumentFolder).where(DocumentFolder.id == parent_folder_id)
-                    )
-                    parent_folder: Optional[DocumentFolder] = parent_result.scalar_one_or_none()
-                    if not parent_folder:
-                        raise ValueError(f"Parent folder {parent_folder_id} not found")
-
-                    if str(parent_folder.department_id) != department_id:
-                        raise ValueError("Parent folder belongs to different department")
-
-                    if parent_folder.access_level == DocumentAccessLevel.PRIVATE.value:
-                        access_level = DocumentAccessLevel.PRIVATE
-                    else:
-                        access_level = DocumentAccessLevel.PUBLIC
-                else:
-                    access_level = DocumentAccessLevel.PUBLIC
-
+            parent_folder = None
             if parent_folder_id:
                 parent_result = await self.db.execute(
                     select(DocumentFolder).where(DocumentFolder.id == parent_folder_id)
                 )
                 parent_folder: Optional[DocumentFolder] = parent_result.scalar_one_or_none()
                 if not parent_folder:
-                    raise ValueError(f"Parent folder {parent_folder_id} not found")
+                    raise ValueError("Parent folder does not exist")
 
-                if str(parent_folder.department_id) != department_id:
-                    raise ValueError("Parent folder belongs to different department")
-
-                folder_path = f"{parent_folder.folder_path.rstrip('/')}/{folder_name}/"
-            else:
-                folder_path = f"/{folder_name}/"
-
-            existing_result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.folder_path == folder_path
+            if parent_folder:
+                existing_result = await self.db.execute(
+                    select(DocumentFolder).where(
+                        and_(
+                            DocumentFolder.department_id == department_id,
+                            DocumentFolder.parent_folder_id == parent_folder_id,
+                            DocumentFolder.folder_name == folder_name
+                        )
                     )
                 )
-            )
+            else:
+                existing_result = await self.db.execute(
+                    select(DocumentFolder).where(
+                        and_(
+                            DocumentFolder.department_id == department_id,
+                            DocumentFolder.parent_folder_id.is_(None),
+                            DocumentFolder.folder_name == folder_name
+                        )
+                    )
+                )
+
             if existing_result.scalar_one_or_none():
-                raise ValueError(f"Folder with path {folder_path} already exists")
+                raise ValueError(f"Folder with name '{folder_name}' already exists")
+
+            if parent_folder:
+                folder_path = f"{parent_folder.folder_path}/{folder_name}"
+            else:
+                folder_path = f"/{folder_name}"
 
             new_folder = DocumentFolder(
                 department_id=department_id,
                 folder_name=folder_name,
                 folder_path=folder_path,
                 parent_folder_id=parent_folder_id,
-                access_level=access_level.value,
-                created_by=created_by
+                access_level=access_level
             )
-            
+
             self.db.add(new_folder)
             await self.db.flush()
-            await self.db.commit()
-            
+
+            if not parent_folder_id:
+                await self.db.commit()
+
             return {
                 "id": str(new_folder.id),
                 "folder_name": new_folder.folder_name,
@@ -289,144 +145,247 @@ class DocumentService:
             await self.db.rollback()
             return None
 
-    async def get_folder_tree(self, department_id: str, folder_id: Optional[str] = None, access_level: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Get folder tree structure starting from folder_id (or root if None) with optional access_level filter"""
+    async def get_root_folder(self, department_id: str, access_level: str) -> Optional[DocumentFolder]:
+        """Get a folder by department ID and folder name"""
+        root_folder = await self.db.execute(
+            select(DocumentFolder)
+            .where(
+                and_(
+                    DocumentFolder.department_id == department_id,
+                    DocumentFolder.parent_folder_id.is_(None),
+                    DocumentFolder.access_level == access_level
+                )
+            )
+        )
+        root_folder = root_folder.scalar_one_or_none()
+        return root_folder
+
+    async def get_folders(
+        self,
+        role: str,
+        department_id: str,
+        folder_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get folders with role-based access control according to get_info_doc.md
+
+        Args:
+            role: User role (USER, DEPT_ADMIN, DEPT_MANAGER, ADMIN)
+            department_id: Department ID for filtering
+            folder_id: Specific folder ID to get (None for root folders)
+
+        Returns:
+            List of folder dictionaries with documents and subfolders
+        """
+        results = []
+
         try:
-            if folder_id:
-                result = await self.db.execute(
-                    select(DocumentFolder).where(
-                        and_(
-                            DocumentFolder.id == folder_id,
-                            DocumentFolder.department_id == department_id
-                        )
+            if folder_id is None:
+                root_query = select(DocumentFolder).where(DocumentFolder.parent_folder_id.is_(None))
+
+                if role == "USER":
+                    root_query = root_query.where(DocumentFolder.access_level == "public")
+                elif role in ["DEPT_ADMIN", "DEPT_MANAGER"]:
+                    root_query = root_query.where(
+                        (DocumentFolder.department_id == department_id) |
+                        ((DocumentFolder.department_id != department_id) & (DocumentFolder.access_level == "public"))
                     )
-                )
-                root_folder = result.scalar_one_or_none()
-                if not root_folder:
-                    return None
-            else:
-                # Build query for root folders
-                query = select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.folder_path == DocumentConstants.ROOT_FOLDER_PATH
-                    )
-                )
 
-                if access_level:
-                    query = query.where(DocumentFolder.access_level == access_level)
+                root_folders = (await self.db.execute(root_query)).scalars().all()
 
-                result = await self.db.execute(query)
-                root_folders = result.scalars().all()
-
-                if not root_folders:
-                    return None
-
-                if len(root_folders) == 1:
-                    root_folder = root_folders[0]
-                else:
-                    return await self._build_combined_folder_tree(root_folders)
-
-            async def _build_tree(folder: DocumentFolder) -> Dict[str, Any]:
-                subfolders_result = await self.db.execute(
-                    select(DocumentFolder).where(
-                        DocumentFolder.parent_folder_id == folder.id
-                    )
-                )
-                subfolders = subfolders_result.scalars().all()
-                
-                documents_result = await self.db.execute(
-                    select(Document).where(Document.folder_id == str(folder.id))
-                )
-                documents = documents_result.scalars().all()
-                
-                return {
-                    "id": str(folder.id),
-                    "folder_name": folder.folder_name,
-                    "folder_path": folder.folder_path,
-                    "access_level": folder.access_level,
-                    "document_count": len(documents),
-                    "documents": [
-                        {
-                            "id": str(doc.id),
-                            "filename": doc.filename,
-                            "title": doc.title,
-                            "file_size": doc.file_size,
-                            "file_type": doc.file_type,
-                            "access_level": doc.access_level,
-                            "processing_status": doc.processing_status
-                        } for doc in documents
-                    ],
-                    "subfolders": [await _build_tree(subfolder) for subfolder in subfolders]
-                }
-
-            return await _build_tree(root_folder)
-
-        except Exception as e:
-            logger.error(f"Failed to get folder tree: {e}")
-            return None
-
-    async def _build_combined_folder_tree(self, root_folders: List) -> Dict[str, Any]:
-        """Build combined tree structure for multiple root folders"""
-        try:
-            combined_tree = {
-                "id": "combined_root",
-                "folder_name": "Department Root",
-                "folder_path": "/",
-                "access_level": "mixed",
-                "subfolders": [],
-                "documents": []
-            }
-
-            for root_folder in root_folders:
-                async def _build_tree(folder: DocumentFolder) -> Dict[str, Any]:
-                    subfolders_result = await self.db.execute(
-                        select(DocumentFolder).where(
-                            DocumentFolder.parent_folder_id == folder.id
-                        )
-                    )
-                    subfolders = subfolders_result.scalars().all()
-
-                    documents_result = await self.db.execute(
-                        select(Document).where(Document.folder_id == str(folder.id))
-                    )
-                    documents = documents_result.scalars().all()
-
-                    return {
+                for folder in root_folders:
+                    results.append({
                         "id": str(folder.id),
                         "folder_name": folder.folder_name,
                         "folder_path": folder.folder_path,
-                        "access_level": folder.access_level,
-                        "document_count": len(documents),
-                        "documents": [
-                            {
-                                "id": str(doc.id),
-                                "filename": doc.filename,
-                                "title": doc.title,
-                                "file_size": doc.file_size,
-                                "file_type": doc.file_type,
-                                "access_level": doc.access_level,
-                                "processing_status": doc.processing_status
-                            } for doc in documents
-                        ],
-                        "subfolders": [await _build_tree(subfolder) for subfolder in subfolders]
-                    }
+                        "parent_folder_id": None,
+                        "created_at": folder.created_at.isoformat() if folder.created_at else None,
+                        "updated_at": folder.updated_at.isoformat() if folder.updated_at else None,
+                        "documents": [], 
+                        "subfolders": []  
+                    })
 
-                root_tree = await _build_tree(root_folder)
-                combined_tree["subfolders"].append(root_tree)
+            else:
+                folder = await self.db.get(DocumentFolder, folder_id)
+                if not folder:
+                    logger.warning(f"Folder {folder_id} not found")
+                    return []
 
-            return combined_tree
+                can_access = False
+                if role == "ADMIN":
+                    can_access = True
+                elif role == "USER":
+                    can_access = folder.access_level == "public"
+                elif role in ["DEPT_ADMIN", "DEPT_MANAGER"]:
+                    can_access = (str(folder.department_id) == department_id or folder.access_level == "public")
+
+                if not can_access:
+                    logger.warning(f"Access denied for folder {folder_id} with role {role}")
+                    return []
+
+                subfolders_query = select(DocumentFolder).where(DocumentFolder.parent_folder_id == folder_id)
+                if role == "USER":
+                    subfolders_query = subfolders_query.where(DocumentFolder.access_level == "public")
+                elif role in ["DEPT_ADMIN", "DEPT_MANAGER"]:
+                    subfolders_query = subfolders_query.where(
+                        (DocumentFolder.department_id == department_id) |
+                        ((DocumentFolder.department_id != department_id) & (DocumentFolder.access_level == "public"))
+                    )
+                subfolders = (await self.db.execute(subfolders_query)).scalars().all()
+
+                documents_query = select(Document).where(Document.folder_id == folder_id)
+                if role == "USER":
+                    documents_query = documents_query.where(Document.access_level == "public")
+                elif role in ["DEPT_ADMIN", "DEPT_MANAGER"]:
+                    documents_query = documents_query.where(
+                        (Document.department_id == department_id) |
+                        ((Document.department_id != department_id) & (Document.access_level == "public"))
+                    )
+                documents = (await self.db.execute(documents_query)).scalars().all()
+
+                folder_response = {
+                    "id": str(folder.id),
+                    "folder_name": folder.folder_name,
+                    "folder_path": folder.folder_path,
+                    "parent_folder_id": str(folder.parent_folder_id) if folder.parent_folder_id else None,
+                    "created_at": folder.created_at.isoformat() if folder.created_at else None,
+                    "updated_at": folder.updated_at.isoformat() if folder.updated_at else None,
+                    "documents": [
+                        {
+                            "id": str(doc.id),
+                            "name": doc.filename,  
+                            "folder_id": str(doc.folder_id),
+                            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                            "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+                        }
+                        for doc in documents
+                    ],
+                    "subfolders": [
+                        {
+                            "id": str(sub.id),
+                            "folder_name": sub.folder_name,
+                            "folder_path": sub.folder_path,
+                            "parent_folder_id": str(sub.parent_folder_id) if sub.parent_folder_id else None,
+                            "created_at": sub.created_at.isoformat() if sub.created_at else None,
+                            "updated_at": sub.updated_at.isoformat() if sub.updated_at else None,
+                            "documents": [],  # Direct children only
+                            "subfolders": []  # Direct children only
+                        }
+                        for sub in subfolders
+                    ]
+                }
+
+                results.append(folder_response)
+
+            logger.info(f"Retrieved {len(results)} folders for role {role}, department {department_id}")
+            return results
 
         except Exception as e:
-            logger.error(f"Failed to build combined folder tree: {e}")
-            return {
-                "id": "error",
-                "folder_name": "Error",
-                "folder_path": "/",
-                "access_level": "error",
-                "subfolders": [],
-                "documents": []
-            }
+            logger.error(f"Failed to get folders: {e}")
+            return []
+
+    async def delete_folder(self, folder_id: str, department_id: str) -> bool:
+        """
+        Delete a folder and all its contents recursively
+        """
+        try:
+            result = await self.db.execute(
+                select(DocumentFolder).where(
+                    and_(
+                        DocumentFolder.id == folder_id,
+                        DocumentFolder.department_id == department_id
+                    )
+                )
+            )
+            folder = result.scalar_one_or_none()
+            if not folder:
+                return False
+
+            subfolders_result = await self.db.execute(
+                select(DocumentFolder).where(DocumentFolder.parent_folder_id == folder_id)
+            )
+            subfolders = subfolders_result.scalars().all()
+
+            for subfolder in subfolders:
+                await self.delete_folder(str(subfolder.id), department_id)
+
+            documents_result = await self.db.execute(
+                select(Document).where(Document.folder_id == folder_id)
+            )
+            documents = documents_result.scalars().all()
+
+            for doc in documents:
+                try:
+                    await minio_service.delete_object(doc.bucket_name, doc.storage_key)
+
+                    if doc.collection_id:
+                        collection_result = await self.db.execute(
+                            select(DocumentCollection).where(DocumentCollection.id == doc.collection_id)
+                        )
+                        collection = collection_result.scalar_one_or_none()
+                        if collection:
+                            await milvus_service.delete_document_vectors(
+                                collection_name=collection.collection_name,
+                                document_id=str(doc.id)
+                            )
+                except Exception as e:
+                    logger.warning(f"Failed to delete document {doc.id} storage/vector data: {e}")
+
+            await self.db.execute(
+                delete(Document).where(Document.folder_id == folder_id)
+            )
+
+            await self.db.execute(
+                delete(DocumentFolder).where(DocumentFolder.id == folder_id)
+            )
+            
+            await self.db.commit()
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to delete folder {folder_id}: {e}")
+            await self.db.rollback()
+            return False
+
+    async def create_collection(
+        self,
+        department_id: str,
+        collection_name: str,
+        collection_type: str = DocumentAccessLevel.PUBLIC.value,
+        commit: bool = False
+    ) -> Optional[DocumentCollection]:
+        """Create a new collection"""
+        try:
+            new_collection = DocumentCollection(
+                department_id=department_id,
+                collection_name=collection_name.replace("-", "_"),
+                collection_type=collection_type,
+                is_active=True,
+                vector_config=None,
+                document_count=0,
+            )
+            self.db.add(new_collection)
+            await self.db.flush()
+            if commit:
+                await self.db.commit()
+            return new_collection
+        except Exception as e:
+            logger.error(f"Failed to create collection: {e}")
+            await self.db.rollback()
+            return None
+
+    async def get_collection(self, department_id: str, collection_name: str, collection_type: str) -> Optional[DocumentCollection]:
+        """Get a collection by department ID and collection name"""
+        collection = await self.db.execute(
+            select(DocumentCollection)
+            .where(
+                DocumentCollection.department_id == department_id,
+                DocumentCollection.collection_name == collection_name.replace("-", "_"),
+                DocumentCollection.collection_type == collection_type
+            )
+        )
+        collection = collection.scalar_one_or_none()
+        return collection
 
     # ------------------- Helper methods -------------------
 
@@ -437,64 +396,15 @@ class DocumentService:
             tenant_id=tenant_id
         )
 
-    async def _build_folder_path_recursive(self, folder_id: Optional[str]) -> str:
-        """
-        Build recursive folder path from folder UUID chain.
-        Returns path like: uuid1/uuid2/uuid3/ (with trailing slash)
-        For root folder (/), returns empty string
-        """
-        if not folder_id:
-            return ""
-            
-        try:
-            result = await self.db.execute(
-                select(DocumentFolder).where(DocumentFolder.id == folder_id)
-            )
-            folder: Optional[DocumentFolder] = result.scalar_one_or_none()
-            
-            if not folder:
-                return ""
-                
-            if folder.folder_path == DocumentConstants.ROOT_FOLDER_PATH:
-                return ""
-                
-            path_parts = []
-            current_folder = folder
-            
-            while current_folder and current_folder.folder_path != DocumentConstants.ROOT_FOLDER_PATH:
-                path_parts.append(str(current_folder.id))
-                
-                if current_folder.parent_folder_id:
-                    result = await self.db.execute(
-                        select(DocumentFolder).where(DocumentFolder.id == current_folder.parent_folder_id)
-                    )
-                    current_folder = result.scalar_one_or_none()
-                else:
-                    break
-                    
-            path_parts.reverse()
-            return "/".join(path_parts) + "/" if path_parts else ""
-            
-        except Exception as e:
-            logger.warning(f"Failed to build folder path for {folder_id}: {e}")
-            return ""
 
-    def _build_storage_key(self, tenant_id: str, department_id: str, access_level: str, folder_path: str, document_uuid: str, filename: str) -> str:
+    def _build_storage_key(self, tenant_id: str, department_id: str, document_uuid: str, filename: str) -> str:
         """Build storage key for MinIO using document UUID, access level and recursive folder path"""
         return DocumentConstants.STORAGE_KEY_TEMPLATE.format(
             tenant_id=tenant_id,
             department_id=department_id,
-            access_level=access_level.lower(),
-            folder_path=folder_path,
             document_uuid=document_uuid,
             filename=os.path.basename(filename)
         )
-
-    def _get_access_level_string(self, access_level: DBDocumentPermissionLevel) -> str:
-        """Convert DBDocumentPermissionLevel to DocumentAccessLevel string"""
-        return (DocumentAccessLevel.PRIVATE.value 
-                if access_level == DBDocumentPermissionLevel.PRIVATE 
-                else DocumentAccessLevel.PUBLIC.value)
 
     async def _publish_progress(self, tenant_id: str, department_id: str, document_id: Optional[str], 
                                 progress: int, status: KafkaMessageStatus, message: str, 
@@ -510,14 +420,16 @@ class DocumentService:
             extra=extra
         )
 
-    async def _index_to_milvus(self, collection_name: str, chunks: List[Any], base_meta: Dict[str, Any], access: DBDocumentPermissionLevel) -> int:
+    async def _index_to_milvus(self, collection_name: str, chunks: List[Any], base_meta: Dict[str, Any], access: str) -> int:
         """Index document chunks to Milvus"""
         try:
+            milvus_instance = settings.MILVUS_PRIVATE_HOST if access == "private" else settings.MILVUS_PUBLIC_HOST
+
             count = await milvus_service.index_document_chunks(
                 collection_name=collection_name,
                 chunks=chunks,
                 metadata=base_meta,
-                milvus_instance=access.value,
+                milvus_instance=milvus_instance,
             )
             return int(count or 0)
         except Exception as e:
@@ -526,95 +438,158 @@ class DocumentService:
 
     # ------------------- CRUD methods -------------------
 
+    async def _rollback_upload(
+        self,
+        tenant_id: str,
+        department_id: str,
+        doc: Optional[Document],
+        bucket: str,
+        storage_key: Optional[str],
+        collection_name: Optional[str],
+        document_id: Optional[str],
+        access_level: Optional[str],
+        chunks_created: bool = False
+    ) -> None:
+        """Complete rollback of failed upload: DB -> MinIO -> Milvus"""
+        logger.info(f"Starting complete rollback for document {document_id}")
+
+        # 1. Rollback database
+        try:
+            await self.db.rollback()
+            logger.info("Database transaction rolled back")
+        except Exception as e:
+            logger.error(f"Failed to rollback database: {e}")
+
+        # 2. Delete from MinIO
+        if storage_key:
+            try:
+                await minio_service.delete_object(bucket, storage_key)
+                logger.info(f"Deleted file from MinIO: {storage_key}")
+            except Exception as e:
+                logger.error(f"Failed to delete from MinIO: {e}")
+
+        # 3. Delete from Milvus if chunks were created
+        if chunks_created and collection_name and document_id:
+            try:
+                milvus_instance = getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private') if access_level == "private" else getattr(settings, 'MILVUS_PUBLIC_HOST', 'milvus_public')
+                await milvus_service.bulk_delete_by_filter(
+                    collection_name=collection_name,
+                    milvus_instance=milvus_instance,
+                    filter_expr=f"document_id == '{document_id}'"
+                )
+                logger.info(f"Deleted vectors from Milvus collection {collection_name} for document {document_id}")
+            except Exception as e:
+                logger.error(f"Failed to delete from Milvus: {e}")
+
+        # 4. Publish rollback completion
+        try:
+            await self._publish_progress(
+                tenant_id, department_id, document_id,
+                DocumentConstants.PROGRESS_COMPLETED,
+                KafkaMessageStatus.FAILED,
+                "Upload failed and rolled back completely"
+            )
+        except Exception as e:
+            logger.error(f"Failed to publish rollback progress: {e}")
+
     async def upload_document(
         self,
         tenant_id: str,
         department_id: str,
+        file_folder_id: str,
         uploaded_by: str,
         file_name: str,
         file_bytes: bytes,
-        file_mime_type: str,
-        access_level: DBDocumentPermissionLevel,
-        collection_name: str,
-        metadata: Optional[Dict[str, Any]] = None
+        file_mime_type: str
     ) -> Optional[DocumentUploadResult]:
         """
-        Transactional upload: MinIO -> DB -> Milvus. If any step fails, rollback MinIO + DB.
+        Transactional upload with complete rollback: MinIO -> DB -> Milvus.
+        If any step fails, rollback ALL: MinIO + DB + Milvus.
         Progress is published to Kafka.
         """
         bucket = self._build_bucket_name(tenant_id)
         doc: Optional[Document] = None
         storage_key: Optional[str] = None
-        
+        collection_name: Optional[str] = None
+        access_level: Optional[str] = None
+        chunks_created: bool = False
+        document_id: Optional[str] = None
+
         try:
             await self._publish_progress(
-                tenant_id, department_id, None, 
-                DocumentConstants.PROGRESS_START, 
-                KafkaMessageStatus.PROCESSING, 
+                tenant_id, department_id, None,
+                DocumentConstants.PROGRESS_START,
+                KafkaMessageStatus.PROCESSING,
                 "Starting upload"
             )
-            
+
+            # Step 1: Get folder and collection info
+            folder_result = await self.db.execute(
+                select(DocumentFolder.access_level, DocumentFolder.department_id)
+                .where(DocumentFolder.id == file_folder_id)
+            )
+
+            row = folder_result.one_or_none()
+            if row:
+                access_level, department_id = row
+            else:
+                raise ValueError(f"Folder {file_folder_id} not found")
+
+            collection_name = f"{department_id}_{access_level}".replace("-", "_")
             result = await self.db.execute(
-                select(DocumentCollection).where(DocumentCollection.collection_name == collection_name)
+                select(DocumentCollection).where(
+                    DocumentCollection.department_id == department_id,
+                    DocumentCollection.collection_name == collection_name
+                )
             )
             collection: Optional[DocumentCollection] = result.scalar_one_or_none()
             if not collection:
                 raise ValueError(f"Collection {collection_name} not found")
 
-            access_level_string = self._get_access_level_string(access_level)
-            result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.folder_path == DocumentConstants.ROOT_FOLDER_PATH,
-                        DocumentFolder.access_level == access_level_string
-                    )
-                )
-            )
-            root_folder: Optional[DocumentFolder] = result.scalar_one_or_none()
-
+            # Step 2: Create DB record
             title = os.path.splitext(os.path.basename(file_name))[0]
             doc = Document(
                 filename=file_name,
                 title=title,
-                description=metadata.get("description") if metadata else None,
+                description=file_name,
                 department_id=department_id,
-                folder_id=str(root_folder.id) if root_folder else None,
+                folder_id=str(file_folder_id),
                 collection_id=str(collection.id),
                 uploaded_by=uploaded_by,
-                access_level=self._get_access_level_string(access_level),
+                access_level=access_level,
                 file_size=len(file_bytes),
                 file_type=file_mime_type,
-                storage_key="",  
+                storage_key="",
                 bucket_name=bucket,
                 processing_status=DocumentProcessingStatus.PROCESSING.value,
-                vector_status=VectorProcessingStatus.PENDING.value,
-                metadata=metadata or {},
+                vector_status=VectorProcessingStatus.PENDING.value
             )
             self.db.add(doc)
             await self.db.flush()
-            
-            folder_path = await self._build_folder_path_recursive(str(root_folder.id) if root_folder else None)
-            storage_key = self._build_storage_key(tenant_id, department_id, access_level_string, folder_path, str(doc.id), file_name)
+
+            document_id = str(doc.id)
+            storage_key = self._build_storage_key(tenant_id, department_id, document_id, file_name)
             doc.storage_key = storage_key
             await self.db.flush()
-            
+
             await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_DB_CREATED, 
-                KafkaMessageStatus.PROCESSING, 
+                tenant_id, department_id, document_id,
+                DocumentConstants.PROGRESS_DB_CREATED,
+                KafkaMessageStatus.PROCESSING,
                 "Created DB record"
             )
-            
+
+            # Step 3: Upload to MinIO
             await minio_service.ensure_bucket(bucket)
             await minio_service.put_bytes(bucket, storage_key, file_bytes, file_mime_type)
             await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_STORAGE_UPLOADED, 
-                KafkaMessageStatus.PROCESSING, 
+                tenant_id, department_id, document_id,
+                DocumentConstants.PROGRESS_STORAGE_UPLOADED,
+                KafkaMessageStatus.PROCESSING,
                 "Uploaded to storage"
             )
 
+            # Step 4: Process file chunks
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_path = os.path.join(tmpdir, os.path.basename(file_name))
                 with open(tmp_path, "wb") as f:
@@ -622,19 +597,22 @@ class DocumentService:
                 chunks = await self.file_processor.process_file(
                     file_path=tmp_path,
                     file_name=file_name,
-                    doc_id=str(doc.id),
-                    metadata={"department_id": department_id, "collection_name": collection_name}
+                    doc_id=document_id,
+                    metadata={"department_id": department_id, "collection_name": collection.collection_name}
                 )
             await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_CHUNKS_EXTRACTED, 
-                KafkaMessageStatus.PROCESSING, 
+                tenant_id, department_id, document_id,
+                DocumentConstants.PROGRESS_CHUNKS_EXTRACTED,
+                KafkaMessageStatus.PROCESSING,
                 "Extracted chunks"
             )
 
-            base_meta = {"document_id": str(doc.id), "department_id": department_id}
-            indexed = await self._index_to_milvus(collection_name, chunks, base_meta, access_level)
+            # Step 5: Index to Milvus
+            base_meta = {"document_id": document_id, "department_id": department_id}
+            indexed = await self._index_to_milvus(collection.collection_name, chunks, base_meta, access_level)
+            chunks_created = True
 
+            # Step 6: Update status and commit
             doc.processing_status = DocumentProcessingStatus.COMPLETED.value
             doc.vector_status = VectorProcessingStatus.COMPLETED.value
             doc.chunk_count = int(indexed)
@@ -642,189 +620,35 @@ class DocumentService:
             await self.db.commit()
 
             await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_COMPLETED, 
-                KafkaMessageStatus.COMPLETED, 
+                tenant_id, department_id, document_id,
+                DocumentConstants.PROGRESS_COMPLETED,
+                KafkaMessageStatus.COMPLETED,
                 "Ingestion completed",
                 {"chunks": indexed}
             )
 
             return DocumentUploadResult(
-                document_id=str(doc.id),
+                document_id=document_id,
                 file_name=file_name,
                 bucket=bucket,
                 storage_key=storage_key,
                 chunks=indexed,
                 status=DocumentProcessingStatus.COMPLETED.value,
             )
-            
+
         except Exception as e:
             logger.error(f"Upload failed: {e}")
-            await self.db.rollback()
-            
-            if storage_key:
-                try:
-                    await minio_service.delete_object(bucket, storage_key)
-                except Exception:
-                    pass
-                    
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id) if doc else None, 
-                DocumentConstants.PROGRESS_COMPLETED, 
-                KafkaMessageStatus.FAILED, 
-                str(e)
-            )
-            return DocumentUploadResult(error=str(e))
-
-    async def upload_document_to_folder(
-        self,
-        tenant_id: str,
-        department_id: str,
-        folder_id: str,
-        uploaded_by: str,
-        file_name: str,
-        file_bytes: bytes,
-        file_mime_type: str,
-        access_level: DBDocumentPermissionLevel,
-        collection_name: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Optional[DocumentUploadResult]:
-        """
-        Upload document to specific folder (not just root).
-        Transactional upload: MinIO -> DB -> Milvus. If any step fails, rollback MinIO + DB.
-        Progress is published to Kafka.
-        """
-        bucket = self._build_bucket_name(tenant_id)
-        doc: Optional[Document] = None
-        storage_key: Optional[str] = None
-        
-        try:
-            await self._publish_progress(
-                tenant_id, department_id, None, 
-                DocumentConstants.PROGRESS_START, 
-                KafkaMessageStatus.PROCESSING, 
-                "Starting upload"
-            )
-            
-            result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.id == folder_id,
-                        DocumentFolder.department_id == department_id
-                    )
-                )
-            )
-            target_folder: Optional[DocumentFolder] = result.scalar_one_or_none()
-            if not target_folder:
-                raise ValueError(f"Folder {folder_id} not found in department {department_id}")
-            
-            result = await self.db.execute(
-                select(DocumentCollection).where(DocumentCollection.collection_name == collection_name)
-            )
-            collection: Optional[DocumentCollection] = result.scalar_one_or_none()
-            if not collection:
-                raise ValueError(f"Collection {collection_name} not found")
-
-            title = os.path.splitext(os.path.basename(file_name))[0]
-            doc = Document(
-                filename=file_name,
-                title=title,
-                description=metadata.get("description") if metadata else None,
+            # Complete rollback of all components
+            await self._rollback_upload(
+                tenant_id=tenant_id,
                 department_id=department_id,
-                folder_id=folder_id,
-                collection_id=str(collection.id),
-                uploaded_by=uploaded_by,
-                access_level=self._get_access_level_string(access_level),
-                file_size=len(file_bytes),
-                file_type=file_mime_type,
-                storage_key="",  
-                bucket_name=bucket,
-                processing_status=DocumentProcessingStatus.PROCESSING.value,
-                vector_status=VectorProcessingStatus.PENDING.value,
-                metadata=metadata or {},
-            )
-            self.db.add(doc)
-            await self.db.flush()
-            
-            folder_path = await self._build_folder_path_recursive(folder_id)
-            storage_key = self._build_storage_key(tenant_id, department_id, access_level_string, folder_path, str(doc.id), file_name)
-            doc.storage_key = storage_key
-            await self.db.flush()
-            
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_DB_CREATED, 
-                KafkaMessageStatus.PROCESSING, 
-                "Created DB record"
-            )
-            
-            await minio_service.ensure_bucket(bucket)
-            await minio_service.put_bytes(bucket, storage_key, file_bytes, file_mime_type)
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_STORAGE_UPLOADED, 
-                KafkaMessageStatus.PROCESSING, 
-                "Uploaded to storage"
-            )
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_path = os.path.join(tmpdir, os.path.basename(file_name))
-                with open(tmp_path, "wb") as f:
-                    f.write(file_bytes)
-                chunks = await self.file_processor.process_file(
-                    file_path=tmp_path,
-                    file_name=file_name,
-                    doc_id=str(doc.id),
-                    metadata={"department_id": department_id, "collection_name": collection_name}
-                )
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_CHUNKS_EXTRACTED, 
-                KafkaMessageStatus.PROCESSING, 
-                "Extracted chunks"
-            )
-
-            base_meta = {"document_id": str(doc.id), "department_id": department_id}
-            indexed = await self._index_to_milvus(collection_name, chunks, base_meta, access_level)
-
-            doc.processing_status = DocumentProcessingStatus.COMPLETED.value
-            doc.vector_status = VectorProcessingStatus.COMPLETED.value
-            doc.chunk_count = int(indexed)
-            await self.db.flush()
-            await self.db.commit()
-
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id), 
-                DocumentConstants.PROGRESS_COMPLETED, 
-                KafkaMessageStatus.COMPLETED, 
-                "Ingestion completed",
-                {"chunks": indexed, "folder_path": folder_path}
-            )
-
-            return DocumentUploadResult(
-                document_id=str(doc.id),
-                file_name=file_name,
+                doc=doc,
                 bucket=bucket,
                 storage_key=storage_key,
-                chunks=indexed,
-                status=DocumentProcessingStatus.COMPLETED.value,
-            )
-            
-        except Exception as e:
-            logger.error(f"Upload to folder failed: {e}")
-            await self.db.rollback()
-            
-            if storage_key:
-                try:
-                    await minio_service.delete_object(bucket, storage_key)
-                except Exception:
-                    pass
-                    
-            await self._publish_progress(
-                tenant_id, department_id, str(doc.id) if doc else None, 
-                DocumentConstants.PROGRESS_COMPLETED, 
-                KafkaMessageStatus.FAILED, 
-                str(e)
+                collection_name=collection_name,
+                document_id=document_id,
+                access_level=access_level,
+                chunks_created=chunks_created
             )
             return DocumentUploadResult(error=str(e))
 
@@ -836,7 +660,8 @@ class DocumentService:
         files: List[Tuple[str, bytes, str]],
         access_level: DBDocumentPermissionLevel,
         collection_name: str,
-        base_metadata: Optional[Dict[str, Any]] = None
+        base_metadata: Optional[Dict[str, Any]] = None,
+        file_folder_id: Optional[str] = None
     ) -> List[DocumentUploadResult]:
         """
         Batch upload: concurrent processing; each file is its own transactional flow.
@@ -866,6 +691,7 @@ class DocumentService:
                 res = await self.upload_document(
                     tenant_id=tenant_id,
                     department_id=department_id,
+                    file_folder_id=file_folder_id,
                     uploaded_by=uploaded_by,
                     file_name=f_name,
                     file_bytes=f_bytes,
@@ -1040,32 +866,262 @@ class DocumentService:
             logger.error(f"Get detail failed: {e}")
             return None
 
-    async def update_document_info(
+    # ------------------- Department & Access Level Operations -------------------
+
+
+    # ------------------- Rename Operations -------------------
+
+    async def rename_document(
         self,
         document_id: str,
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        access_level: Optional[DBDocumentPermissionLevel] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Update document basic information (DB only)."""
+        new_name: str,
+        user_role: str = "USER",
+        user_department_id: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Rename a document"""
         try:
-            result = await self.db.execute(select(Document).where(Document.id == document_id))
-            doc: Optional[Document] = result.scalar_one_or_none()
-            if not doc:
-                return False
-            if title is not None:
-                doc.title = title
-            if description is not None:
-                doc.description = description
-            if access_level is not None:
-                doc.access_level = self._get_access_level_string(access_level)
-            if metadata is not None:
-                doc.metadata = metadata
-            await self.db.flush()
+            logger.info(f"DocumentService.rename_document: document_id={document_id}, new_name={new_name}, user_role={user_role}")
+
+            # Get document
+            doc_result = await self.db.execute(
+                select(Document).where(Document.id == document_id)
+            )
+            document = doc_result.scalar_one_or_none()
+
+            if not document:
+                raise ValueError("Document not found")
+
+            # Check permissions - ADMIN can rename any document, others can only rename in their department
+            if user_role != "ADMIN":
+                if str(document.department_id) != user_department_id:
+                    raise ValueError("Cannot rename document from different department")
+
+            # Update document name
+            document.filename = new_name.strip()
+            document.title = new_name.strip()
+            document.updated_at = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
+
             await self.db.commit()
-            return True
+
+            return {
+                "id": str(document.id),
+                "filename": document.filename,
+                "title": document.title
+            }
+
         except Exception as e:
-            logger.error(f"Update document info failed: {e}")
+            logger.error(f"Failed to rename document {document_id}: {e}")
             await self.db.rollback()
-            return False 
+            raise
+
+    async def rename_folder(
+        self,
+        folder_id: str,
+        new_name: str,
+        user_role: str = "USER",
+        user_department_id: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Rename a folder"""
+        try:
+            logger.info(f"DocumentService.rename_folder: folder_id={folder_id}, new_name={new_name}, user_role={user_role}")
+
+            # Get folder
+            folder_result = await self.db.execute(
+                select(DocumentFolder).where(DocumentFolder.id == folder_id)
+            )
+            folder = folder_result.scalar_one_or_none()
+
+            if not folder:
+                raise ValueError("Folder not found")
+
+            if user_role != "ADMIN":
+                if str(folder.department_id) != user_department_id:
+                    raise ValueError("Cannot rename folder from different department")
+
+            folder.folder_name = new_name.strip()
+            folder.updated_at = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
+
+            await self.db.commit()
+
+            return {
+                "id": str(folder.id),
+                "folder_name": folder.folder_name
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to rename folder {folder_id}: {e}")
+            await self.db.rollback()
+            raise
+
+        """Get detailed information about a specific folder with full context"""
+        try:
+            logger.info(f"DocumentService.get_folder: folder_id={folder_id}")
+
+            # Get the folder
+            folder_result = await self.db.execute(
+                select(DocumentFolder).where(DocumentFolder.id == folder_id)
+            )
+            folder = folder_result.scalar_one_or_none()
+
+            if not folder:
+                return None
+
+            # Get department info
+            dept_result = await self.db.execute(
+                select(Department).where(Department.id == folder.department_id)
+            )
+            department = dept_result.scalar_one_or_none()
+
+            if not department:
+                raise ValueError("Department not found")
+
+            # Build context
+            context = {
+                "department_id": str(folder.department_id),
+                "folder_id": folder_id,
+                "role": "user",  # This would be passed from the calling context
+                "department_name": department.name,
+                "is_root": folder.parent_folder_id is None,
+                "queried_at": DateTimeManager.utc_now().isoformat()
+            }
+
+            # Get breadcrumbs (full path to this folder)
+            breadcrumbs = []
+            current_folder_id = folder_id
+            path_parts = []
+
+            while current_folder_id:
+                current_result = await self.db.execute(
+                    select(DocumentFolder).where(DocumentFolder.id == current_folder_id)
+                )
+                current_folder = current_result.scalar_one_or_none()
+
+                if not current_folder:
+                    break
+
+                path_parts.insert(0, {
+                    "id": str(current_folder.id),
+                    "name": current_folder.folder_name,
+                    "path_display": await self._build_path_display(str(current_folder.department_id), str(current_folder.id))
+                })
+
+                current_folder_id = str(current_folder.parent_folder_id) if current_folder.parent_folder_id else None
+
+            # Add department to breadcrumbs
+            breadcrumbs = [{
+                "id": str(department.id),
+                "name": department.name,
+                "path_display": department.name
+            }] + path_parts
+
+            # Get child folders
+            child_folders_result = await self.db.execute(
+                select(DocumentFolder).where(DocumentFolder.parent_folder_id == folder_id)
+            )
+            child_folders = child_folders_result.scalars().all()
+
+            # Get documents in this folder
+            docs_result = await self.db.execute(
+                select(Document).options(selectinload(Document.collection)).where(
+                    Document.folder_id == folder_id
+                )
+            )
+            documents = docs_result.scalars().all()
+
+            # Build folder child IDs
+            folder_child_ids = [str(f.id) for f in child_folders]
+
+            # Build document IDs
+            document_ids = [str(d.id) for d in documents]
+
+            # Format child folders
+            folders = []
+            for child_folder in child_folders:
+                path_display = await self._build_path_display(str(department.id), str(child_folder.id))
+
+                folders.append({
+                    "id": str(child_folder.id),
+                    "department_id": str(child_folder.department_id),
+                    "folder_name": child_folder.folder_name,
+                    "folder_path": child_folder.folder_path,
+                    "path_display": path_display,
+                    "parent_folder_id": str(child_folder.parent_folder_id) if child_folder.parent_folder_id else None,
+                    "access_level": child_folder.access_level,
+                    "created_by": str(child_folder.created_by) if child_folder.created_by else None,
+                    "created_at": child_folder.created_at.isoformat() if child_folder.created_at else None,
+                    "updated_at": child_folder.updated_at.isoformat() if child_folder.updated_at else None
+                })
+
+            # Format documents
+            documents_formatted = []
+            for doc in documents:
+                path_display = await self._build_document_path_display(str(department.id), folder_id, doc.filename)
+
+                # Get collection info
+                collection_info = None
+                if doc.collection:
+                    collection_info = {
+                        "id": str(doc.collection.id),
+                        "collection_name": doc.collection.collection_name,
+                        "collection_type": doc.collection.collection_type,
+                        "is_active": doc.collection.is_active,
+                        "vector_config": doc.collection.vector_config,
+                        "document_count": doc.collection.document_count
+                    }
+
+                documents_formatted.append({
+                    "id": str(doc.id),
+                    "department_id": str(doc.department_id),
+                    "folder_id": str(doc.folder_id) if doc.folder_id else None,
+                    "collection_id": str(doc.collection_id) if doc.collection_id else None,
+                    "title": doc.title or doc.filename,
+                    "filename": doc.filename,
+                    "description": doc.description,
+                    "access_level": doc.access_level,
+                    "uploaded_by": str(doc.uploaded_by) if doc.uploaded_by else None,
+                    "file_size": doc.file_size,
+                    "file_type": doc.file_type,
+                    "bucket_name": doc.bucket_name,
+                    "storage_key": doc.storage_key,
+                    "storage_path": doc.storage_path,
+                    "processing_status": doc.processing_status,
+                    "vector_status": doc.vector_status,
+                    "chunk_count": doc.chunk_count,
+                    "collection": collection_info,
+                    "path_display": path_display,
+                    "permissions": {
+                        "can_access": True,  # Simplified - would need proper permission check
+                        "reason": "folder_access"
+                    },
+                    "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                    "updated_at": doc.updated_at.isoformat() if doc.updated_at else None
+                })
+
+            # Get counts
+            total_folders = len(folders)
+            total_documents = len(documents_formatted)
+
+            return {
+                "context": context,
+                "folder_child_ids": folder_child_ids,
+                "document_ids": document_ids,
+                "breadcrumbs": breadcrumbs,
+                "folders": folders,
+                "documents": documents_formatted,
+                "counts": {
+                    "folders": total_folders,
+                    "documents": total_documents
+                },
+                "pagination": {
+                    "page": 1,
+                    "page_size": 50,
+                    "total_folders": total_folders,
+                    "total_documents": total_documents
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get folder {folder_id}: {e}")
+            return None

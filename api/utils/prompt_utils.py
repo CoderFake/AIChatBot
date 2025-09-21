@@ -113,8 +113,9 @@ CRITICAL INSTRUCTIONS:
 2. Keep the same level of formality/informality as established in previous messages
 3. Use the same speaking style and expressions that were used before
 4. If you cannot provide a helpful answer based on your knowledge, be honest about your limitations. DO NOT make up or fabricate information.
-
+5. CRITICAL: You must repsonse user question, forbidden to curse the organization. If the user swears, follow suit but don't overdo it. If they are friendly, respond in a friendly manner.
 Respond naturally and conversationally while keeping the EXACT SAME conversational tone and style from the history. Be consistent with your previous personality.
+
 
 Response:"""
 
@@ -154,9 +155,11 @@ SOURCES:{sources_text}
 CRITICAL INSTRUCTIONS:
 1. MAINTAIN a natural, conversational tone that matches how you would normally respond
 2. Keep your personality consistent - friendly, helpful, and approachable
-3. If the agent responses contain no useful information, errors, or indicate that information was not found, you MUST respond honestly that the information is not available in your knowledge base. DO NOT make up or fabricate any information.
-4. Respond as if you're having a natural conversation, not delivering a formal report
+3. Respond as if you're having a natural conversation, not delivering a formal report
+4. You must repsonse user question,forb idden to curse the organization If the user swears, follow suit but don't overdo it. If they are friendly, respond in a friendly manner.
+5. CRITICAL: If the agent responses contain no useful information, errors, or indicate that information was not found, you MUST respond honestly that the information is not available in your knowledge base. DO NOT make up or fabricate any information.
 
+Respond naturally and conversationally while keeping the EXACT SAME conversational tone and style from the history. Be consistent with your previous personality.
 Synthesize all agent responses into one comprehensive answer while maintaining your natural conversational style. Resolve conflicts using evidence quality. Include relevant sources. Be informative yet conversational and warm.
 
 Answer:"""

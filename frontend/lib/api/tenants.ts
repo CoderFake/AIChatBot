@@ -1,4 +1,4 @@
-import type { Tenant, PublicTenant, CreateTenantRequest, PaginatedResponse } from "@/types"
+import type { Tenant, PublicTenant, CreateTenantRequest, UpdateTenantRequest, UpdateTenantResponse, PaginatedResponse } from "@/types"
 
 interface ListParams {
   page?: number
@@ -68,7 +68,7 @@ export class TenantsAPI {
     })
   }
 
-  update = async (id: string, data: Partial<CreateTenantRequest>): Promise<void> => {
+  update = async (id: string, data: UpdateTenantRequest): Promise<UpdateTenantResponse> => {
     return this.request(`/tenants/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
@@ -104,6 +104,15 @@ export class TenantsAPI {
   getAvailableProviders = async (): Promise<{ providers: any[] }> => {
     return this.request('/providers/available')
   }
+
+  getTenantProviders = async (tenantId: string): Promise<{ providers: any[] }> => {
+    return this.request(`/providers/tenants/${tenantId}`)
+  }
+
+  getTenantTools = async (tenantId: string): Promise<{ tools: any[] }> => {
+    return this.request(`/tools/tenants/${tenantId}`)
+  }
+
 
   listDepartments = async (tenantId: string): Promise<any[]> => {
     return this.request('/tenant-admin/departments')

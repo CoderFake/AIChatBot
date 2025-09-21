@@ -114,8 +114,32 @@ class TenantPublicInfoResponse(BaseModel):
     primary_color: Optional[str] = None
 
 
+class UpdateTenantResponse(BaseModel):
+    """Response body for successful tenant update."""
+    tenant_id: str
+    tenant_name: Optional[str] = None
+    timezone: Optional[str] = None
+    locale: Optional[str] = None
+    sub_domain: Optional[str] = None
+    description: Optional[str] = None
+    updated_at: Optional[str] = None
+    setup_results: Optional[Dict[str, Any]] = None
+
+
 class OperationResult(BaseModel):
     """Generic operation result schema with optional detail message."""
     success: bool
     detail: Optional[str] = None
+
+
+class TenantSettingsResponse(BaseModel):
+    tenant_name: str
+    description: Optional[str]
+    timezone: str
+    locale: str
+    chatbot_name: Optional[str] 
+    logo_url: Optional[str]      
+    bot_name: Optional[str]      
+    branding: Optional[Dict[str, Any]] 
+
 

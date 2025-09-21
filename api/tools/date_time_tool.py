@@ -10,6 +10,7 @@ import pytz
 from dateutil.relativedelta import relativedelta
 from models.models import DateTimeInput
 from utils.logging import get_logger
+from utils.datetime_utils import DateTimeManager
 
 
 logger = get_logger(__name__)
@@ -84,15 +85,24 @@ class DateTimeTool(BaseTool):
             tz = self._get_timezone(timezone_name)
             
             if operation == "current_time":
-                now = datetime.now(tz)
+                if timezone_name.upper() == "UTC":
+                    now = DateTimeManager.utc_now()
+                else:
+                    now = DateTimeManager.tenant_now(timezone_name)
                 return now.strftime("%H:%M:%S")
-            
+
             elif operation == "current_date":
-                now = datetime.now(tz)
+                if timezone_name.upper() == "UTC":
+                    now = DateTimeManager.utc_now()
+                else:
+                    now = DateTimeManager.tenant_now(timezone_name)
                 return now.strftime("%Y-%m-%d")
-            
+
             elif operation == "current_datetime":
-                now = datetime.now(tz)
+                if timezone_name.upper() == "UTC":
+                    now = DateTimeManager.utc_now()
+                else:
+                    now = DateTimeManager.tenant_now(timezone_name)
                 return now.strftime(format_string)
             
             elif operation == "format_datetime":
@@ -104,14 +114,17 @@ class DateTimeTool(BaseTool):
             elif operation == "add_time":
                 if amount is None:
                     return "Error: amount is required for add_time"
-                
+
                 try:
                     amount = int(amount)
                 except (ValueError, TypeError):
                     return f"Error: amount must be a number, got {type(amount).__name__}: {amount}"
-                
+
                 if not datetime_string:
-                    dt = datetime.now(tz)
+                    if timezone_name.upper() == "UTC":
+                        dt = DateTimeManager.utc_now()
+                    else:
+                        dt = DateTimeManager.tenant_now(timezone_name)
                 else:
                     dt = self._parse_datetime(datetime_string)
                     if dt.tzinfo is None:
@@ -139,14 +152,17 @@ class DateTimeTool(BaseTool):
             elif operation == "subtract_time":
                 if amount is None:
                     return "Error: amount is required for subtract_time"
-                
+
                 try:
                     amount = int(amount)
                 except (ValueError, TypeError):
                     return f"Error: amount must be a number, got {type(amount).__name__}: {amount}"
-                
+
                 if not datetime_string:
-                    dt = datetime.now(tz)
+                    if timezone_name.upper() == "UTC":
+                        dt = DateTimeManager.utc_now()
+                    else:
+                        dt = DateTimeManager.tenant_now(timezone_name)
                 else:
                     dt = self._parse_datetime(datetime_string)
                     if dt.tzinfo is None:

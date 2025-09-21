@@ -4,13 +4,14 @@ Manages department CRUD operations with proper error handling and transaction ma
 """
 from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, delete, func
+from sqlalchemy import select, and_, delete
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import SQLAlchemyError
 
 from models.database.tenant import Department, Tenant
 from models.database.agent import Agent, AgentToolConfig
 from services.agents.agent_service import AgentService
+from common.types import DocumentAccessLevel
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,76 +26,8 @@ class DepartmentService:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
         self.agent_service = AgentService(db_session)
-    
+ 
     async def create_department(
-        self,
-        tenant_id: str,
-        department_name: str,
-        description: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Create new department
-        Raises exception on error for transaction rollback
-        """
-        try:
-            result = await self.db.execute(
-                select(Tenant).where(Tenant.id == tenant_id)
-            )
-            tenant = result.scalar_one_or_none()
-            
-            if not tenant:
-                logger.error(f"Tenant {tenant_id} not found")
-                raise ValueError(f"Tenant {tenant_id} not found")
-            
-            existing_result = await self.db.execute(
-                select(Department).where(
-                    and_(
-                        Department.tenant_id == tenant_id,
-                        Department.department_name == department_name
-                    )
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
-            
-            if existing:
-                logger.error(f"Department '{department_name}' already exists in tenant {tenant_id}")
-                raise ValueError(f"Department '{department_name}' already exists")
-            
-            department = Department(
-                tenant_id=tenant_id,
-                department_name=department_name,
-                description=description,
-                is_active=True
-            )
-            
-            self.db.add(department)
-            await self.db.flush()
-
-            result = {
-                "id": str(department.id),
-                "department_name": department.department_name,
-                "description": department.description,
-                "tenant_id": str(department.tenant_id),
-                "tenant_name": tenant.tenant_name,
-                "is_active": department.is_active,
-                "agent_count": 0,
-                "created_at": department.created_at.isoformat() if department.created_at else None,
-                "updated_at": department.updated_at.isoformat() if department.updated_at else None
-            }
-
-            logger.info(f"Created department '{department_name}' with ID {department.id} and default agent")
-            return result
-            
-        except ValueError:
-            raise
-        except SQLAlchemyError as e:
-            logger.error(f"Database error creating department '{department_name}': {e}")
-            raise RuntimeError(f"Database error creating department: {e}")
-        except Exception as e:
-            logger.error(f"Failed to create department '{department_name}': {e}")
-            raise RuntimeError(f"Failed to create department: {e}")
-    
-    async def create_department_with_agent_and_provider(
         self,
         tenant_id: str,
         department_name: str,
@@ -115,11 +48,32 @@ class DepartmentService:
             logger.info(f"Starting transaction: create department '{department_name}' with agent '{agent_name}'")
             
             # Step 1: Create department
-            dept_result = await self.create_department(
+            dept = Department(
                 tenant_id=tenant_id,
                 department_name=department_name,
-                description=department_description
+                description=department_description,
+                is_active=True
             )
+            self.db.add(dept)
+            await self.db.flush()
+
+            # Get tenant name
+            tenant_result = await self.db.execute(
+                select(Tenant).where(Tenant.id == dept.tenant_id)
+            )
+            tenant_obj = tenant_result.scalar_one_or_none()
+            tenant_name = tenant_obj.tenant_name if tenant_obj else None
+
+            dept_result = {
+                "id": str(dept.id),
+                "department_name": dept.department_name,
+                "description": dept.description,
+                "tenant_id": str(dept.tenant_id),
+                "tenant_name": tenant_name,
+                "is_active": dept.is_active,
+                "agent_count": 0,
+                "created_at": dept.created_at.isoformat() if dept.created_at else None
+            }
 
             agent_result = await self.agent_service.create_agent_with_provider(
                 tenant_id=tenant_id,
@@ -131,7 +85,6 @@ class DepartmentService:
                 config_data=config_data
             )
 
-            # Step 3: Assign tools to agent if provided
             tool_assignments = []
             if tool_ids:
                 tool_assignments = await self._assign_tools_to_agent(
@@ -141,18 +94,46 @@ class DepartmentService:
                 )
                 logger.info(f"✓ Tools assigned to agent: {len(tool_assignments)} tools")
 
-            # Step 4: Create default root folders (Private/Public)
+            from services.documents.document_service import DocumentService
+            document_service = DocumentService(self.db)
             try:
-                await self._create_default_department_folders(
-                    tenant_id=tenant_id,
-                    department_id=dept_result['id'],
-                    department_name=department_name
-                )
-                logger.info(f"✓ Default folders (Private/Public) created for department: {department_name}")
+                if not await document_service.get_root_folder(dept_result['id'], DocumentAccessLevel.PRIVATE.value):
+                    await document_service.create_folder(
+                        department_id=dept_result['id'],
+                        folder_name=DocumentAccessLevel.PRIVATE.value,
+                        folder_path=f"/{department_name}/Private",
+                        parent_folder_id=None,
+                        access_level=DocumentAccessLevel.PRIVATE.value,
+                    )
+
+                if not await document_service.get_root_folder(dept_result['id'], DocumentAccessLevel.PUBLIC.value):
+                    await document_service.create_folder(
+                        department_id=dept_result['id'],
+                        folder_name=DocumentAccessLevel.PUBLIC.value,
+                        folder_path=f"/{department_name}/Public",
+                        parent_folder_id=None,
+                        access_level=DocumentAccessLevel.PUBLIC.value,
+                    )
+
+                if not await document_service.get_collection(dept_result['id'], f"{dept_result['id']}-{DocumentAccessLevel.PRIVATE.value}", DocumentAccessLevel.PRIVATE.value):
+                    await document_service.create_collection(
+                        department_id=dept_result['id'],
+                        collection_name=f"{dept_result['id']}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"),
+                        collection_type=DocumentAccessLevel.PRIVATE.value,
+                    )
+
+                if not await document_service.get_collection(dept_result['id'], f"{dept_result['id']}-{DocumentAccessLevel.PUBLIC.value}", DocumentAccessLevel.PUBLIC.value):
+                    await document_service.create_collection(
+                        department_id=dept_result['id'],
+                        collection_name=f"{dept_result['id']}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"),
+                        collection_type=DocumentAccessLevel.PUBLIC.value,
+                    )
+
             except Exception as e:
                 raise RuntimeError(f"Failed to create default folders: {e}")
 
             await self.db.flush()
+            await self.db.commit()
             dept_result["agent_count"] = 1
 
             return {
@@ -176,7 +157,7 @@ class DepartmentService:
             logger.error(f"Transaction rolled back due to unexpected error: {e}")
             raise RuntimeError(f"Unexpected error in transaction: {e}")
     
-    async def get_department_by_id(self, department_id: str) -> Optional[Dict[str, Any]]:
+    async def get_department(self, department_id: str) -> Optional[Dict[str, Any]]:
         """
         Get department by ID
         """
@@ -217,85 +198,6 @@ class DepartmentService:
     async def update_department(
         self,
         department_id: str,
-        department_name: Optional[str] = None,
-        description: Optional[str] = None,
-        is_active: Optional[bool] = None
-    ) -> Dict[str, Any]:
-        """
-        Update department
-        Raises exception on error for transaction rollback
-        """
-        try:
-            result = await self.db.execute(
-                select(Department).where(Department.id == department_id)
-                .options(selectinload(Department.tenant))
-            )
-            department = result.scalar_one_or_none()
-            
-            if not department:
-                logger.error(f"Department {department_id} not found")
-                raise ValueError(f"Department {department_id} not found")
-            
-            # Update fields if provided
-            if department_name is not None:
-                # Check for name conflicts
-                existing_result = await self.db.execute(
-                    select(Department).where(
-                        and_(
-                            Department.tenant_id == department.tenant_id,
-                            Department.department_name == department_name,
-                            Department.id != department_id
-                        )
-                    )
-                )
-                existing = existing_result.scalar_one_or_none()
-                
-                if existing:
-                    logger.error(f"Department name '{department_name}' already exists")
-                    raise ValueError(f"Department name '{department_name}' already exists")
-                
-                department.department_name = department_name
-            
-            if description is not None:
-                department.description = description
-            
-            if is_active is not None:
-                department.is_active = is_active
-            
-            await self.db.flush()
-            
-            agent_result = await self.db.execute(
-                select(func.count(Agent.id)).where(Agent.department_id == department_id)
-            )
-            agent_count = agent_result.scalar() or 0
-
-            result = {
-                "id": str(department.id),
-                "department_name": department.department_name,
-                "description": department.description,
-                "tenant_id": str(department.tenant_id),
-                "tenant_name": department.tenant.tenant_name if department.tenant else None,
-                "is_active": department.is_active,
-                "agent_count": agent_count,
-                "created_at": department.created_at.isoformat() if department.created_at else None,
-                "updated_at": department.updated_at.isoformat() if department.updated_at else None
-            }
-            
-            logger.info(f"Updated department {department_id}")
-            return result
-            
-        except ValueError:
-            raise
-        except SQLAlchemyError as e:
-            logger.error(f"Database error updating department {department_id}: {e}")
-            raise RuntimeError(f"Database error updating department: {e}")
-        except Exception as e:
-            logger.error(f"Failed to update department {department_id}: {e}")
-            raise RuntimeError(f"Failed to update department: {e}")
-
-    async def update_department_with_agent_and_provider(
-        self,
-        department_id: str,
         tenant_id: str,
         department_name: str,
         agent_name: str,
@@ -304,22 +206,45 @@ class DepartmentService:
         model_id: Optional[str] = None,
         config_data: Optional[Dict[str, Any]] = None,
         department_description: Optional[str] = None,
-        tool_ids: Optional[List[str]] = None
+        tool_ids: Optional[List[str]] = None,
+        role: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Update department + agent + provider config in single transaction
         This is the main orchestrator method with transaction wrapper for updates
         """
         try:
-            # Start transaction
             logger.info(f"Starting transaction: update department '{department_id}' with agent '{agent_name}'")
 
-            # Step 1: Update department
-            dept_result = await self.update_department(
-                department_id=department_id,
-                department_name=department_name,
-                description=department_description
+            result = await self.db.execute(
+                select(Department).where(Department.id == department_id)
             )
+            dept = result.scalar_one_or_none()
+            if not dept:
+                raise ValueError(f"Department {department_id} not found")
+
+            dept.department_name = department_name
+            if department_description is not None:
+                dept.description = department_description
+            await self.db.flush()
+
+            # Get tenant name
+            tenant_result = await self.db.execute(
+                select(Tenant).where(Tenant.id == dept.tenant_id)
+            )
+            tenant_obj = tenant_result.scalar_one_or_none()
+            tenant_name = tenant_obj.tenant_name if tenant_obj else None
+
+            dept_result = {
+                "id": str(dept.id),
+                "department_name": dept.department_name,
+                "description": dept.description,
+                "tenant_id": str(dept.tenant_id),
+                "tenant_name": tenant_name,
+                "is_active": dept.is_active,
+                "agent_count": 0,
+                "created_at": dept.created_at.isoformat() if dept.created_at else None
+            }
             logger.info(f"✓ Department updated: {dept_result['id']}")
 
             agent_result = await self.db.execute(
@@ -397,15 +322,40 @@ class DepartmentService:
                     )
                     logger.info(f"✓ New tools assigned to agent: {len(tool_assignments)} tools")
 
-            try:
-                await self._ensure_default_department_folders_exist(
-                    tenant_id=tenant_id,
-                    department_id=department_id,
-                    department_name=department_name
-                )
-                logger.info(f"✓ Default folders verified/created for department: {department_name}")
-            except Exception as e:
-                logger.warning(f"Could not ensure default folders: {e}")
+                from services.documents.document_service import DocumentService
+                document_service = DocumentService(self.db)
+
+                if not await document_service.get_root_folder(department_id, DocumentAccessLevel.PRIVATE.value):
+                    await document_service.create_folder(
+                        department_id=department_id,
+                        folder_name=DocumentAccessLevel.PRIVATE.value,
+                        folder_path=f"/{department_name}/Private",
+                        parent_folder_id=None,
+                        access_level=DocumentAccessLevel.PRIVATE.value,
+                    )
+
+                if not await document_service.get_root_folder(department_id, DocumentAccessLevel.PUBLIC.value):
+                    await document_service.create_folder(
+                        department_id=department_id,
+                        folder_name=DocumentAccessLevel.PUBLIC.value,
+                        folder_path=f"/{department_name}/Public",
+                        parent_folder_id=None,
+                        access_level=DocumentAccessLevel.PUBLIC.value,
+                    )
+
+
+                if not await document_service.get_collection(department_id, f"{department_id}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"), DocumentAccessLevel.PRIVATE.value):
+                    await document_service.create_collection(
+                        department_id=department_id,
+                        collection_name=f"{department_id}-{DocumentAccessLevel.PRIVATE.value}".replace("-", "_"),
+                        collection_type=DocumentAccessLevel.PRIVATE.value,
+                    )
+                if not await document_service.get_collection(department_id, f"{department_id}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"), DocumentAccessLevel.PUBLIC.value):
+                    await document_service.create_collection(
+                        department_id=department_id,
+                        collection_name=f"{department_id}-{DocumentAccessLevel.PUBLIC.value}".replace("-", "_"),
+                        collection_type=DocumentAccessLevel.PUBLIC.value,
+                    )
 
             await self.db.flush()
 
@@ -416,6 +366,8 @@ class DepartmentService:
                 .options(selectinload(Agent.provider))
             )
             final_agent = final_agent_result.scalar_one_or_none()
+
+            await self.db.commit()
 
             result = {
                 "department": dept_result,
@@ -670,97 +622,3 @@ class DepartmentService:
             logger.error(f"Failed to assign tools to agent {agent_id}: {e}")
             raise RuntimeError(f"Failed to assign tools: {e}")
 
-    async def _create_default_department_folders(
-        self,
-        tenant_id: str,
-        department_id: str,
-        department_name: str
-    ) -> None:
-        """
-        Create default root folders (Private/Public) for the department
-        """
-        try:
-            from models.database.document import DocumentFolder
-
-            private_folder = DocumentFolder(
-                department_id=department_id,
-                folder_name="Private",
-                folder_path=f"/{department_name}/Private",
-                access_level="private",
-                parent_folder_id=None  # Root folder
-            )
-            self.db.add(private_folder)
-
-            # Create Public folder
-            public_folder = DocumentFolder(
-                department_id=department_id,
-                folder_name="Public",
-                folder_path=f"/{department_name}/Public",
-                access_level="public",
-                parent_folder_id=None  # Root folder
-            )
-            self.db.add(public_folder)
-
-            await self.db.flush()
-            logger.info(f"Created default folders for department {department_name}: Private, Public")
-
-        except Exception as e:
-            logger.error(f"Failed to create default folders for department {department_name}: {e}")
-            raise RuntimeError(f"Failed to create default folders: {e}")
-
-    async def _ensure_default_department_folders_exist(
-        self,
-        tenant_id: str,
-        department_id: str,
-        department_name: str
-    ) -> None:
-        """
-        Ensure default root folders (Private/Public) exist for the department
-        Create them if they don't exist (used during updates)
-        """
-        try:
-            from models.database.document import DocumentFolder
-
-            result = await self.db.execute(
-                select(DocumentFolder).where(
-                    and_(
-                        DocumentFolder.department_id == department_id,
-                        DocumentFolder.parent_folder_id.is_(None)  
-                    )
-                )
-            )
-            existing_folders = result.scalars().all()
-            existing_folder_names = [f.folder_name for f in existing_folders]
-
-            if "Private" not in existing_folder_names:
-                private_folder = DocumentFolder(
-                    department_id=department_id,
-                    folder_name="Private",
-                    folder_path=f"/{department_name}/Private",
-                    access_level="private",
-                    parent_folder_id=None  # Root folder
-                )
-                self.db.add(private_folder)
-                logger.info(f"Created Private folder for department {department_name}")
-
-            if "Public" not in existing_folder_names:
-                public_folder = DocumentFolder(
-                    department_id=department_id,
-                    folder_name="Public",
-                    folder_path=f"/{department_name}/Public",
-                    access_level="public",
-                    parent_folder_id=None  # Root folder
-                )
-                self.db.add(public_folder)
-                logger.info(f"Created Public folder for department {department_name}")
-
-            await self.db.flush()
-
-            if "Private" not in existing_folder_names or "Public" not in existing_folder_names:
-                logger.info(f"Ensured default folders exist for department {department_name}")
-            else:
-                logger.info(f"Default folders already exist for department {department_name}")
-
-        except Exception as e:
-            logger.error(f"Failed to ensure default folders for department {department_name}: {e}")
-            raise RuntimeError(f"Failed to ensure default folders: {e}")

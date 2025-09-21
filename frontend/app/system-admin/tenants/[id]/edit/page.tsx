@@ -6,7 +6,7 @@ import { useRouter, useParams } from 'next/navigation'
 import { useTranslation } from 'react-i18next'
 import { useToast } from '@/lib/use-toast'
 import { apiService } from '@/lib/api/index'
-import type { CreateTenantRequest } from '@/types'
+import type { UpdateTenantRequest, UpdateTenantResponse } from '@/types'
 import {
   Card,
   CardContent,
@@ -29,7 +29,7 @@ export default function EditTenantPage() {
   const { t } = useTranslation()
   const { showError, showSuccess } = useToast()
 
-  const [formData, setFormData] = useState<CreateTenantRequest>({
+  const [formData, setFormData] = useState<UpdateTenantRequest>({
     tenant_name: '',
     timezone: 'UTC',
     locale: 'en',
@@ -49,7 +49,13 @@ export default function EditTenantPage() {
   useEffect(() => {
     const loadData = async () => {
       try {
-        const [tenantRes, tzRes, localeRes, providersRes, toolsRes] = await Promise.all([
+        const [
+          tenantRes,
+          tzRes,
+          localeRes,
+          providersRes,
+          toolsRes
+        ] = await Promise.all([
           apiService.tenants.getDetail(tenantId),
           apiService.tenants.getTimezones(),
           apiService.tenants.getLocales(),
@@ -66,6 +72,8 @@ export default function EditTenantPage() {
           allowed_providers: tenantRes.allowed_providers || [],
           allowed_tools: tenantRes.allowed_tools || [],
         })
+
+        // Set selected providers and tools from tenant data
         setSelectedProviderIds(tenantRes.allowed_providers || [])
         setSelectedTools(tenantRes.allowed_tools || [])
 
@@ -121,7 +129,7 @@ export default function EditTenantPage() {
   }, [selectedTools, selectedProviderIds])
 
   const handleInputChange =
-    (field: keyof CreateTenantRequest) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    (field: keyof UpdateTenantRequest) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
       const value = e.target.value
       setFormData((prev) => ({
         ...prev,
@@ -129,7 +137,7 @@ export default function EditTenantPage() {
       }))
     }
 
-  const handleSelectChange = (field: keyof CreateTenantRequest) => (value: string) => {
+  const handleSelectChange = (field: keyof UpdateTenantRequest) => (value: string) => {
     setFormData((prev) => ({
       ...prev,
       [field]: value,
@@ -140,18 +148,23 @@ export default function EditTenantPage() {
     e.preventDefault()
     setIsLoading(true)
     try {
-      const cleanedData: CreateTenantRequest = {
+      const cleanedData: UpdateTenantRequest = {
         ...formData,
         sub_domain: formData.sub_domain?.trim() || undefined,
         description: formData.description?.trim() || undefined,
         allowed_providers: selectedProviderIds.length > 0 ? selectedProviderIds : undefined,
         allowed_tools: selectedTools.length > 0 ? selectedTools : undefined,
       }
-      await apiService.tenants.update(tenantId, cleanedData)
+
+      const updateData: UpdateTenantRequest = Object.fromEntries(
+        Object.entries(cleanedData).filter(([_, value]) => value !== undefined)
+      ) as UpdateTenantRequest
+
+      await apiService.tenants.update(tenantId, updateData)
       showSuccess(t('notifications.operationCompleted'))
       router.push(`/system-admin/tenants/${tenantId}`)
     } catch (err) {
-      showError(err instanceof Error ? err.message : t('messages.errors.failedToCreateTenant'))
+      showError(err instanceof Error ? err.message : t('messages.errors.failedToUpdateTenant'))
     } finally {
       setIsLoading(false)
     }

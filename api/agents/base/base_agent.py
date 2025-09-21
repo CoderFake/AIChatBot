@@ -192,11 +192,6 @@ class BaseAgent(ABC):
             if not self.provider_config:
                 return False
 
-            from services.llm.provider_manager import get_llm_provider_for_tenant
-            provider = await get_llm_provider_for_tenant(self.tenant_id)
-            if not provider:
-                return False
-
             return True
 
         except Exception as e:
@@ -280,53 +275,4 @@ class GenericAgent(BaseAgent):
     Uses the same base functionality but can be extended later
     """
 
-    async def _generate_response(
-        self,
-        query: str,
-        tool_results: Dict[str, Any],
-        user_context: Dict[str, Any]
-    ) -> str:
-        """
-        Generate response using available tools and LLM
-        """
-        try:
-            from services.llm.provider_manager import get_llm_provider_for_tenant
-            provider = await get_llm_provider_for_tenant(self.tenant_id)
-
-            context_parts = []
-            for tool_name, result in tool_results.items():
-                if isinstance(result, dict) and "error" not in result:
-                    context_parts.append(f"{tool_name}: {result.get('content', 'No content')}")
-
-            context = "\n".join(context_parts) if context_parts else "No tool results available"
-
-            from utils.language_utils import detect_language
-
-            detected_language = detect_language(query)
-
-            system_prompt = f"""You are {self.agent_name} - {self.description}
-
-Query: {query}
-
-Tool Results:
-{context}
-
-Provide a helpful and accurate response based on the available information."""
-
-            if detected_language == "vietnamese":
-                system_prompt += "\n\nPlease respond in Vietnamese."
-            elif detected_language == "japanese":
-                system_prompt += "\n\nPlease respond in Japanese."
-            elif detected_language == "korean":
-                system_prompt += "\n\nPlease respond in Korean."
-            elif detected_language == "chinese":
-                system_prompt += "\n\nPlease respond in Chinese."
-
-            response = await provider.ainvoke(system_prompt)
-            return response.content.strip()
-
-        except Exception as e:
-            logger.error(f"Generic agent response generation failed: {e}")
-            return f"I am {self.agent_name}. I encountered an error while processing: {str(e)}. Please try again."
-
-
+    pass

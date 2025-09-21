@@ -1249,8 +1249,6 @@ This document lists all available API endpoints in the AI ChatBot system, organi
 
 **Request (Form Data):**
 - `file`: File (required)
-- `collection_name`: string (required)
-- `access_level`: "public" or "private" (required)
 - `folder_id`: string (optional)
 - `user_context`: auto-injected
 
@@ -1263,8 +1261,7 @@ This document lists all available API endpoints in the AI ChatBot system, organi
   "bucket": "string",
   "storage_key": "string",
   "chunks": "integer",
-  "collection": "string",
-  "access_level": "string"
+  "collection": "string"
 }
 ```
 
@@ -1312,7 +1309,6 @@ This document lists all available API endpoints in the AI ChatBot system, organi
 
 **Query Parameters:**
 - `folder_id`: string (optional)
-- `access_level`: "public" or "private" or null (optional)
 
 **Response:** Folder tree structure
 

@@ -1,12 +1,11 @@
 """
 Cache Manager Service
-Central cache management with fallback support
+Central cache management with Redis primary and Memory fallback
 Handles tenant-specific caching and Redis operations
 """
 import json
 import asyncio
-from typing import Dict, Any, Optional, List, Union
-from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
 
 from services.cache.redis_service import redis_client
 from config.settings import get_settings
@@ -24,7 +23,9 @@ class CacheManager:
     """
     
     def __init__(self):
-        self._fallback_cache: Dict[str, Any] = {}
+        self._fallback_cache = {}
+        logger.info("Using dict as fallback cache")
+
         self._cache_stats = {
             "hits": 0,
             "misses": 0,
@@ -74,16 +75,16 @@ class CacheManager:
                     value = await client.get(key)
                     if value is not None:
                         self._cache_stats["hits"] += 1
-                        logger.debug(f"Cache hit (Redis): {key}")
                         return json.loads(value)
             except Exception as redis_error:
                 logger.warning(f"Redis get error for key {key}: {redis_error}")
                 if "Connection refused" in str(redis_error) or "ConnectionError" in str(redis_error):
                     redis_client._initialized = False
 
+            # Dict fallback only
             if key in self._fallback_cache:
                 self._cache_stats["hits"] += 1
-                logger.debug(f"Cache hit (fallback): {key}")
+                logger.debug(f"Cache hit (dict fallback): {key}")
                 return self._fallback_cache[key]
 
             self._cache_stats["misses"] += 1
@@ -138,9 +139,10 @@ class CacheManager:
                 if "Connection refused" in str(redis_error) or "ConnectionError" in str(redis_error):
                     redis_client._initialized = False
 
+            # Dict fallback only
             self._fallback_cache[key] = value
             self._cache_stats["sets"] += 1
-            logger.debug(f"Cache set (fallback): {key}")
+            logger.debug(f"Cache set (dict fallback): {key}")
             return True
             
         except Exception as e:
@@ -235,7 +237,7 @@ class CacheManager:
             fallback_keys = [key for key in self._fallback_cache.keys() if self._match_pattern(key, pattern)]
             for key in fallback_keys:
                 del self._fallback_cache[key]
-            
+
             deleted_count += len(fallback_keys)
             
             if deleted_count > 0:
@@ -362,9 +364,13 @@ class CacheManager:
         except Exception as e:
             logger.warning(f"Could not get Redis info: {e}")
         
+
+            fallback_size = len(self._fallback_cache)
+
         return {
             "stats": self._cache_stats.copy(),
-            "fallback_cache_size": len(self._fallback_cache),
+            "fallback_cache_size": fallback_size,
+            "fallback_cache_type": "dict",
             "redis_available": redis_client.get_client() is not None,
             "redis_info": redis_info,
             "initialized": self._initialized
@@ -426,7 +432,7 @@ class CacheManager:
                 success = False
             
             self._fallback_cache.clear()
-            logger.warning("Cleared fallback cache")
+            logger.warning("Cleared dict fallback cache")
             
             self._cache_stats = {
                 "hits": 0,

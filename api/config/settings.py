@@ -133,7 +133,7 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql://ai_user:ai_pass@localhost:5432/ai_chatbot"
     
-    # Redis
+    # Redis (Primary Cache)
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
@@ -148,7 +148,7 @@ class Settings(BaseSettings):
 
     # Milvus URIs for Docker Compose
     MILVUS_PUBLIC_URI: str = f"http://{MILVUS_PUBLIC_HOST}:{MILVUS_PUBLIC_PORT}"
-    MILVUS_PRIVATE_URI: str = f"http://{MILVUS_PRIVATE_HOST}:{MILVUS_PUBLIC_PORT}"
+    MILVUS_PRIVATE_URI: str = f"http://{MILVUS_PRIVATE_HOST}:{MILVUS_PRIVATE_PORT}"
 
     # Milvus 2.6 Advanced Features
     MILVUS_USE_RABITQ_COMPRESSION: bool = True
@@ -293,7 +293,7 @@ class Settings(BaseSettings):
         if values.get('EMBEDDING_MODEL'):
             embedding_config.model_name = values['EMBEDDING_MODEL']
         if values.get('EMBEDDING_DIMENSIONS'):
-            milvus_config.vector_dim = values['EMBEDDING_DIMENSIONS']
+            embedding_config.max_length = values['EMBEDDING_DIMENSIONS']  # Note: using max_length as dimension proxy
         if values.get('EMBEDDING_BATCH_SIZE'):
             embedding_config.batch_size = values['EMBEDDING_BATCH_SIZE']
         values['embedding'] = embedding_config
@@ -311,7 +311,7 @@ class Settings(BaseSettings):
             "gemini": LLMProviderConfig(
                 name="gemini",
                 enabled=True,
-                models=["gemini-2.5-pro","gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+                models=["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
                 default_model="gemini-2.5-pro",
                 config={
                     "base_url": "https://api.google.com/v1",

@@ -49,7 +49,7 @@ class ProviderApiKeysService:
                     and_(
                         TenantProviderConfig.tenant_id == uuid.UUID(tenant_id),
                         Provider.provider_name == provider_name,
-                        TenantProviderConfig.is_enabled == True
+                        TenantProviderConfig.is_enabled.is_(True)
                     )
                 )
             )

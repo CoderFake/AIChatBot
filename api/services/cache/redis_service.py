@@ -4,7 +4,7 @@ Redis client with connection management and error handling
 Supports tenant-specific operations and bulk operations
 """
 import asyncio
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 import redis.asyncio as redis
 
 from config.settings import get_settings
@@ -86,14 +86,9 @@ class RedisService:
             current_loop = asyncio.get_event_loop()
 
         if self._loop is not None and current_loop is not self._loop:
-            logger.warning("Redis event loop changed; reinitializing client on current loop")
-            try:
-                self.redis_client = None
-                self.redis_pool = None
-                self._initialized = False
-                await self.initialize()
-            except Exception as e:
-                logger.error(f"Failed to reinitialize Redis on new loop: {e}")
+            logger.warning("Redis event loop changed; skipping reinitialization to prevent blocking I/O")
+            
+            pass
 
     async def ping(self) -> bool:
         """Test Redis connection"""

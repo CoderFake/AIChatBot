@@ -8,7 +8,6 @@ from sqlalchemy import select, and_
 from sqlalchemy.exc import SQLAlchemyError
 from models.database.provider import Provider, ProviderModel, TenantProviderConfig
 from utils.logging import get_logger
-from utils.encryption_utils import encryption_service
 
 logger = get_logger(__name__)
 

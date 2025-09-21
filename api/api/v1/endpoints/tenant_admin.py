@@ -13,6 +13,8 @@ from common.timezones import TimezoneGroups
 from services.tenant.tenant_service import get_tenant_service
 from services.tenant.settings_service import SettingsService
 from services.auth.validate_permission import ValidatePermission
+from models.schemas.responses.tenant import TenantSettingsResponse
+from models.schemas.request.tenant import TenantSettingsRequest
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -54,6 +56,7 @@ class WorkflowAgentResponse(BaseModel):
     provider_name: str
     model_name: str
     model_configuration: Dict[str, Any] = Field(alias="model_config")
+    api_keys: List[str]
     max_iterations: int
     timeout_seconds: int
     confidence_threshold: float
@@ -77,17 +80,19 @@ async def get_workflow_agent_config(
 
         workflow_service = WorkflowAgentService(db)
         workflow_agent = await workflow_service.get_or_create_workflow_agent(tenant_id)
+        workflow_agent_config = await workflow_service.get_workflow_agent_config(tenant_id)
 
         return WorkflowAgentResponse(
             id=workflow_agent["id"],
             tenant_id=workflow_agent["tenant_id"],
-            provider_name=workflow_agent["provider_name"],
-            model_name=workflow_agent["model_name"],
-            model_config=workflow_agent["model_config"] or {},
-            max_iterations=workflow_agent["max_iterations"],
-            timeout_seconds=workflow_agent["timeout_seconds"],
-            confidence_threshold=workflow_agent["confidence_threshold"],
-            is_active=workflow_agent["is_active"]
+            provider_name=workflow_agent_config["provider_name"],
+            model_name=workflow_agent_config["model_name"],
+            model_config=workflow_agent_config["model_config"],
+            api_keys=workflow_agent_config["api_keys"],
+            max_iterations=workflow_agent_config["max_iterations"],
+            timeout_seconds=workflow_agent_config["timeout_seconds"],
+            confidence_threshold=workflow_agent_config["confidence_threshold"],
+            is_active=workflow_agent_config["is_active"]
         )
 
     except HTTPException:
@@ -171,28 +176,6 @@ async def create_or_update_workflow_agent(
 
 # ==================== TENANT SETTINGS CONFIGURATION ====================
 
-class TenantSettingsRequest(BaseModel):
-    tenant_name: Optional[str] = None
-    description: Optional[str] = None
-    timezone: Optional[str] = None
-    locale: Optional[str] = None
-    bot_name: Optional[str] = None
-    chatbot_name: Optional[str] = None  
-    logo_url: Optional[str] = None         
-    branding: Optional[Dict[str, Any]] = None
-
-
-class TenantSettingsResponse(BaseModel):
-    tenant_name: str
-    description: Optional[str]
-    timezone: str
-    locale: str
-    chatbot_name: Optional[str] 
-    logo_url: Optional[str]      
-    bot_name: Optional[str]      
-    branding: Optional[Dict[str, Any]] 
-
-
 @router.get("/settings", response_model=TenantSettingsResponse, summary="Get tenant settings")
 async def get_tenant_settings(
     db: AsyncSession = Depends(get_db),
@@ -205,11 +188,10 @@ async def get_tenant_settings(
 
         settings_data = await settings_service.get_tenant_settings_with_mapping(tenant_id)
 
-        # Add backward compatibility fields
         response_data = dict(settings_data)
         response_data['chatbot_name'] = settings_data.get('chatbot_name')
         response_data['logo_url'] = settings_data.get('logo_url')
-        response_data['bot_name'] = settings_data.get('chatbot_name')  # Map to new format
+        response_data['bot_name'] = settings_data.get('chatbot_name')  
         response_data['branding'] = {
             'logo_url': settings_data.get('logo_url')
         }
@@ -243,13 +225,11 @@ async def update_tenant_settings(
             locale=request.locale
         )
 
-        # Handle bot_name (new format) or chatbot_name (old format)
         bot_name_to_update = request.bot_name or request.chatbot_name
         if bot_name_to_update is not None:
             await settings_service.update_bot_name(tenant_id, bot_name_to_update)
             updated_settings = await settings_service.get_tenant_settings_with_mapping(tenant_id)
 
-        # Handle logo_url from branding (new format) or direct logo_url (old format)
         logo_url_to_update = None
         if request.branding and request.branding.get("logo_url") is not None:
             logo_url_to_update = request.branding["logo_url"]
@@ -263,7 +243,7 @@ async def update_tenant_settings(
         response_data = dict(updated_settings)
         response_data['chatbot_name'] = updated_settings.get('chatbot_name')
         response_data['logo_url'] = updated_settings.get('logo_url')
-        response_data['bot_name'] = updated_settings.get('chatbot_name')  # Map to new format
+        response_data['bot_name'] = updated_settings.get('chatbot_name') 
         response_data['branding'] = {
             'logo_url': updated_settings.get('logo_url')
         }
@@ -550,7 +530,7 @@ async def create_department(
         from services.department.department_service import DepartmentService
         dept_service = DepartmentService(db)
 
-        result = await dept_service.create_department_with_agent_and_provider(
+        result = await dept_service.create_department(
             tenant_id=tenant_id,
             department_name=request.department_name,
             agent_name=request.agent_name,
@@ -602,7 +582,7 @@ async def get_department(
         from services.department.department_service import DepartmentService
         dept_service = DepartmentService(db)
 
-        department_data = await dept_service.get_department_by_id(department_id)
+        department_data = await dept_service.get_department(department_id)
 
         if not department_data:
             raise HTTPException(
@@ -642,7 +622,7 @@ async def update_department(
 
         from services.department.department_service import DepartmentService
         dept_service = DepartmentService(db)
-        result = await dept_service.update_department_with_agent_and_provider(
+        result = await dept_service.update_department(
             department_id=department_id,
             tenant_id=tenant_id,
             department_name=request.department_name,
@@ -652,7 +632,8 @@ async def update_department(
             model_id=request.model_id,
             config_data=request.provider_config,
             department_description=request.description,
-            tool_ids=request.tool_ids
+            tool_ids=request.tool_ids,
+            role = user_ctx.get("role")
         )
 
         if "cache_invalidation" in result:

@@ -78,14 +78,64 @@ class Language(Enum):
 
 
 class FileType(Enum):
-    """Enum define file types"""
+    """Enum define allowed file types"""
     PDF = "pdf"
     DOCX = "docx"
-    TXT = "txt"
-    MD = "md"
     DOC = "doc"
-    XLSX = "xlsx"
-    PPTX = "pptx" 
+    MD = "md"
+    TXT = "txt"
+
+
+# File validation constants
+ALLOWED_MIME_TYPES = {
+    'application/pdf',  # PDF files
+    'application/msword',  # DOC files
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # DOCX files
+    'text/plain',  # TXT files
+    'text/markdown',  # MD files
+    'text/x-markdown'  # Alternative MD MIME type
+}
+
+MIME_TYPE_MAPPING = {
+    'application/pdf': 'pdf',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+    'text/x-markdown': 'md'
+}
+
+
+def validate_file_type(mime_type: str) -> str:
+    """
+    Validate file type and return short name.
+    Raises ValueError if file type is not allowed.
+
+    Args:
+        mime_type: MIME type of the file
+
+    Returns:
+        Short file type name
+
+    Raises:
+        ValueError: If file type is not in allowed list
+    """
+    if mime_type not in ALLOWED_MIME_TYPES:
+        raise ValueError("File type not allowed. Only PDF, DOCX, DOC, MD, and TXT files are supported.")
+    return MIME_TYPE_MAPPING.get(mime_type, 'unknown')
+
+
+def is_allowed_file_type(mime_type: str) -> bool:
+    """
+    Check if file type is allowed.
+
+    Args:
+        mime_type: MIME type of the file
+
+    Returns:
+        True if allowed, False otherwise
+    """
+    return mime_type in ALLOWED_MIME_TYPES
 
 
 class ConfigScope(str, Enum):
@@ -364,18 +414,16 @@ class KafkaMessageStatus(Enum):
 class DocumentConstants:
     """Constants for document operations to avoid hardcoding"""
     
-    # Folder constants
     ROOT_FOLDER_PATH = "/"
     ROOT_FOLDER_NAME = "root"
     
-    # Collection name templates
-    COLLECTION_NAME_TEMPLATE_PUBLIC = "{tenant_id}-{department_id}-public"
-    COLLECTION_NAME_TEMPLATE_PRIVATE = "{tenant_id}-{department_id}-private"
+    COLLECTION_NAME_TEMPLATE_PUBLIC = "{department_id}_public"
+    COLLECTION_NAME_TEMPLATE_PRIVATE = "{department_id}_private"
     
     # Bucket name template
     BUCKET_NAME_TEMPLATE = "{prefix}-{tenant_id}"
     
-    STORAGE_KEY_TEMPLATE = "{tenant_id}/{department_id}/{access_level}/{folder_path}{document_uuid}_{filename}"
+    STORAGE_KEY_TEMPLATE = "{tenant_id}/{department_id}/{document_uuid}_{filename}"
     
     # Progress steps for Kafka
     PROGRESS_START = 5

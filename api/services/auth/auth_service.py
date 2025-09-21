@@ -298,6 +298,20 @@ class AuthService:
 
             is_maintainer = db_role == getattr(__import__('common.types', fromlist=['UserRole']).types, 'UserRole', None).MAINTAINER.value if False else db_role == 'MAINTAINER'
 
+            tenant_timezone = None
+            if not is_maintainer and user.tenant_id:
+                try:
+                    from models.database.tenant import Tenant
+                    tenant_result = await self.db.execute(
+                        select(Tenant.timezone).where(Tenant.id == user.tenant_id)
+                    )
+                    tenant = tenant_result.scalar_one_or_none()
+                    if tenant and tenant.timezone:
+                        tenant_timezone = str(tenant.timezone)
+                except Exception as e:
+                    logger.warning(f"Failed to get tenant timezone for user {user_id}: {e}")
+                    tenant_timezone = None
+
             context: Dict[str, Any] = {
                 "user_id": str(user.id),
                 "username": user.username,
@@ -309,6 +323,7 @@ class AuthService:
                 "department_id": str(user.department_id) if user.department_id else None,
                 "is_verified": user.is_verified,
                 "jti": jti,
+                "timezone": tenant_timezone,
             }
 
             return context

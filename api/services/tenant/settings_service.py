@@ -35,7 +35,7 @@ class SettingsService:
         """
         try:
             await self._ensure_cache_initialized()
-            cache_key = f"tenant_settings_{tenant_id}"
+            cache_key = f"tenant_config_{tenant_id}"
 
             cached_settings = await cache_manager.get(cache_key)
             if cached_settings:
@@ -201,8 +201,7 @@ class SettingsService:
             await self._ensure_cache_initialized()
 
             cache_keys = [
-                f"tenant_settings_{tenant_id}",
-                f"tenant_settings_mapped_{tenant_id}",
+                f"tenant_config_{tenant_id}",
                 f"tenant:{tenant_id}:details"
             ]
 
@@ -221,7 +220,7 @@ class SettingsService:
         try:
             await self._ensure_cache_initialized()
 
-            cache_key = f"tenant_settings_mapped_{tenant_id}"
+            cache_key = f"tenant_config_{tenant_id}"
             cached_mapped_settings = await cache_manager.get(cache_key)
             if cached_mapped_settings:
                 logger.info(f"Retrieved mapped tenant settings from cache for tenant {tenant_id}")

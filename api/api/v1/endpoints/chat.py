@@ -13,6 +13,7 @@ from config.database import get_db
 from api.v1.middleware.middleware import JWTAuth
 from models.schemas.request.chat import ChatRequest
 from services.chat.chat_service import ChatService
+from common.types import UserRole
 from utils.logging import get_logger
 from utils.language_utils import detect_language, get_localized_message
 
@@ -189,7 +190,7 @@ async def update_session_title(
 
 
 @router.post("/query")
-async def chat_query_with_planning(
+async def chat(
     request: ChatRequest,
     user_context: Dict[str, Any] = Depends(JWTAuth.get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -200,11 +201,15 @@ async def chat_query_with_planning(
     """
     try:
         query = request.query
-        session_id_str = request.session_id or f"session_{user_context.get('user_id', 'anonymous')}"
+        session_id_str = request.session_id
 
         tenant_id = user_context.get("tenant_id")
         department_id = user_context.get("department_id")
         user_id = user_context.get("user_id")
+        access_level = request.access_scope.visibility or "public"
+
+        if user_context.get("role") == UserRole.USER.value:
+            access_level = "public"
 
         if not tenant_id:
             raise HTTPException(status_code=400, detail="Tenant ID required")
@@ -225,11 +230,12 @@ async def chat_query_with_planning(
         
         session_title = None
         logger.info(f"Session {chat_session.id} message_count: {chat_session.message_count}")
+
         if chat_session.message_count == 0 and query.strip():
-            logger.info(f"Generating title for first message in session {chat_session.id}")
+            logger.info(f"First message - generating title for session {chat_session.id}")
             from services.chat.title_service import TitleService
             title_service = TitleService(db)
-            
+
             session_title = await title_service.generate_and_update_session_title(
                 session=chat_session,
                 first_message=query,
@@ -238,25 +244,26 @@ async def chat_query_with_planning(
             )
             logger.info(f"Generated session title: {session_title}")
         else:
-            logger.info(f"Skipping title generation - message_count: {chat_session.message_count}, query: {bool(query.strip())}")
+            logger.info(f"Existing session - skipping title generation, message_count: {chat_session.message_count}")
 
-        user_message = await chat_service.save_user_query(
-            session_id=session_id,
-            query=query,
-            language=detected_language
-        )
-        
+        is_first_message = chat_session.message_count == 0
+
         async def event_generator() -> AsyncGenerator[str, None]:
             try:
+                if session_title:
+                    yield f"data: {json.dumps({'type': 'title', 'title': session_title})}\n\n"
+
                 async for event in chat_service.execute_multi_agent_workflow(
                     query=query,
+                    access_level=access_level,
                     session_id=session_id,
                     tenant_id=tenant_id,
                     department_id=department_id,
                     user_context=user_context,
                     detected_language=detected_language,
-                    user_message_id=str(user_message.id),
-                    session_title=session_title 
+                    user_message_id=None,  # Will be created in workflow for first message
+                    session_title=session_title,
+                    is_first_message=is_first_message
                 ):
                     yield event
 

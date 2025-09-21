@@ -2,7 +2,6 @@
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from config.database import get_db
 from services.agents.agent_service import AgentService
@@ -44,7 +43,7 @@ async def get_department(
     """Get department details with agents"""
     try:
         agent_service = AgentService(db)
-        department = await agent_service.get_department_by_id(department_id)
+        department = await agent_service.get_department(department_id)
 
         if not department:
             raise HTTPException(
@@ -124,52 +123,6 @@ async def delete_department(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete department: {str(e)}"
-        )
-
-
-@router.post("/agents", summary="Create agent for department")
-async def create_agent_for_department(
-    department_id: str,
-    agent_name: str,
-    description: str,
-    provider_id: Optional[str] = None,
-    model_id: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-    user_ctx: dict = Depends(RequireAtLeastAdmin())
-) -> Dict[str, Any]:
-    """Create agent for existing department"""
-    try:
-        agent_service = AgentService(db)
-        agent = await agent_service.create_agent_for_existing_department(
-            department_id=department_id,
-            agent_name=agent_name,
-            description=description,
-            provider_id=provider_id,
-            model_id=model_id
-        )
-
-        if not agent:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to create agent or department not found"
-            )
-
-        return {
-            "agent": {
-                "id": str(agent.id),
-                "name": agent.agent_name,
-                "description": agent.description,
-                "department_id": department_id,
-                "is_enabled": agent.is_enabled
-            }
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create agent for department: {str(e)}"
         )
 
 

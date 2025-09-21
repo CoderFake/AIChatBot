@@ -1,20 +1,51 @@
-from typing import List, Dict, Any, Optional, Union
-import json
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pymilvus import (
     MilvusClient,
     DataType,
     FunctionType,
     AnnSearchRequest,
-    RRFRanker
+    RRFRanker,
+    CollectionSchema,
+    FieldSchema
 )
+from langchain_milvus import Milvus
 from services.embedding.embedding_service import embedding_service
-from common.types import DBDocumentPermissionLevel
+from common.types import DocumentAccessLevel
 from config.settings import get_settings
 from utils.logging import get_logger
+import json
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+
+class EmbeddingWrapper:
+    """Wrapper to integrate our embedding service with LangChain"""
+    
+    def __init__(self, embedding_service):
+        self.embedding_service = embedding_service
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of documents"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If in async context, we need to handle this differently
+            embeddings = loop.run_until_complete(self.embedding_service.encode_documents(texts))
+        else:
+            embeddings = asyncio.run(self.embedding_service.encode_documents(texts))
+        return embeddings["dense_vectors"].tolist()
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            embeddings = loop.run_until_complete(self.embedding_service.encode_queries([text]))
+        else:
+            embeddings = asyncio.run(self.embedding_service.encode_queries([text]))
+        return embeddings["dense_vectors"][0].tolist()
 
 
 class MilvusService:
@@ -24,40 +55,36 @@ class MilvusService:
     - Dynamic schema for flexible data models
     - Hybrid vector + keyword search
     - Connection pooling for scalability
+    - LangChain MMR integration for diversity
     """
 
     def __init__(self):
         self.public_client = None
         self.private_client = None
+        self.public_langchain = None
+        self.private_langchain = None
         self.collection_cache = {}
         self.function_cache = {}
         self._initialize_clients()
         self._setup_connection_pool()
 
     def _initialize_clients(self):
-        """Initialize Milvus 2.6 clients with advanced configuration"""
+        """Initialize Milvus 2.6 clients with basic configuration"""
         try:
-            connection_config = {
-                "uri": "",
-                "db_name": "default",
-                "token": "",
-                "connect_timeout": 30,
-                "request_timeout": settings.MILVUS_QUERY_TIMEOUT_MS / 1000,
-                "pool_size": settings.MILVUS_CONNECTION_POOL_SIZE
-            }
-
             public_uri = getattr(settings, 'MILVUS_PUBLIC_URI', 'http://milvus_public:19530')
-            connection_config["uri"] = public_uri
-            self.public_client = MilvusClient(**connection_config)
+            private_uri = getattr(settings, 'MILVUS_PRIVATE_URI', 'http://milvus_private:19531')
 
-            private_uri = getattr(settings, 'MILVUS_PRIVATE_URI', 'http://milvus_private:19530')
-            connection_config["uri"] = private_uri
-            self.private_client = MilvusClient(**connection_config)
+            self.public_client = MilvusClient(uri=public_uri)
+            self.private_client = MilvusClient(uri=private_uri)
 
-            logger.info("Milvus 2.6 clients initialized successfully with advanced features")
+            # Initialize LangChain clients lazily when needed
+            self.public_langchain = None
+            self.private_langchain = None
+
+            logger.info("Milvus clients initialized successfully with URI-based configuration")
 
         except Exception as e:
-            logger.error(f"Failed to initialize Milvus 2.6 clients: {e}")
+            logger.error(f"Failed to initialize Milvus clients: {e}")
             raise
 
     def _setup_connection_pool(self):
@@ -71,31 +98,57 @@ class MilvusService:
     
     def _get_client(self, milvus_instance: str) -> MilvusClient:
         """Get appropriate Milvus client based on instance type"""
-        if milvus_instance == DBDocumentPermissionLevel.PUBLIC.value:
+        if milvus_instance == getattr(settings, 'MILVUS_PUBLIC_HOST', 'milvus_public'):
             return self.public_client
-        elif milvus_instance == DBDocumentPermissionLevel.PRIVATE.value:
+        elif milvus_instance == getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private'):
             return self.private_client
         else:
             raise ValueError(f"Invalid Milvus instance: {milvus_instance}")
+
+    def _get_langchain_client(self, milvus_instance: str, collection_name: str) -> Milvus:
+        """Get appropriate LangChain Milvus client for MMR operations"""
+        try:
+            if milvus_instance == getattr(settings, 'MILVUS_PUBLIC_HOST', 'milvus_public'):
+                if self.public_langchain is None:
+                    embedding_wrapper = EmbeddingWrapper(embedding_service)
+                    self.public_langchain = Milvus(
+                        embedding_function=embedding_wrapper,
+                        collection_name=collection_name,
+                        connection_args={"uri": getattr(settings, 'MILVUS_PUBLIC_URI', 'http://milvus_public:19530')}
+                    )
+                return self.public_langchain
+            elif milvus_instance == getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private'):
+                if self.private_langchain is None:
+                    embedding_wrapper = EmbeddingWrapper(embedding_service)
+                    self.private_langchain = Milvus(
+                        embedding_function=embedding_wrapper,
+                        collection_name=collection_name,
+                        connection_args={"uri": getattr(settings, 'MILVUS_PRIVATE_URI', 'http://milvus_private:19531')}
+                    )
+                return self.private_langchain
+            else:
+                raise ValueError(f"Invalid Milvus instance: {milvus_instance}")
+        except Exception as e:
+            logger.error(f"Failed to initialize LangChain Milvus client: {e}")
+            raise
     
     async def ensure_collection_exists(
         self, 
-        collection_name: str, 
-        milvus_instance: str
+        collection_name: str,
+        access_level: str
     ) -> bool:
         """
         Ensure collection exists, create if not found
         """
         try:
-            client = self._get_client(milvus_instance)
-            cache_key = f"{milvus_instance}:{collection_name}"
-            
-            if cache_key in self.collection_cache:
-                return True
-            
+            if access_level == DocumentAccessLevel.PUBLIC.value:
+                client = self._get_client(getattr(settings, 'MILVUS_PUBLIC_HOST', 'milvus_public'))
+            elif access_level == DocumentAccessLevel.PRIVATE.value:
+                client = self._get_client(getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private'))
+            else:
+                raise ValueError(f"Invalid access level: {access_level}")
+
             if client.has_collection(collection_name):
-                self.collection_cache[cache_key] = True
-                logger.info(f"Collection {collection_name} exists in {milvus_instance}")
                 return True
             
             success = self._create_collection(
@@ -104,8 +157,7 @@ class MilvusService:
             )
             
             if success:
-                self.collection_cache[cache_key] = True
-                logger.info(f"Created collection {collection_name} in {milvus_instance}")
+                logger.info(f"Created collection {collection_name}")
             
             return success
             
@@ -120,68 +172,75 @@ class MilvusService:
     ) -> bool:
         """
         Create new collection with Milvus 2.6 advanced schema
-        Supports JSON indexing, dynamic fields, and RaBitQ compression
+        Fixed to use proper FieldSchema and CollectionSchema objects
         """
         try:
-            schema = {
-                "fields": [
-                    {
-                        "name": "vector",
-                        "type": DataType.FLOAT_VECTOR,
-                        "dimension": settings.EMBEDDING_DIMENSIONS,
-                        "params": {
-                            "enable_RaBitQ": settings.MILVUS_USE_RABITQ_COMPRESSION
-                        }
-                    },
-                    {
-                        "name": "text",
-                        "type": DataType.VARCHAR,
-                        "max_length": 65535,
-                        "enable_analyzer": True 
-                    },
-                    {
-                        "name": "document_id",
-                        "type": DataType.VARCHAR,
-                        "max_length": 255
-                    },
-                    {
-                        "name": "department",
-                        "type": DataType.VARCHAR,
-                        "max_length": 100
-                    },
-                    {
-                        "name": "document_source",
-                        "type": DataType.VARCHAR,
-                        "max_length": 255
-                    },
-                    {
-                        "name": "metadata",
-                        "type": DataType.JSON,
-                        "enable_dynamic_field": settings.MILVUS_DYNAMIC_SCHEMA_ENABLED
-                    },
-                    {
-                        "name": "created_at",
-                        "type": DataType.INT64,
-                        "default_value": int(datetime.now().timestamp() * 1000)
-                    }
-                ],
-                "enable_dynamic_field": settings.MILVUS_DYNAMIC_SCHEMA_ENABLED,
-                "description": f"RAG collection for {collection_name} with Milvus 2.6 features"
-            }
+            fields = [
+                FieldSchema(
+                    name="id",
+                    dtype=DataType.INT64,
+                    is_primary=True,
+                    auto_id=True
+                ),
+                FieldSchema(
+                    name="vector",
+                    dtype=DataType.FLOAT_VECTOR,
+                    dim=getattr(settings, 'EMBEDDING_DIMENSIONS', 1024)
+                ),
+                FieldSchema(
+                    name="text",
+                    dtype=DataType.VARCHAR,
+                    max_length=65535
+                ),
+                FieldSchema(
+                    name="document_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=255
+                ),
+                FieldSchema(
+                    name="department",
+                    dtype=DataType.VARCHAR,
+                    max_length=100
+                ),
+                FieldSchema(
+                    name="document_source",
+                    dtype=DataType.VARCHAR,
+                    max_length=255
+                ),
+                FieldSchema(
+                    name="metadata",
+                    dtype=DataType.JSON
+                ),
+                FieldSchema(
+                    name="created_at",
+                    dtype=DataType.INT64
+                )
+            ]
+
+            schema = CollectionSchema(
+                fields=fields,
+                description=f"RAG collection for {collection_name} with Milvus 2.6 features",
+                enable_dynamic_field=getattr(settings, 'MILVUS_DYNAMIC_SCHEMA_ENABLED', True)
+            )
 
             client.create_collection(
                 collection_name=collection_name,
-                schema=schema,
-                index_params={
-                    "field_name": "vector",
-                    "index_type": settings.MILVUS_INDEX_TYPE,
-                    "metric_type": settings.MILVUS_METRIC_TYPE,
-                    "params": settings.MILVUS_INDEX_PARAMS
-                }
+                schema=schema
             )
 
-            if settings.MILVUS_HYBRID_SEARCH_ENABLED:
-                self._create_text_search_function(client, collection_name)
+            client.create_index(
+                collection_name=collection_name,
+                field_name="vector",
+                index_type=getattr(settings, 'MILVUS_INDEX_TYPE', 'HNSW'),
+                metric_type=getattr(settings, 'MILVUS_METRIC_TYPE', 'COSINE'),
+                params=getattr(settings, 'MILVUS_INDEX_PARAMS', {"M": 16, "efConstruction": 200})
+            )
+
+            if getattr(settings, 'MILVUS_HYBRID_SEARCH_ENABLED', False):
+                try:
+                    self._create_text_search_function(client, collection_name)
+                except Exception as e:
+                    logger.warning(f"Failed to create text search function: {e}")
 
             client.load_collection(collection_name)
 
@@ -225,17 +284,28 @@ class MilvusService:
         top_k: int = 10,
         score_threshold: float = 0.7,
         filter_expr: Optional[str] = None,
-        enable_hybrid_search: bool = True
+        enable_hybrid_search: bool = True,
+        enable_mmr: bool = False,
+        mmr_lambda: float = 0.5,
+        mmr_fetch_k: int = 20
     ) -> List[Dict[str, Any]]:
         """
         Search documents using Milvus 2.6 hybrid search (vector + keyword)
+        With optional MMR for diversity
         """
         try:
-            await self.ensure_collection_exists(collection_name, milvus_instance)
+            access_level = DocumentAccessLevel.PRIVATE.value if milvus_instance == getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private') else DocumentAccessLevel.PUBLIC.value
+            await self.ensure_collection_exists(collection_name, access_level)
+
+            if enable_mmr:
+                return await self._search_with_mmr(
+                    query, collection_name, milvus_instance, top_k, 
+                    score_threshold, filter_expr, mmr_lambda, mmr_fetch_k
+                )
 
             client = self._get_client(milvus_instance)
 
-            if enable_hybrid_search and settings.MILVUS_HYBRID_SEARCH_ENABLED:
+            if enable_hybrid_search and getattr(settings, 'MILVUS_HYBRID_SEARCH_ENABLED', False):
                 return await self._hybrid_search(
                     client, query, collection_name, top_k, score_threshold, filter_expr
                 )
@@ -247,6 +317,56 @@ class MilvusService:
         except Exception as e:
             logger.error(f"Search failed in collection {collection_name}: {e}")
             return []
+
+    async def _search_with_mmr(
+        self,
+        query: str,
+        collection_name: str,
+        milvus_instance: str,
+        top_k: int,
+        score_threshold: float,
+        filter_expr: Optional[str],
+        lambda_mult: float,
+        fetch_k: int
+    ) -> List[Dict[str, Any]]:
+        """Search with MMR diversity using LangChain integration"""
+        try:
+            langchain_client = self._get_langchain_client(milvus_instance, collection_name)
+            
+            docs = langchain_client.max_marginal_relevance_search(
+                query=query,
+                k=top_k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+                expr=filter_expr
+            )
+            
+            results = []
+            for i, doc in enumerate(docs):
+                results.append({
+                    "id": doc.metadata.get("document_id", "unknown"),
+                    "content": doc.page_content,
+                    "score": 1.0 - (i * 0.1),  # Synthetic score based on MMR rank
+                    "search_type": "mmr",
+                    "mmr_rank": i + 1,
+                    "metadata": {
+                        "document_id": doc.metadata.get("document_id", "unknown"),
+                        "department": doc.metadata.get("department", "unknown"),
+                        "document_source": doc.metadata.get("document_source", "unknown"),
+                        "created_at": doc.metadata.get("created_at"),
+                        **doc.metadata
+                    }
+                })
+            
+            logger.info(f"Found {len(results)} results using MMR search")
+            return results
+            
+        except Exception as e:
+            logger.warning(f"MMR search failed, falling back to hybrid search: {e}")
+            client = self._get_client(milvus_instance)
+            return await self._hybrid_search(
+                client, query, collection_name, top_k, score_threshold, filter_expr
+            )
 
     async def _hybrid_search(
         self,
@@ -266,7 +386,7 @@ class MilvusService:
                 data=[query_vector],
                 anns_field="vector",
                 search_params={
-                    "metric_type": settings.MILVUS_METRIC_TYPE,
+                    "metric_type": getattr(settings, 'MILVUS_METRIC_TYPE', 'COSINE'),
                     "params": {"ef": 200}
                 },
                 limit=top_k * 2,
@@ -319,7 +439,7 @@ class MilvusService:
                 data=[query_vector],
                 limit=top_k,
                 search_params={
-                    "metric_type": settings.MILVUS_METRIC_TYPE,
+                    "metric_type": getattr(settings, 'MILVUS_METRIC_TYPE', 'COSINE'),
                     "params": {"ef": 200}
                 },
                 output_fields=["text", "document_id", "department", "document_source", "metadata", "created_at"],
@@ -352,7 +472,7 @@ class MilvusService:
                     if isinstance(metadata, str):
                         try:
                             metadata = json.loads(metadata)
-                        except:
+                        except Exception:
                             metadata = {}
 
                     processed_results.append({
@@ -371,6 +491,20 @@ class MilvusService:
 
         logger.info(f"Found {len(processed_results)} results using {search_type} search")
         return processed_results
+
+    def _sanitize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert UUID and other non-JSON serializable objects to strings in metadata"""
+        sanitized = {}
+        for key, value in metadata.items():
+            if hasattr(value, '__str__') and not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                sanitized[key] = str(value)
+            elif isinstance(value, dict):
+                sanitized[key] = self._sanitize_metadata(value)
+            elif isinstance(value, list):
+                sanitized[key] = [str(item) if hasattr(item, '__str__') and not isinstance(item, (str, int, float, bool, dict, type(None))) else item for item in value]
+            else:
+                sanitized[key] = value
+        return sanitized
     
     async def insert_documents(
         self,
@@ -382,8 +516,9 @@ class MilvusService:
         Insert documents into collection with real embeddings
         """
         try:
-            await self.ensure_collection_exists(collection_name, milvus_instance)
-            
+            access_level = DocumentAccessLevel.PRIVATE.value if milvus_instance == getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private') else DocumentAccessLevel.PUBLIC.value
+            await self.ensure_collection_exists(collection_name, access_level)
+
             client = self._get_client(milvus_instance)
             
             texts = [doc["text"] for doc in documents]
@@ -392,20 +527,40 @@ class MilvusService:
             dense_vectors = embeddings["dense_vectors"]
             
             insert_data = []
-            current_time = int(datetime.now().timestamp() * 1000)  # Milvus timestamp format
+            current_time = int(datetime.now().timestamp() * 1000)
 
             for i, doc in enumerate(documents):
+                department_value = doc["department"]
+                if hasattr(department_value, '__str__'):
+                    department_str = str(department_value)
+                else:
+                    department_str = department_value
+
+                document_id_value = doc["document_id"]
+                if hasattr(document_id_value, '__str__'):
+                    document_id_str = str(document_id_value)
+                else:
+                    document_id_str = document_id_value
+
+                document_source_value = doc["document_source"]
+                if hasattr(document_source_value, '__str__'):
+                    document_source_str = str(document_source_value)
+                else:
+                    document_source_str = document_source_value
+
+                sanitized_metadata = self._sanitize_metadata(doc.get("metadata", {}))
+
                 insert_data.append({
                     "vector": dense_vectors[i].tolist(),
-                    "text": doc["text"],
-                    "document_id": doc["document_id"],
-                    "department": doc["department"],
-                    "document_source": doc["document_source"],
-                    "metadata": doc.get("metadata", {}),
+                    "text": str(doc["text"]),
+                    "document_id": document_id_str,
+                    "department": department_str,
+                    "document_source": document_source_str,
+                    "metadata": sanitized_metadata,
                     "created_at": current_time
                 })
             
-            result = client.insert(
+            client.insert(
                 collection_name=collection_name,
                 data=insert_data
             )
@@ -416,115 +571,7 @@ class MilvusService:
         except Exception as e:
             logger.error(f"Failed to insert documents into {collection_name}: {e}")
             return False
-    
-    async def create_department_collections(
-        self,
-        department_id: str
-    ) -> Dict[str, bool]:
-        """
-        Create both public and private collections for a department using dept_id format
-        Format: {dept_id}-public and {dept_id}-private
-        """
-        results = {}
 
-        public_collection = f"{department_id}-public"
-        results["public"] = await self.ensure_collection_exists(
-            public_collection,
-            DBDocumentPermissionLevel.PUBLIC.value
-        )
-
-        private_collection = f"{department_id}-private"
-        results["private"] = await self.ensure_collection_exists(
-            private_collection,
-            DBDocumentPermissionLevel.PRIVATE.value
-        )
-
-        logger.info(f"Created collections for department {department_id}: {public_collection}, {private_collection}")
-        return results
-    
-    def get_collection_stats(self) -> Dict[str, Any]:
-        """
-        Get comprehensive collection statistics with Milvus 2.6 features
-        """
-        try:
-            stats = {
-                "milvus_version": "2.6",
-                "total_collections": len(self.collection_cache),
-                "cached_collections": list(self.collection_cache.keys()),
-                "cached_functions": list(self.function_cache.keys()),
-                "features_enabled": {
-                    "RaBitQ_compression": settings.MILVUS_USE_RABITQ_COMPRESSION,
-                    "JSON_indexing": settings.MILVUS_JSON_INDEXING_ENABLED,
-                    "dynamic_schema": settings.MILVUS_DYNAMIC_SCHEMA_ENABLED,
-                    "hybrid_search": settings.MILVUS_HYBRID_SEARCH_ENABLED
-                },
-                "index_config": {
-                    "type": settings.MILVUS_INDEX_TYPE,
-                    "metric": settings.MILVUS_METRIC_TYPE,
-                    "params": settings.MILVUS_INDEX_PARAMS
-                },
-                "performance_config": {
-                    "connection_pool_size": settings.MILVUS_CONNECTION_POOL_SIZE,
-                    "query_timeout_ms": settings.MILVUS_QUERY_TIMEOUT_MS,
-                    "load_timeout_ms": settings.MILVUS_LOAD_TIMEOUT_MS
-                },
-                "public_instance": {
-                    "host": settings.MILVUS_PUBLIC_HOST,
-                    "port": settings.MILVUS_PUBLIC_PORT,
-                    "collections": [],
-                    "functions": []
-                },
-                "private_instance": {
-                    "host": settings.MILVUS_PRIVATE_HOST,
-                    "port": settings.MILVUS_PRIVATE_PORT,
-                    "collections": [],
-                    "functions": []
-                }
-            }
-
-            try:
-                public_collections = self.public_client.list_collections()
-                stats["public_instance"]["collections"] = public_collections
-                stats["public_instance"]["count"] = len(public_collections)
-
-                for collection in public_collections:
-                    try:
-                        desc = self.public_client.describe_collection(collection)
-                        stats["public_instance"][f"{collection}_schema"] = desc
-                    except Exception as e:
-                        logger.debug(f"Failed to describe collection {collection}: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to get public collections: {e}")
-                stats["public_instance"]["error"] = str(e)
-
-            try:
-                private_collections = self.private_client.list_collections()
-                stats["private_instance"]["collections"] = private_collections
-                stats["private_instance"]["count"] = len(private_collections)
-
-                for collection in private_collections:
-                    try:
-                        desc = self.private_client.describe_collection(collection)
-                        stats["private_instance"][f"{collection}_schema"] = desc
-                    except Exception as e:
-                        logger.debug(f"Failed to describe collection {collection}: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to get private collections: {e}")
-                stats["private_instance"]["error"] = str(e)
-
-            return stats
-
-        except Exception as e:
-            logger.error(f"Failed to get collection stats: {e}")
-            return {
-                "total_collections": len(self.collection_cache),
-                "cached_collections": list(self.collection_cache.keys()),
-                "cached_functions": list(self.function_cache.keys()),
-                "error": str(e)
-            }
-    
     async def bulk_delete_by_filter(
         self,
         filter_expr: str,
@@ -577,15 +624,6 @@ class MilvusService:
         try:
             client = self._get_client(milvus_instance)
             
-            default_params = {
-                "field_name": "vector",
-                "index_type": "HNSW",
-                "metric_type": "COSINE",
-                "params": {"M": 16, "efConstruction": 200}
-            }
-            
-            index_params = new_index_params if new_index_params else default_params
-            
             client.release_collection(collection_name)
             
             try:
@@ -593,10 +631,22 @@ class MilvusService:
             except Exception:
                 pass 
             
-            client.create_index(
-                collection_name=collection_name,
-                **index_params
-            )
+            if new_index_params:
+                client.create_index(
+                    collection_name=collection_name,
+                    field_name="vector",
+                    index_type=new_index_params.get("index_type", "HNSW"),
+                    metric_type=new_index_params.get("metric_type", "COSINE"),
+                    params=new_index_params.get("params", {"M": 16, "efConstruction": 200})
+                )
+            else:
+                client.create_index(
+                    collection_name=collection_name,
+                    field_name="vector",
+                    index_type="HNSW",
+                    metric_type="COSINE",
+                    params={"M": 16, "efConstruction": 200}
+                )
             
             client.load_collection(collection_name)
             
@@ -642,8 +692,9 @@ class MilvusService:
             Number of chunks indexed
         """
         try:
-            await self.ensure_collection_exists(collection_name, milvus_instance)
-            
+            access_level = DocumentAccessLevel.PRIVATE.value if milvus_instance == getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private') else DocumentAccessLevel.PUBLIC.value
+            await self.ensure_collection_exists(collection_name, access_level)
+
             documents = []
             texts = []
             
@@ -663,12 +714,17 @@ class MilvusService:
                 elif isinstance(chunk, dict) and 'metadata' in chunk:
                     chunk_metadata.update(chunk['metadata'])
                 
+                sanitized_metadata = self._sanitize_metadata(chunk_metadata)
+                
+                document_id_value = metadata.get("document_id", "unknown")
+                department_value = metadata.get("department_id", "unknown")
+                
                 documents.append({
-                    "text": text,
-                    "document_id": metadata.get("document_id", "unknown"),
-                    "department": metadata.get("department_id", "unknown"),
+                    "text": str(text),
+                    "document_id": str(document_id_value),
+                    "department": str(department_value),
                     "document_source": f"chunk_{i}",
-                    "metadata": chunk_metadata
+                    "metadata": sanitized_metadata
                 })
             
             success = await self.insert_documents(
@@ -710,17 +766,17 @@ class MilvusService:
                 public_result = await self.bulk_delete_by_filter(
                     filter_expr=filter_expr,
                     collection_name=collection_name,
-                    milvus_instance=DBDocumentPermissionLevel.PUBLIC.value
+                    milvus_instance=getattr(settings, 'MILVUS_PUBLIC_HOST', 'milvus_public')
                 )
             except Exception as e:
                 logger.debug(f"Public instance delete failed (expected if not public): {e}")
                 public_result = False
-            
+
             try:
                 private_result = await self.bulk_delete_by_filter(
                     filter_expr=filter_expr,
                     collection_name=collection_name,
-                    milvus_instance=DBDocumentPermissionLevel.PRIVATE.value
+                    milvus_instance=getattr(settings, 'MILVUS_PRIVATE_HOST', 'milvus_private')
                 )
             except Exception as e:
                 logger.debug(f"Private instance delete failed (expected if not private): {e}")
@@ -737,161 +793,6 @@ class MilvusService:
         except Exception as e:
             logger.error(f"Error deleting document vectors: {e}")
             raise
-
-    async def json_path_search(
-        self,
-        collection_name: str,
-        milvus_instance: str,
-        json_path: str,
-        value: Any,
-        top_k: int = 10,
-        operator: str = "=="
-    ) -> List[Dict[str, Any]]:
-        """
-        Search using JSON path queries (Milvus 2.6 feature)
-        Example: json_path="metadata.category", value="hr", operator="=="
-        """
-        try:
-            await self.ensure_collection_exists(collection_name, milvus_instance)
-            client = self._get_client(milvus_instance)
-
-            filter_expr = f"metadata['{json_path}'] {operator} {repr(value)}"
-
-            search_results = client.search(
-                collection_name=collection_name,
-                data=[[0.0] * settings.EMBEDDING_DIMENSIONS],
-                limit=top_k,
-                search_params={"metric_type": settings.MILVUS_METRIC_TYPE},
-                output_fields=["text", "document_id", "department", "document_source", "metadata"],
-                filter=filter_expr
-            )
-
-            return self._process_search_results(search_results, 0.0, "json_path")
-
-        except Exception as e:
-            logger.error(f"JSON path search failed: {e}")
-            return []
-
-    async def add_dynamic_field(
-        self,
-        collection_name: str,
-        milvus_instance: str,
-        field_name: str,
-        field_value: Any,
-        filter_expr: str
-    ) -> bool:
-        """
-        Add dynamic field to existing documents (Milvus 2.6 feature)
-        Only works if dynamic schema is enabled
-        """
-        try:
-            if not settings.MILVUS_DYNAMIC_SCHEMA_ENABLED:
-                logger.warning("Dynamic schema is disabled in settings")
-                return False
-
-            client = self._get_client(milvus_instance)
-
-            update_data = {
-                f"metadata['{field_name}']": field_value
-            }
-
-            result = client.upsert(
-                collection_name=collection_name,
-                data=[update_data],
-                filter=filter_expr
-            )
-
-            logger.info(f"Added dynamic field '{field_name}' to documents matching: {filter_expr}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to add dynamic field: {e}")
-            return False
-
-    async def time_range_search(
-        self,
-        collection_name: str,
-        milvus_instance: str,
-        start_time: datetime,
-        end_time: Optional[datetime] = None,
-        top_k: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        Search documents within time range using timestamp field
-        """
-        try:
-            await self.ensure_collection_exists(collection_name, milvus_instance)
-            client = self._get_client(milvus_instance)
-
-            start_timestamp = int(start_time.timestamp() * 1000)
-            end_timestamp = int((end_time or datetime.now()).timestamp() * 1000)
-
-            filter_expr = f"created_at >= {start_timestamp} and created_at <= {end_timestamp}"
-
-            search_results = client.search(
-                collection_name=collection_name,
-                data=[[0.0] * settings.EMBEDDING_DIMENSIONS],
-                limit=top_k,
-                search_params={"metric_type": settings.MILVUS_METRIC_TYPE},
-                output_fields=["text", "document_id", "department", "document_source", "metadata", "created_at"],
-                filter=filter_expr
-            )
-
-            return self._process_search_results(search_results, 0.0, "time_range")
-
-        except Exception as e:
-            logger.error(f"Time range search failed: {e}")
-            return []
-
-    async def advanced_filter_search(
-        self,
-        collection_name: str,
-        milvus_instance: str,
-        filters: Dict[str, Any],
-        top_k: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        Advanced search with multiple filters including JSON paths
-        """
-        try:
-            filter_conditions = []
-
-            for key, value in filters.items():
-                if key.startswith("metadata."):
-                    json_path = key.replace("metadata.", "")
-                    filter_conditions.append(f"metadata['{json_path}'] == {repr(value)}")
-                elif key == "time_range":
-                    if isinstance(value, dict):
-                        start_time = value.get("start")
-                        end_time = value.get("end")
-                        if start_time and end_time:
-                            start_ts = int(start_time.timestamp() * 1000)
-                            end_ts = int(end_time.timestamp() * 1000)
-                            filter_conditions.append(f"created_at >= {start_ts} and created_at <= {end_ts}")
-                else:
-                    filter_conditions.append(f"{key} == {repr(value)}")
-
-            filter_expr = " and ".join(filter_conditions) if filter_conditions else None
-
-            return await self.search_documents(
-                query="",
-                collection_name=collection_name,
-                milvus_instance=milvus_instance,
-                top_k=top_k,
-                score_threshold=0.0,
-                filter_expr=filter_expr,
-                enable_hybrid_search=False
-            )
-
-        except Exception as e:
-            logger.error(f"Advanced filter search failed: {e}")
-            return []
-
-    def clear_cache(self):
-        """Clear collection existence cache"""
-        self.collection_cache.clear()
-        self.function_cache.clear()
-        logger.info("Cleared Milvus collection and function cache")
 
 
 milvus_service = MilvusService()

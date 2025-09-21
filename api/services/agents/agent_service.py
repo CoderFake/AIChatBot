@@ -13,13 +13,10 @@ from datetime import datetime
 import json
 
 from models.database.agent import Agent, AgentToolConfig
-from models.database.tenant import Department, Tenant
+from models.database.tenant import Department
 from models.database.tool import Tool, TenantToolConfig
 from utils.logging import get_logger
 from utils.datetime_utils import DateTimeManager
-
-from services.documents.document_service import DocumentService
-from services.storage.minio_service import MinioService
 
 logger = get_logger(__name__)
 
@@ -30,8 +27,9 @@ class AgentService:
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
         self._agent_cache: Dict[str, Dict[str, Any]] = {}
+        self._agents_structure_cache: Dict[str, Dict[str, Any]] = {} 
         self._cache_timestamp: Optional[datetime] = None
-        self._cache_ttl = 300 
+        self._cache_ttl = 1800
     
     def _is_cache_valid(self) -> bool:
         """Check if agent cache is still valid"""
@@ -158,233 +156,6 @@ class AgentService:
             logger.warning(f"Skip tenant allowed tools enforcement due to error: {e}")
             return None
 
-    async def create_department_with_agent(
-        self,
-        tenant_id: str,
-        department_name: str,
-        agent_name: str,
-        agent_description: str,
-        provider_id: Optional[str] = None,
-        model_id: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Create department and its agent together (transactional + side-effects)"""
-        try:
-            result = await self.db.execute(
-                select(Tenant).where(Tenant.id == tenant_id)
-            )
-            tenant = result.scalar_one_or_none()
-            
-            if not tenant:
-                logger.error(f"Tenant {tenant_id} not found")
-                return None
-            
-            department = Department(
-                tenant_id=tenant_id,
-                department_name=department_name
-            )
-            self.db.add(department)
-            await self.db.flush()
-            
-            agent = Agent(
-                agent_name=agent_name,
-                description=agent_description,
-                tenant_id=str(tenant.id),
-                department_id=str(department.id),
-                provider_id=provider_id,
-                model_id=model_id,
-                is_system=False,
-                is_enabled=True
-            )
-            self.db.add(agent)
-            await self.db.flush()
-
-            doc_service = DocumentService(self.db)
-            doc_meta = doc_service.create_department_root(
-                tenant_id=str(tenant.id),
-                department_id=str(department.id)
-            )
-            if not doc_meta or not doc_meta.get("document_root_id"):
-                raise RuntimeError("Failed to initialize document root/collections")
-
-            try:
-                minio = MinioService()  
-                bucket_path = f"{tenant.id}/{doc_meta['document_root_id']}"
-                if hasattr(minio, 'ensure_bucket'):
-                    minio.ensure_bucket(str(tenant.id))  
-                if hasattr(minio, 'put_object'):
-                    from io import BytesIO
-                    empty = BytesIO(b"")
-                    minio.put_object(str(tenant.id), f"{doc_meta['document_root_id']}/", empty, 0) 
-            except Exception as storage_exc:
-                logger.error(f"MinIO initialization failed: {storage_exc}")
-                raise
-
-            await self.db.flush()
-            self.invalidate_cache()
-            
-            logger.info(f"Created department '{department_name}' with agent '{agent_name}' and initialized storage")
-            
-            return {
-                "department": {
-                    "id": str(department.id),
-                    "name": department_name,
-                    "tenant_id": tenant_id
-                },
-                "agent": {
-                    "id": str(agent.id),
-                    "name": agent_name,
-                    "description": agent_description,
-                    "tenant_id": str(tenant.id),
-                    "department_id": str(department.id)
-                },
-                "document": doc_meta
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to create department with agent and storage init: {e}")
-            return None
-
-    async def get_departments(self, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get departments list, optionally filtered by tenant"""
-        try:
-            query = select(Department).options(selectinload(Department.tenant))
-            
-            if tenant_id:
-                query = query.where(Department.tenant_id == tenant_id)
-            
-            query = query.order_by(Department.department_name)
-            
-            result = await self.db.execute(query)
-            departments = result.scalars().all()
-            
-            result_list = []
-            for dept in departments:
-                agent_result = await self.db.execute(
-                    select(Agent).where(Agent.department_id == str(dept.id))
-                )
-                agents = agent_result.scalars().all()
-                agent_count = len(agents)
-                
-                result_list.append({
-                    "id": str(dept.id),
-                    "name": dept.department_name,
-                    "tenant_id": str(dept.tenant_id),
-                    "tenant_name": dept.tenant.tenant_name if dept.tenant else None,
-                    "agent_count": agent_count,
-                    "created_at": dept.created_at.isoformat() if dept.created_at else None
-                })
-            
-            return result_list
-            
-        except Exception as e:
-            logger.error(f"Failed to get departments: {e}")
-            return []
-
-    async def get_department_by_id(self, department_id: str) -> Optional[Dict[str, Any]]:
-        """Get department by ID with agent information"""
-        try:
-            result = await self.db.execute(
-                select(Department).where(Department.id == department_id)
-                .options(selectinload(Department.tenant))
-            )
-            department = result.scalar_one_or_none()
-            
-            if not department:
-                return None
-            
-            agent_result = await self.db.execute(
-                select(Agent).where(Agent.department_id == department_id)
-            )
-            agents = agent_result.scalars().all()
-            
-            agents_data = []
-            for agent in agents:
-                agents_data.append({
-                    "id": str(agent.id),
-                    "name": agent.agent_name,
-                    "description": agent.description,
-                    "is_enabled": agent.is_enabled,
-                    "is_system": agent.is_system
-                })
-            
-            return {
-                "id": str(department.id),
-                "name": department.department_name,
-                "tenant_id": str(department.tenant_id),
-                "tenant_name": department.tenant.tenant_name if department.tenant else None,
-                "agents": agents_data,
-                "created_at": department.created_at.isoformat() if department.created_at else None
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to get department {department_id}: {e}")
-            return None
-    
-    async def update_department(self, department_id: str, department_name: str) -> bool:
-        """Update department name"""
-        try:
-            stmt = select(Department).where(Department.id == department_id)
-            result = await self.db.execute(stmt)
-            department = result.scalars().first()
-            
-            if not department:
-                return False
-            
-            department.department_name = department_name
-            await self.db.commit()
-            
-            self.invalidate_cache()
-            
-            logger.info(f"Updated department {department_id} name to '{department_name}'")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to update department {department_id}: {e}")
-            await self.db.rollback()
-            return False
-    
-    async def delete_department(self, department_id: str, cascade: bool = True) -> bool:
-        """Delete department and optionally its agents"""
-        try:
-            stmt = select(Department).where(Department.id == department_id)
-            result = await self.db.execute(stmt)
-            department = result.scalars().first()
-            
-            if not department:
-                return False
-            
-            if cascade:
-                stmt = select(Agent).where(Agent.department_id == department_id)
-                result = await self.db.execute(stmt)
-                agents = result.scalars().all()
-                for agent in agents:
-                    stmt = select(AgentToolConfig).where(AgentToolConfig.agent_id == str(agent.id))
-                    result = await self.db.execute(stmt)
-                    configs = result.scalars().all()
-                    for config in configs:
-                        await self.db.delete(config)
-                    await self.db.delete(agent)
-            else:
-                stmt = select(Agent).where(Agent.department_id == department_id)
-                result = await self.db.execute(stmt)
-                agent_count = len(result.scalars().all())
-                if agent_count > 0:
-                    logger.error(f"Cannot delete department {department_id}: has {agent_count} agents")
-                    return False
-            
-            await self.db.delete(department)
-            await self.db.commit()
-            
-            self.invalidate_cache()
-            
-            logger.info(f"Deleted department {department_id} (cascade={cascade})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to delete department {department_id}: {e}")
-            await self.db.rollback()
-            return False
-    
     async def create_agent_for_existing_department(
         self,
         department_id: str,
@@ -440,7 +211,7 @@ class AgentService:
             result = await self.db.execute(
                 select(Agent)
                 .join(Department, Agent.department_id == Department.id)
-                .where(Agent.is_enabled == True)
+                .where(Agent.is_enabled.is_(True))
                 .options(
                     selectinload(Agent.department),
                     selectinload(Agent.provider),
@@ -460,26 +231,6 @@ class AgentService:
         
         return self._agent_cache.copy()
     
-    async def get_agents_for_selection(self) -> List[Dict[str, str]]:
-        """
-        Get agents list for Reflection + Semantic Router selection
-        Returns clean format with id, name, description for LLM processing
-        """
-        if not self._is_cache_valid():
-            await self._refresh_cache()
-        
-        agents_for_selection = []
-        
-        for agent_id, agent_data in self._agent_cache.items():
-            if agent_data.get("is_enabled"):
-                agents_for_selection.append({
-                    "id": agent_id,
-                    "name": agent_data.get("name", ""),
-                    "description": agent_data.get("description", "")
-                })
-        
-        return agents_for_selection
-    
     async def get_agent_by_id(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """Get specific agent by ID"""
         if not self._is_cache_valid():
@@ -497,90 +248,10 @@ class AgentService:
             if agent.get("department_id") == department_id
         }
 
-    async def get_agents_with_tools_for_user(
-        self,
-        user_id: str,
-        agent_ids: List[str],
-        tenant_id: str,
-        user_access_levels: List[str] = None
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Get agents with tools filtered by user permissions and agent access
-
-        Note: All provided agents are included, user permissions only filter tools access
-
-        Args:
-            user_id: User ID
-            agent_ids: List of Agent IDs to check (typically all tenant agents)
-            tenant_id: Tenant ID
-            user_access_levels: User's access levels (['public'], ['private'], ['public', 'private'])
-                                 Used to filter tools by access_level_override
-
-        Returns:
-            Dict of agents with their accessible tools (filtered by user permissions)
-        """
-        try:
-            from services.tools.tool_manager import tool_manager
-
-            available_agents = {
-                aid: self._agent_cache.get(aid)
-                for aid in agent_ids
-                if aid in self._agent_cache and self._agent_cache.get(aid) is not None
-            }
-
-            if user_access_levels is None:
-                user_access_levels = ["public"] 
-            accessible_tools = await tool_manager.get_tools_for_user(
-                user_id=user_id,
-                agent_ids=agent_ids,
-                tenant_id=tenant_id,
-                user_access_levels=user_access_levels
-            )
-
-            tool_lookup = {tool["tool_name"]: tool for tool in accessible_tools}
-
-            filtered_agents = {}
-
-            for agent_id, agent_info in available_agents.items():
-                if not agent_info.get("is_enabled", False):
-                    continue
-
-                agent_tools = agent_info.get("tools", [])
-
-                accessible_agent_tools = []
-                for tool in agent_tools:
-                    tool_name = tool.get("name")
-                    if tool_name in tool_lookup:
-                        accessible_tool = tool_lookup[tool_name]
-                        accessible_agent_tools.append({
-                            "name": tool_name,
-                            "description": accessible_tool.get("description", ""),
-                            "access_level": accessible_tool.get("access_level"),
-                            "category": accessible_tool.get("category")
-                        })
-
-                filtered_agents[agent_id] = {
-                    **agent_info,
-                    "tools": accessible_agent_tools,
-                    "accessible_tools_count": len(accessible_agent_tools)
-                }
-
-            logger.debug(f"User {user_id} has access to {len(filtered_agents)} agents with {len(accessible_tools)} tools")
-            return filtered_agents
-
-        except Exception as e:
-            logger.error(f"Failed to get agents with tools for user {user_id}: {e}")
-            return {}
-    
     async def get_agent_tools(self, agent_id: str) -> List[Dict[str, Any]]:
         """Get tools available for specific agent"""
         agent = await self.get_agent_by_id(agent_id)
         return agent.get("tools", []) if agent else []
-    
-    async def is_agent_enabled(self, agent_id: str) -> bool:
-        """Check if agent is enabled"""
-        agent = await self.get_agent_by_id(agent_id)
-        return agent.get("is_enabled", False) if agent else False
     
     async def get_agent_config(self, agent_id: str) -> Dict[str, Any]:
         """Get complete agent configuration from database"""
@@ -1333,12 +1004,13 @@ class AgentService:
 
         cache_key = f"agents_structure:{tenant_id}:{user_role}:{user_department_id or 'none'}"
 
-        cached_result = self._agent_cache.get(cache_key)
-        if cached_result and self._is_cache_valid():
-            logger.debug(f"Using cached agents structure for user role: {user_role}")
+        cached_result = self._agents_structure_cache.get(cache_key)
+        if cached_result:
+            logger.info(f"✅ Cache HIT: Using cached agents structure for user role: {user_role}, tenant: {tenant_id}")
             return cached_result
+        else:
+            logger.info(f"❌ Cache MISS: Building agents structure from database for user role: {user_role}, tenant_id: {tenant_id}, department_id: {user_department_id}")
 
-        logger.info(f"Building agents structure from database for user role: {user_role}, tenant_id: {tenant_id}, department_id: {user_department_id}")
 
         from models.database.agent import Agent, AgentToolConfig
         from models.database.tool import Tool
@@ -1451,7 +1123,7 @@ class AgentService:
             
             if agent_name not in agents:
                 agents[agent_name] = {
-                    "agent_name": row.agent_name,  # Keep original case
+                    "agent_name": row.agent_name, 
                     "desc": row.description or "",
                     "agent_id": agent_id,
                     "department": row.department_name or "",
@@ -1469,7 +1141,7 @@ class AgentService:
                 agents[agent_name]["tools"].append(tool_info)
 
         # Cache the result
-        self._agent_cache[cache_key] = agents
+        self._agents_structure_cache[cache_key] = agents
         logger.info(f"Cached agents structure for user role: {user_role} with {len(agents)} agents")
 
         return agents

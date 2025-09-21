@@ -31,6 +31,8 @@ class UpdateTenantRequest(BaseModel):
     sub_domain: Optional[str] = Field(None)
     locale: Optional[str] = Field(None)
     description: Optional[str] = Field(None)
+    allowed_providers: Optional[List[str]] = Field(None, description="List of provider names to allow for tenant")
+    allowed_tools: Optional[List[str]] = Field(None, description="List of tool IDs to enable for tenant")
 
 
 class UpdateWorkflowAgentRequest(BaseModel):
@@ -40,3 +42,16 @@ class UpdateWorkflowAgentRequest(BaseModel):
     provider_name: Optional[str] = Field(None)
     model_name: Optional[str] = Field(None)
     is_active: Optional[bool] = Field(None)
+
+
+
+class TenantSettingsRequest(BaseModel):
+    tenant_name: Optional[str] = None
+    description: Optional[str] = None
+    timezone: Optional[str] = None
+    locale: Optional[str] = None
+    bot_name: Optional[str] = None
+    chatbot_name: Optional[str] = None  
+    logo_url: Optional[str] = None         
+    branding: Optional[Dict[str, Any]] = None
+

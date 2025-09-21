@@ -8,7 +8,6 @@ from services.tenant.tenant_service import get_tenant_service
 from api.v1.middleware.middleware import (
     RequireOnlyMaintainer,
     RequireOnlyAdmin,
-    RequireAtLeastAdmin,
     RequireAdminOrDeptAdmin,
     RequireAtLeastDeptAdmin,
     RequireAtLeastDeptManager
@@ -19,7 +18,6 @@ from models.schemas.responses.tenant import (
     TenantListResponse,
     CreateTenantResponse,
     OperationResult,
-    TenantDetailResponse,
     TenantPublicInfoResponse,
 )
 from models.database.tenant import Department
@@ -28,7 +26,7 @@ router = APIRouter()
 
 
 @router.post("", response_model=CreateTenantResponse, summary="Create a new tenant with optional provider and tools setup")
-async def create_tenant_endpoint(
+async def create_tenant(
     payload: CreateTenantRequest,
     maintainer: dict = Depends(RequireOnlyMaintainer()),
     db: AsyncSession = Depends(get_db),
@@ -37,7 +35,7 @@ async def create_tenant_endpoint(
     try:
         created_by = str(maintainer.get("user_id")) if isinstance(maintainer, dict) else "system"
 
-        result = await service.create_tenant_with_setup(
+        result = await service.create_tenant(
             tenant_name=payload.tenant_name,
             timezone=payload.timezone,
             locale=payload.locale or "en_US",
@@ -54,7 +52,7 @@ async def create_tenant_endpoint(
 
 
 @router.get("", response_model=TenantListResponse, summary="List tenants")
-async def list_tenants_endpoint(
+async def list_tenants(
     page: int = 1,
     limit: int = 20,
     is_active: bool | None = None,
@@ -87,7 +85,7 @@ async def list_tenants_endpoint(
 
 
 @router.get("/{tenant_id}/public-info", response_model=TenantPublicInfoResponse, summary="Get public tenant info (no authentication required)")
-async def get_tenant_public_info_endpoint(
+async def get_tenant_public(
     tenant_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> TenantPublicInfoResponse:
@@ -108,43 +106,24 @@ async def get_tenant_public_info_endpoint(
     )
 
 
-@router.get("/{tenant_id}", response_model=TenantDetailResponse, summary="Get tenant detail")
-async def get_tenant_endpoint(
+@router.get("/{tenant_id}", summary="Get tenant detail with allowed providers and tools")
+async def get_tenant(
     tenant_id: str,
-    admin: dict = Depends(RequireAtLeastAdmin()),
     db: AsyncSession = Depends(get_db),
 ):
-    service = await get_tenant_service(db)
-    data = await service.get_tenant_by_id(tenant_id)
-    if not data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
-    settings_dict = data.get("settings") or {}
-    return TenantDetailResponse(
-        id=data["id"],
-        tenant_id=data.get("tenant_id") or data["id"],
-        tenant_name=data["tenant_name"],
-        timezone=data["timezone"],
-        locale=data["locale"],
-        sub_domain=data.get("sub_domain"),
-        is_active=data["is_active"],
-        description=settings_dict.get("description") if isinstance(settings_dict, dict) else None,
-        created_at=data["created_at"],
-        updated_at=data["updated_at"],
-        status=data.get("status"),
-        admin_count=data.get("admin_count"),
-        user_count=data.get("user_count"),
-        is_deleted=data.get("is_deleted"),
-        deleted_at=data.get("deleted_at"),
-        version=data.get("version"),
-        settings=settings_dict,
-    )
+    try:
+        service = await get_tenant_service(db)
+        data = await service.get_tenant_with_config(tenant_id)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.put("/{tenant_id}", response_model=OperationResult, summary="Update tenant")
-async def update_tenant_endpoint(
+async def update_tenant(
     tenant_id: str,
     payload: UpdateTenantRequest,
-    admin: dict = Depends(RequireOnlyAdmin()),
+    admin: dict = Depends(RequireOnlyMaintainer()),
     db: AsyncSession = Depends(get_db),
 ):
     service = await get_tenant_service(db)
@@ -155,16 +134,21 @@ async def update_tenant_endpoint(
 
 
 @router.delete("/{tenant_id}", response_model=OperationResult, summary="Soft delete tenant")
-async def delete_tenant_endpoint(
+async def delete_tenant(
     tenant_id: str,
     maintainer: dict = Depends(RequireOnlyMaintainer()),
     db: AsyncSession = Depends(get_db),
 ):
     service = await get_tenant_service(db)
-    ok = await service.update_tenant(tenant_id, updates={"is_active": False}, updated_by=str(maintainer.get("user_id")) if isinstance(maintainer, dict) else "system")
-    if not ok:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Delete failed")
-    return OperationResult(success=True)
+    try:
+        await service.update_tenant(
+            tenant_id=tenant_id,
+            updates={"is_active": False},
+            updated_by=str(maintainer.get("user_id")) if isinstance(maintainer, dict) else "system"
+        )
+        return OperationResult(success=True)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Delete failed: {str(e)}")
 
 
 @router.post("/configure-provider", summary="Configure provider for tenant")
@@ -344,7 +328,7 @@ async def invite_department_admins(
         if not department:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
-        service = get_tenant_service(db)
+        service = await get_tenant_service(db)
         invite_service = await service.get_invite_service()
 
         invite_links = await invite_service.invite_department_admins(
@@ -381,7 +365,7 @@ async def invite_department_managers(
         if not department:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
-        service = get_tenant_service(db)
+        service = await get_tenant_service(db)
         invite_service = await service.get_invite_service()
 
         invite_links = await invite_service.invite_department_managers(
@@ -418,7 +402,7 @@ async def invite_users(
         if not department:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
-        service = get_tenant_service(db)
+        service = await get_tenant_service(db)
         invite_service = await service.get_invite_service()
 
         invite_links = await invite_service.invite_users(
@@ -436,3 +420,9 @@ async def invite_users(
 
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+
+
+
+

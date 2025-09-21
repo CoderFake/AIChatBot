@@ -30,6 +30,8 @@ export interface Tenant {
   updated_at: string
   admin_count?: number
   user_count?: number
+  allowed_providers?: string[]
+  allowed_tools?: string[]
   settings?: {
     chatbot?: {
       name?: string
@@ -39,9 +41,9 @@ export interface Tenant {
     branding?: {
       logo_url?: string
       primary_color?: string
-      
+
     }
-    
+
   }
 }
 
@@ -209,6 +211,48 @@ export interface CreateTenantRequest {
   description?: string
   allowed_providers?: string[]
   allowed_tools?: string[]
+}
+
+export interface UpdateTenantRequest {
+  tenant_name?: string
+  timezone?: string
+  locale?: string
+  is_active?: boolean
+  sub_domain?: string
+  description?: string
+  allowed_providers?: string[]
+  allowed_tools?: string[]
+}
+
+export interface UpdateTenantResponse {
+  tenant_id: string
+  tenant_name?: string
+  timezone?: string
+  locale?: string
+  sub_domain?: string
+  description?: string
+  updated_at?: string
+  setup_results?: {
+    allowed_providers?: {
+      tenant_id: string
+      allowed_providers: string[]
+      created_configs: Array<{
+        provider_name: string
+        config_id: string
+        action: "created" | "updated"
+      }>
+      updated_count: number
+    }
+    tools_setup?: {
+      tenant_id: string
+      enabled_tools: Array<{
+        tool_name: string
+        config_id: string
+        action: "created" | "updated"
+      }>
+      total_updated: number
+    }
+  }
 }
 
 export interface InviteUsersRequest {

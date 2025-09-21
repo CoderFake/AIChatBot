@@ -29,11 +29,66 @@ class BaseLLMProvider(ABC):
         """Initialize provider"""
         pass
     
-    @abstractmethod
+
+    def __reduce__(self):
+        """Support for pickle/msgpack serialization using reduce protocol"""
+        state = {
+            'provider_name': self.name,
+            'config': {
+                'name': self.config.name,
+                'default_model': self.config.default_model,
+                'config': getattr(self.config, 'config', {}),
+                'enabled': getattr(self.config, 'enabled', True)
+            },
+            'api_keys': getattr(self, '_api_keys', []),
+            'runtime_api_keys': getattr(self, '_runtime_api_keys', []),
+            'initialized': self._initialized
+        }
+        return (self._recreate_provider, (state,))
+
+    @classmethod
+    def _recreate_provider(cls, state):
+        """Recreate provider from serialized state"""
+        from config.settings import LLMProviderConfig
+
+        config_data = state['config']
+        config = LLMProviderConfig(
+            name=config_data['name'],
+            default_model=config_data['default_model'],
+            config=config_data.get('config', {}),
+            enabled=config_data.get('enabled', True)
+        )
+
+        provider_class = cls._get_provider_class(state['provider_name'])
+        provider = provider_class(config)
+
+        provider.name = state['provider_name']
+        provider._api_keys = state.get('api_keys', [])
+        provider._runtime_api_keys = state.get('runtime_api_keys', [])
+        provider._initialized = state.get('initialized', False)
+
+        return provider
+
+    @classmethod
+    def _get_provider_class(cls, provider_name):
+        """Get provider class by name"""
+        from services.llm.provider_manager import LLMProviderManager
+        return LLMProviderManager.PROVIDER_CLASSES.get(provider_name, cls)
+
     async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Async invoke LLM - returns LLMResponse or AsyncGenerator based on markdown parameter"""
+
+        if hasattr(self, '_runtime_api_keys') and self._runtime_api_keys:
+            if 'api_keys' not in kwargs:
+                kwargs['api_keys'] = self._runtime_api_keys
+
+        return await self._invoke_llm(prompt, model, **kwargs)
+
+    @abstractmethod
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+        """Internal LLM invocation - to be overridden by subclasses"""
         pass
-    
+
     @abstractmethod
     async def health_check(self) -> bool:
         """Check provider health"""
@@ -54,30 +109,7 @@ class GeminiProvider(BaseLLMProvider):
         try:
             if self._api_keys:
                 import google.generativeai as genai
-                
                 genai.configure(api_key=self._api_keys[0])
-                try:
-                    test_model = genai.GenerativeModel(
-                        model_name=self.config.default_model,
-                        generation_config=genai.GenerationConfig(
-                            response_mime_type="application/json",
-                            response_schema={
-                                "type": "object",
-                                "properties": {
-                                    "response": {"type": "string"}
-                                }
-                            }
-                        )
-                    )
-                    
-                    await asyncio.wait_for(
-                        test_model.generate_content_async("Return JSON: {'response': 'test'}"),
-                        timeout=10.0
-                    )
-                    logger.debug("Gemini provider test call successful")
-
-                except Exception as e:
-                    logger.warning(f"Gemini provider test call failed: {e} - proceeding anyway")
 
             self._initialized = True
             logger.info(f"Gemini provider initialized with {len(self._api_keys)} API keys")
@@ -87,7 +119,7 @@ class GeminiProvider(BaseLLMProvider):
             logger.error(f"Failed to initialize Gemini provider: {e}")
             return False
     
-    async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Invoke Gemini API with streaming support based on markdown parameter"""
         if not self._initialized:
             raise RuntimeError("Gemini provider not initialized")
@@ -98,8 +130,11 @@ class GeminiProvider(BaseLLMProvider):
         runtime_keys = kwargs.get("api_keys")
         if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
             keys = [k for k in runtime_keys if k]
+            current_key_index = 0  
         else:
             keys = self._api_keys
+            current_key_index = self._current_key_index
+        
         if not keys:
             raise RuntimeError("No API keys provided for Gemini at runtime")
         max_retries = len(keys)
@@ -123,7 +158,7 @@ class GeminiProvider(BaseLLMProvider):
         
         for attempt in range(max_retries):
             try:
-                current_key = keys[self._current_key_index]
+                current_key = keys[current_key_index]
                 genai.configure(api_key=current_key)
                 
                 llm_model = genai.GenerativeModel(
@@ -137,6 +172,21 @@ class GeminiProvider(BaseLLMProvider):
                         timeout=30.0
                     )
                     
+                    if not response.parts or not any(part.text for part in response.parts if hasattr(part, 'text')):
+                        finish_reason = None
+                        if hasattr(response, 'candidates') and response.candidates:
+                            finish_reason = getattr(response.candidates[0], 'finish_reason', None)
+                        
+                        if finish_reason == 2:  # SAFETY
+                            logger.warning("Gemini response blocked by safety filter for session")
+                            raise RuntimeError("Content blocked by Gemini safety filter")
+                        elif finish_reason == 3:  # RECITATION  
+                            logger.warning("Gemini response blocked due to recitation")
+                            raise RuntimeError("Content blocked by Gemini recitation filter")
+                        else:
+                            logger.warning(f"Gemini returned empty response with finish_reason: {finish_reason}")
+                            raise RuntimeError("Gemini returned empty response")
+                    
                     content = response.text
                     
                     if response_format == "json_object" or kwargs.get("json_mode", False):
@@ -145,12 +195,19 @@ class GeminiProvider(BaseLLMProvider):
                         except json.JSONDecodeError:
                             content = json.dumps({"response": content})
                     
+                    # Update global index only if using instance keys
+                    if runtime_keys:
+                        metadata_key_index = current_key_index
+                    else:
+                        self._current_key_index = current_key_index
+                        metadata_key_index = current_key_index
+                    
                     return LLMResponse(
                         content=content,
                         model=model_name,
                         provider="gemini",
                         usage=getattr(response, "usage_metadata", None),
-                        metadata={"api_key_index": self._current_key_index}
+                        metadata={"api_key_index": metadata_key_index}
                     )
 
                 except Exception as e:
@@ -162,12 +219,12 @@ class GeminiProvider(BaseLLMProvider):
                         raise
 
             except asyncio.TimeoutError:
-                logger.warning(f"Gemini API call timeout with key {self._current_key_index}")
-                self._current_key_index = (self._current_key_index + 1) % len(keys)
+                logger.warning(f"Gemini API call timeout with key {current_key_index}")
+                current_key_index = (current_key_index + 1) % len(keys)
 
             except Exception as e:
-                logger.warning(f"Gemini API call failed with key {self._current_key_index}: {e}")
-                self._current_key_index = (self._current_key_index + 1) % len(keys)
+                logger.warning(f"Gemini API call failed with key {current_key_index}: {e}")
+                current_key_index = (current_key_index + 1) % len(keys)
 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Gemini API keys failed: {e}")
@@ -178,7 +235,8 @@ class GeminiProvider(BaseLLMProvider):
         """Stream Gemini response chunks"""
         import google.generativeai as genai
         
-        current_key = keys[self._current_key_index]
+        current_key_index = 0  # Always start from 0 for streaming
+        current_key = keys[current_key_index]
         genai.configure(api_key=current_key)
         
         llm_model = genai.GenerativeModel(
@@ -226,7 +284,6 @@ class OllamaProvider(BaseLLMProvider):
         base_url = config.config.get("base_url") or "http://ollama:11434"
         if base_url == "http://ollama:11434":
             base_url = "http://host.docker.internal:11434"
-            print(f"Docker environment detected, using {base_url} for Ollama")
         if not base_url.startswith(("http://", "https://")):
             base_url = f"http://{base_url}"
         self._base_url = base_url.rstrip("/")
@@ -250,7 +307,7 @@ class OllamaProvider(BaseLLMProvider):
             logger.error(f"Failed to initialize Ollama provider: {e}")
             return False
 
-    async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Invoke Ollama with streaming support based on markdown parameter"""
         if not self._initialized:
             raise RuntimeError("Ollama provider not initialized")
@@ -280,11 +337,9 @@ class OllamaProvider(BaseLLMProvider):
             if kwargs.get(param) is not None:
                 kwargs[param] = kwargs[param]
 
-        # Nếu có tham số markdown, trả về streaming generator
         if markdown:
             return self._stream_response(prompt, model_name, options, response_format, kwargs)
         
-        # Không có markdown, trả về LLMResponse như cũ
         payload = {
             "model": model_name,
             "prompt": prompt,
@@ -421,21 +476,11 @@ class OpenAIProvider(BaseLLMProvider):
         try:
             if self._api_keys:
                 from openai import AsyncOpenAI
-                
+
                 self._client = AsyncOpenAI(
                     api_key=self._api_keys[0],
                     base_url=self._base_url
                 )
-                
-                try:
-                    response = await self._client.chat.completions.create(
-                        model=self.config.default_model,
-                        messages=[{"role": "user", "content": "Test"}],
-                        max_tokens=10
-                    )
-                    logger.debug("OpenAI provider test call successful")
-                except Exception as e:
-                    logger.warning(f"OpenAI provider test call failed: {e} - proceeding anyway")
             
             self._initialized = True
             logger.info(f"OpenAI provider initialized with {len(self._api_keys)} API keys")
@@ -445,7 +490,7 @@ class OpenAIProvider(BaseLLMProvider):
             logger.error(f"Failed to initialize OpenAI provider: {e}")
             return False
     
-    async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Invoke OpenAI API with streaming support based on markdown parameter"""
         if not self._initialized:
             raise RuntimeError("OpenAI provider not initialized")
@@ -456,8 +501,11 @@ class OpenAIProvider(BaseLLMProvider):
         runtime_keys = kwargs.get("api_keys")
         if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
             keys = [k for k in runtime_keys if k]
+            current_key_index = 0  # Reset index for runtime keys
         else:
             keys = self._api_keys
+            current_key_index = self._current_key_index
+        
         if not keys:
             raise RuntimeError("No API keys provided for OpenAI at runtime")
         max_retries = len(keys)
@@ -465,14 +513,12 @@ class OpenAIProvider(BaseLLMProvider):
         temperature = kwargs.get("temperature")
         markdown = kwargs.get("markdown", False)
         
-        # Nếu có tham số markdown, trả về streaming generator
         if markdown:
             return self._stream_response(prompt, model_name, keys, temperature, kwargs)
         
-        # Không có markdown, trả về LLMResponse như cũ
         for attempt in range(max_retries):
             try:
-                current_key = keys[self._current_key_index]
+                current_key = keys[current_key_index]
                 client = AsyncOpenAI(
                     api_key=current_key,
                     base_url=self._base_url
@@ -494,17 +540,24 @@ class OpenAIProvider(BaseLLMProvider):
                 response = await client.chat.completions.create(**request_params)
                 content = response.choices[0].message.content
                 
+                # Update global index only if using instance keys  
+                if runtime_keys:
+                    metadata_key_index = current_key_index
+                else:
+                    self._current_key_index = current_key_index
+                    metadata_key_index = current_key_index
+                
                 return LLMResponse(
                     content=content,
                     model=model_name,
                     provider="openai",
                     usage=response.usage.model_dump() if response.usage else None,
-                    metadata={"api_key_index": self._current_key_index}
+                    metadata={"api_key_index": metadata_key_index}
                 )
                 
             except Exception as e:
-                logger.warning(f"OpenAI API call failed with key {self._current_key_index}: {e}")
-                self._current_key_index = (self._current_key_index + 1) % len(keys)
+                logger.warning(f"OpenAI API call failed with key {current_key_index}: {e}")
+                current_key_index = (current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All OpenAI API keys failed: {e}")
@@ -515,7 +568,8 @@ class OpenAIProvider(BaseLLMProvider):
         """Stream OpenAI response chunks"""
         from openai import AsyncOpenAI
         
-        current_key = keys[self._current_key_index]
+        current_key_index = 0  # Always start from 0 for streaming
+        current_key = keys[current_key_index]
         client = AsyncOpenAI(
             api_key=current_key,
             base_url=self._base_url
@@ -569,21 +623,8 @@ class MistralProvider(BaseLLMProvider):
         try:
             if self._api_keys:
                 from mistralai import Mistral
-                
+
                 self._client = Mistral(api_key=self._api_keys[0])
-                
-                try:
-                    response = await asyncio.wait_for(
-                        self._client.chat.complete_async(
-                            model=self.config.default_model,
-                            messages=[{"role": "user", "content": "Test"}],
-                            max_tokens=10
-                        ),
-                        timeout=10.0
-                    )
-                    logger.debug("Mistral provider test call successful")
-                except Exception as e:
-                    logger.warning(f"Mistral provider test call failed: {e} - proceeding anyway")
             
             self._initialized = True
             logger.info(f"Mistral provider initialized with {len(self._api_keys)} API keys")
@@ -593,7 +634,7 @@ class MistralProvider(BaseLLMProvider):
             logger.error(f"Failed to initialize Mistral provider: {e}")
             return False
     
-    async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Invoke Mistral API with streaming support based on markdown parameter"""
         if not self._initialized:
             raise RuntimeError("Mistral provider not initialized")
@@ -604,8 +645,11 @@ class MistralProvider(BaseLLMProvider):
         runtime_keys = kwargs.get("api_keys")
         if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
             keys = [k for k in runtime_keys if k]
+            current_key_index = 0  # Reset index for runtime keys
         else:
             keys = self._api_keys
+            current_key_index = self._current_key_index
+        
         if not keys:
             raise RuntimeError("No API keys provided for Mistral at runtime")
         max_retries = len(keys)
@@ -617,14 +661,12 @@ class MistralProvider(BaseLLMProvider):
             if not any(word in prompt.lower() for word in ["json", "format", "response_format"]):
                 final_prompt = f"{prompt}\n\nPlease respond in valid JSON format."
         
-        # Nếu có tham số markdown, trả về streaming generator
         if markdown:
             return self._stream_response(final_prompt, model_name, keys, kwargs)
         
-        # Không có markdown, trả về LLMResponse như cũ
         for attempt in range(max_retries):
             try:
-                current_key = keys[self._current_key_index]
+                current_key = keys[current_key_index]
                 client = Mistral(api_key=current_key)
                 
                 response = await asyncio.wait_for(
@@ -645,17 +687,24 @@ class MistralProvider(BaseLLMProvider):
                     except json.JSONDecodeError:
                         content = json.dumps({"response": content})
                 
+                # Update global index only if using instance keys
+                if runtime_keys:
+                    metadata_key_index = current_key_index
+                else:
+                    self._current_key_index = current_key_index
+                    metadata_key_index = current_key_index
+                
                 return LLMResponse(
                     content=content,
                     model=model_name,
                     provider="mistral",
                     usage=response.usage.model_dump() if response.usage else None,
-                    metadata={"api_key_index": self._current_key_index}
+                    metadata={"api_key_index": metadata_key_index}
                 )
                 
             except Exception as e:
-                logger.warning(f"Mistral API call failed with key {self._current_key_index}: {e}")
-                self._current_key_index = (self._current_key_index + 1) % len(keys)
+                logger.warning(f"Mistral API call failed with key {current_key_index}: {e}")
+                current_key_index = (current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Mistral API keys failed: {e}")
@@ -666,7 +715,8 @@ class MistralProvider(BaseLLMProvider):
         """Stream Mistral response chunks"""
         from mistralai import Mistral
         
-        current_key = keys[self._current_key_index]
+        current_key_index = 0  # Always start from 0 for streaming
+        current_key = keys[current_key_index]
         client = Mistral(api_key=current_key)
         
         try:
@@ -711,18 +761,8 @@ class AnthropicProvider(BaseLLMProvider):
         try:
             if self._api_keys:
                 from anthropic import AsyncAnthropic
-                
+
                 self._client = AsyncAnthropic(api_key=self._api_keys[0])
-                
-                try:
-                    response = await self._client.messages.create(
-                        model=self.config.default_model,
-                        max_tokens=10,
-                        messages=[{"role": "user", "content": "Test"}]
-                    )
-                    logger.debug("Anthropic provider test call successful")
-                except Exception as e:
-                    logger.warning(f"Anthropic provider test call failed: {e} - proceeding anyway")
             
             self._initialized = True
             logger.info(f"Anthropic provider initialized with {len(self._api_keys)} API keys")
@@ -732,7 +772,7 @@ class AnthropicProvider(BaseLLMProvider):
             logger.error(f"Failed to initialize Anthropic provider: {e}")
             return False
     
-    async def ainvoke(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
+    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         """Invoke Anthropic Claude API with streaming support based on markdown parameter"""
         if not self._initialized:
             raise RuntimeError("Anthropic provider not initialized")
@@ -743,8 +783,11 @@ class AnthropicProvider(BaseLLMProvider):
         runtime_keys = kwargs.get("api_keys")
         if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
             keys = [k for k in runtime_keys if k]
+            current_key_index = 0  # Reset index for runtime keys
         else:
             keys = self._api_keys
+            current_key_index = self._current_key_index
+        
         if not keys:
             raise RuntimeError("No API keys provided for Anthropic at runtime")
         max_retries = len(keys)
@@ -756,14 +799,12 @@ class AnthropicProvider(BaseLLMProvider):
             if not any(word in prompt.lower() for word in ["json", "format", "response_format"]):
                 final_prompt = f"{prompt}\n\nPlease respond in valid JSON format only."
         
-        # Nếu có tham số markdown, trả về streaming generator
         if markdown:
             return self._stream_response(final_prompt, model_name, keys, kwargs)
         
-        # Không có markdown, trả về LLMResponse như cũ
         for attempt in range(max_retries):
             try:
-                current_key = keys[self._current_key_index]
+                current_key = keys[current_key_index]
                 client = AsyncAnthropic(api_key=current_key)
                 
                 response = await client.messages.create(
@@ -781,17 +822,24 @@ class AnthropicProvider(BaseLLMProvider):
                     except json.JSONDecodeError:
                         content = json.dumps({"response": content})
                 
+                # Update global index only if using instance keys
+                if runtime_keys:
+                    metadata_key_index = current_key_index
+                else:
+                    self._current_key_index = current_key_index
+                    metadata_key_index = current_key_index
+                
                 return LLMResponse(
                     content=content,
                     model=model_name,
                     provider="anthropic",
                     usage=response.usage.model_dump() if response.usage else None,
-                    metadata={"api_key_index": self._current_key_index}
+                    metadata={"api_key_index": metadata_key_index}
                 )
                 
             except Exception as e:
-                logger.warning(f"Anthropic API call failed with key {self._current_key_index}: {e}")
-                self._current_key_index = (self._current_key_index + 1) % len(keys)
+                logger.warning(f"Anthropic API call failed with key {current_key_index}: {e}")
+                current_key_index = (current_key_index + 1) % len(keys)
                 
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Anthropic API keys failed: {e}")
@@ -802,7 +850,8 @@ class AnthropicProvider(BaseLLMProvider):
         """Stream Anthropic response chunks"""
         from anthropic import AsyncAnthropic
         
-        current_key = keys[self._current_key_index]
+        current_key_index = 0  # Always start from 0 for streaming
+        current_key = keys[current_key_index]
         client = AsyncAnthropic(api_key=current_key)
         
         try:
@@ -840,213 +889,57 @@ class LLMProviderManager:
         "anthropic": AnthropicProvider
     }
     
-    def __init__(self, db_session=None):
+    def __init__(self):
         self.settings = get_settings()
         self._providers: Dict[str, BaseLLMProvider] = {}
         self._initialized = False
-        self._db_session = db_session
     
-    async def initialize(self, db_session=None):
-        """Initialize enabled providers - DATABASE-FIRST approach"""
+    async def initialize(self):
+        """Initialize provider manager by loading and initializing all providers at startup"""
         if self._initialized:
             return
 
-        try:
-            if db_session is not None:
-                self._db_session = db_session
-            
-            provider_configs = await self._load_providers_from_database()
-            
-            if not provider_configs:
-                logger.warning("No providers in database, using registry fallback")
-                provider_configs = await self._load_providers_from_registry_fallback()
-            
-            logger.info(f"Found {len(provider_configs)} provider configurations")
-            
-            initialized_count = 0
-            for provider_name, config in provider_configs.items():
-                if config.get("is_enabled", False):
-                    success = await self._initialize_provider(provider_name, config)
-                    if success:
-                        initialized_count += 1
-            
-            self._initialized = True
-            logger.info(f"LLM Provider Manager initialized with {initialized_count}/{len(provider_configs)} providers: {list(self._providers.keys())}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM Provider Manager: {e}")
-            raise
-    
-    async def _load_providers_from_database(self) -> Dict[str, Dict[str, Any]]:
-        """Load provider configurations from database"""
-        try:
-            if not self._db_session:
-                return {}
-            
-            from sqlalchemy import select
-            from models.database.provider import Provider, ProviderModel
-            
-            result = await self._db_session.execute(
-                select(Provider, ProviderModel)
-                .join(ProviderModel, ProviderModel.provider_id == Provider.id, isouter=True)
-            )
-            rows = result.all()
-            provider_map: Dict[str, Dict[str, Any]] = {}
-            models_map: Dict[str, List[str]] = {}
-            
-            for provider, prov_model in rows:
-                key = str(provider.id)
-                if key not in provider_map:
-                    provider_map[key] = {
-                        "name": provider.provider_name,
-                        "is_enabled": provider.is_enabled,
-                        "config": provider.base_config or {},
-                        "models": [],
-                        "default_model": "",
-                        "source": "database"
-                    }
-                    models_map[key] = []
-                if prov_model and prov_model.model_name:
-                    models_map[key].append(prov_model.model_name)
-            
-            provider_configs: Dict[str, Dict[str, Any]] = {}
-            for key, pdata in provider_map.items():
-                model_names = models_map.get(key, [])
-                pdata["models"] = model_names
-                default_model = ""
-                if model_names:
-                    default_model = model_names[0]
-                pdata["default_model"] = default_model
-                provider_configs[pdata["name"]] = pdata
-            
-            logger.info(f"Loaded {len(provider_configs)} providers from database")
-            return provider_configs
-            
-        except Exception as e:
-            logger.error(f"Failed to load providers from database: {e}")
-            return {}
-    
-    async def _load_providers_from_registry_fallback(self) -> Dict[str, Dict[str, Any]]:
-        """Fallback: Load providers from registry + settings"""
-        try:
-            from services.llm.provider_registry import provider_registry
-            
-            registry_providers = provider_registry.get_all_providers()
-            provider_configs = {}
-            
-            for provider_name, registry_def in registry_providers.items():
-                settings_config = self.settings.llm_providers.get(provider_name)
-                is_enabled = settings_config and settings_config.enabled if settings_config else False
-                
-                provider_configs[provider_name] = {
-                    "name": provider_name,
-                    "display_name": registry_def["display_name"],
-                    "description": registry_def["description"],
-                    "is_enabled": is_enabled,
-                    "models": registry_def["models"],
-                    "default_model": registry_def["default_model"],
-                    "config": {
-                        **registry_def["provider_config"],
-                        **(settings_config.config if settings_config else {})
-                    },
-                    "source": "registry_fallback"
-                }
-            
-            logger.warning(f"Loaded {len(provider_configs)} providers from registry fallback")
-            return provider_configs
-            
-        except Exception as e:
-            logger.error(f"Registry fallback failed: {e}")
-            return {}
-    
-    def _convert_to_llm_provider_config(self, config: Dict[str, Any]) -> LLMProviderConfig:
-        """Convert config dict to LLMProviderConfig"""
-        return LLMProviderConfig(
-            name=config["name"],
-            enabled=config.get("is_enabled", False),
-            models=config.get("models", []),
-            default_model=config.get("default_model", ""),
-            config=config.get("config", {})
-        )
-    
-    async def _initialize_provider(self, provider_name: str, config: Dict[str, Any] = None) -> bool:
-        """Initialize specific provider from config"""
-        try:
-            if config is None:
-                provider_config = self.settings.llm_providers.get(provider_name)
-                if not provider_config or not provider_config.enabled:
-                    logger.info(f"Provider {provider_name} disabled or not configured")
-                    return False
-                llm_config = provider_config
-            else:
-                if not config.get("is_enabled", False):
-                    logger.info(f"Provider {provider_name} is disabled")
-                    return False
-                llm_config = self._convert_to_llm_provider_config(config)
-            
-            provider_class = self.PROVIDER_CLASSES.get(provider_name)
-            if not provider_class:
-                logger.warning(f"Unknown provider type: {provider_name}. Available: {list(self.PROVIDER_CLASSES.keys())}")
-                return False
-            
-            provider = provider_class(llm_config)
-            
-            success = await provider.initialize()
-            
-            if success:
-                self._providers[provider_name] = provider
-                source = config.get("source", "settings") if config else "settings"
-                logger.info(f"Provider {provider_name} initialized successfully ({source})")
-                return True
-            else:
-                logger.error(f"Failed to initialize provider {provider_name}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error initializing provider {provider_name}: {e}")
-            return False
+        for provider_name, provider_config in self.settings.llm_providers.items():
+            if provider_config.enabled:
+                try:
+                    provider_class = self.PROVIDER_CLASSES.get(provider_name)
+                    if provider_class:
+                        provider = provider_class(provider_config)
+                        success = await provider.initialize()
+                        if success:
+                            self._providers[provider_name] = provider
+                            logger.info(f"Initialized provider: {provider_name}")
+                        else:
+                            logger.warning(f"Failed to initialize provider: {provider_name}")
+                    else:
+                        logger.warning(f"Unknown provider type: {provider_name}")
+                except Exception as e:
+                    logger.error(f"Failed to create/initialize provider {provider_name}: {e}")
+
+        self._initialized = True
+        logger.info(f"LLM Provider Manager initialized with {len(self._providers)} providers")
+
     
     def get_supported_providers(self) -> List[str]:
         """Get list of all supported provider types"""
         return list(self.PROVIDER_CLASSES.keys())
     
-    def validate_provider_configs(self) -> Dict[str, List[str]]:
-        """Validate all provider configurations"""
-        validation_results = {}
-        
-        for provider_name, provider_config in self.settings.llm_providers.items():
-            issues = []
-            
-            if provider_name not in self.PROVIDER_CLASSES:
-                issues.append(f"Unsupported provider type: {provider_name}")
-            
-            config = provider_config.config
-            if provider_name == "ollama":
-                if not config.get("base_url"):
-                    issues.append("Missing base_url for Ollama")
-            
-            if not provider_config.models:
-                issues.append("No models configured")
-            
-            if not provider_config.default_model:
-                issues.append("No default model specified")
-            
-            validation_results[provider_name] = issues
-        
-        return validation_results
     
     async def get_provider(self, provider_name: Optional[str] = None) -> BaseLLMProvider:
-        """Get LLM provider instance"""
+        """Get LLM provider instance (all providers are lazy loaded at startup)"""
         if not self._initialized:
             await self.initialize()
-        
-        if not self._providers:
-            raise RuntimeError("No LLM providers available")
-        
-        if provider_name and provider_name in self._providers:
-            return self._providers[provider_name]
-        else:
-            return next(iter(self._providers.values()))
+
+        if not provider_name:
+            enabled_providers = [name for name, config in self.settings.llm_providers.items() if config.enabled]
+            if not enabled_providers:
+                raise RuntimeError("No enabled LLM providers found in settings")
+            provider_name = enabled_providers[0]
+
+        if provider_name not in self._providers:
+            raise RuntimeError(f"Provider {provider_name} not found. Available providers: {list(self._providers.keys())}")
+
+        return self._providers[provider_name]
     
     async def health_check_all(self) -> Dict[str, Dict[str, Any]]:
         """Check health of all providers with detailed status"""
@@ -1076,182 +969,3 @@ class LLMProviderManager:
     def get_available_providers(self) -> List[str]:
         """Get list of available (initialized) providers"""
         return list(self._providers.keys())
-    
-    def get_provider_summary(self) -> Dict[str, Any]:
-        """Get summary of all provider configurations"""
-        return {
-            "supported": self.get_supported_providers(),
-            "configured": list(self.settings.llm_providers.keys()),
-            "enabled": self.settings.get_enabled_providers(),
-            "available": self.get_available_providers(),
-            "validation": self.validate_provider_configs()
-        }
-
-
-llm_provider_manager = None
-
-
-async def get_llm_provider_for_tenant(tenant_id: str):
-    """Get LLM provider for specific tenant based on WorkflowAgent configuration"""
-    from services.cache.cache_manager import cache_manager
-    
-    cache_key = f"tenant_llm_provider:{tenant_id}"
-    
-    try:
-        cached_provider_data = await cache_manager.get(cache_key)
-        if cached_provider_data:
-            logger.debug(f"Found cached provider data for tenant {tenant_id}")
-            return await _create_provider_from_cache(cached_provider_data)
-        
-        logger.debug(f"No cached provider for tenant {tenant_id}, querying database")
-        
-        from config.database import get_db_context
-        from models.database.agent import WorkflowAgent
-        from models.database.provider import TenantProviderConfig, Provider
-        from sqlalchemy import select
-        import uuid
-
-        async with get_db_context() as db_session:
-            workflow_result = await db_session.execute(
-                select(WorkflowAgent).where(
-                    WorkflowAgent.tenant_id == uuid.UUID(tenant_id),
-                    WorkflowAgent.is_active == True
-                )
-            )
-            workflow_agent = workflow_result.scalar_one_or_none()
-
-            if not workflow_agent:
-                logger.warning(f"No active workflow agent found for tenant {tenant_id}")
-                return None
-
-            provider_result = await db_session.execute(
-                select(TenantProviderConfig, Provider)
-                .join(Provider, Provider.id == TenantProviderConfig.provider_id)
-                .where(
-                    TenantProviderConfig.tenant_id == uuid.UUID(tenant_id),
-                    Provider.provider_name == workflow_agent.provider_name,
-                    TenantProviderConfig.is_enabled == True
-                )
-            )
-            provider_data = provider_result.first()
-
-            if not provider_data:
-                logger.warning(f"No enabled provider config found for {workflow_agent.provider_name} in tenant {tenant_id}")
-                fallback_data = {
-                    "provider_name": workflow_agent.provider_name,
-                    "model_name": workflow_agent.model_name,
-                    "model_config": workflow_agent.model_config or {},
-                    "api_keys": [],
-                    "base_config": {},
-                    "is_fallback": True
-                }
-                await cache_manager.set(cache_key, fallback_data, ttl=1800)
-                return await _get_fallback_provider(workflow_agent.provider_name)
-
-            tenant_config, provider = provider_data
-
-            provider_data_to_cache = {
-                "provider_name": provider.provider_name,
-                "model_name": workflow_agent.model_name,
-                "model_config": workflow_agent.model_config or {},
-                "api_keys": tenant_config.api_keys or [],
-                "base_config": provider.base_config or {},
-                "is_fallback": False
-            }
-            
-            await cache_manager.set(cache_key, provider_data_to_cache, ttl=None)
-            
-            return await _create_provider_from_data(provider_data_to_cache)
-
-    except Exception as e:
-        logger.error(f"Failed to get LLM provider for tenant {tenant_id}: {e}")
-        return None
-
-
-async def _create_provider_from_cache(cached_data: dict):
-    """Create provider instance from cached data"""
-    return await _create_provider_from_data(cached_data)
-
-
-async def _create_provider_from_data(provider_data: dict):
-    """Create provider instance from provider data"""
-    try:
-        if provider_data.get("is_fallback"):
-            return await _get_fallback_provider(provider_data["provider_name"])
-            
-        api_keys = provider_data.get("api_keys", [])
-        if not api_keys:
-            logger.error(f"No API keys provided for provider {provider_data.get('provider_name')}")
-            return None
-
-        provider_config = LLMProviderConfig(
-            name=provider_data["provider_name"],
-            enabled=True,
-            models=[provider_data["model_name"]],
-            default_model=provider_data["model_name"],
-            config={
-                **provider_data["model_config"],
-                "api_keys": api_keys,
-                "base_url": provider_data["base_config"].get("base_url"),
-                "timeout": provider_data["base_config"].get("timeout", 120),
-            }
-        )
-
-        provider_class = LLMProviderManager.PROVIDER_CLASSES.get(provider_data["provider_name"])
-        if not provider_class:
-            logger.error(f"Unknown provider type: {provider_data['provider_name']}")
-            return None
-
-        llm_provider = provider_class(provider_config)
-        success = await llm_provider.initialize()
-
-        if success:
-            logger.info(f"Successfully created LLM provider {provider_data['provider_name']}")
-            return llm_provider
-        else:
-            logger.error(f"Failed to initialize provider {provider_data['provider_name']}")
-            if hasattr(llm_provider, 'cleanup'):
-                try:
-                    await llm_provider.cleanup()
-                except Exception as cleanup_error:
-                    logger.debug(f"Error during provider cleanup: {cleanup_error}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Failed to create provider from data: {e}")
-        try:
-            if 'llm_provider' in locals() and llm_provider and hasattr(llm_provider, 'cleanup'):
-                await llm_provider.cleanup()
-        except Exception as cleanup_error:
-            logger.debug(f"Error during provider cleanup on exception: {cleanup_error}")
-        return None
-
-
-async def _get_fallback_provider(provider_name: str):
-    """Get fallback provider from settings when tenant config is not available"""
-    try:
-        settings = get_settings()
-        provider_config = settings.llm_providers.get(provider_name)
-        
-        if not provider_config or not provider_config.enabled:
-            logger.warning(f"Fallback provider {provider_name} not available or disabled")
-            return None
-
-        provider_class = LLMProviderManager.PROVIDER_CLASSES.get(provider_name)
-        if not provider_class:
-            logger.error(f"Unknown fallback provider type: {provider_name}")
-            return None
-
-        provider = provider_class(provider_config)
-        success = await provider.initialize()
-        
-        if success:
-            logger.info(f"Using fallback provider {provider_name}")
-            return provider
-        else:
-            logger.error(f"Failed to initialize fallback provider {provider_name}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Failed to get fallback provider {provider_name}: {e}")
-        return None

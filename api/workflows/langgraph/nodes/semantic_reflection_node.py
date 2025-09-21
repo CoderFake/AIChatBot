@@ -1,5 +1,6 @@
 """
 Semantic Reflection Node - Optimized for JSON mode providers
+workflows/langgraph/nodes/analysis/semantic_reflection_node.py
 """
 import json
 from typing import Dict, Any
@@ -8,6 +9,7 @@ from .base import AnalysisNode
 from workflows.langgraph.state.state import RAGState
 from utils.logging import get_logger
 from utils.language_utils import get_workflow_message
+from services.orchestrator.orchestrator import Orchestrator
 
 logger = get_logger(__name__)
 
@@ -31,7 +33,6 @@ class SemanticReflectionNode(AnalysisNode):
     async def execute(self, state: RAGState, config: RunnableConfig) -> Dict[str, Any]:
         """Execute semantic analysis and route to appropriate node"""
         try:
-            
             result = await self._perform_semantic_analysis(state)
 
             semantic_routing = result.get("semantic_analysis", {})
@@ -44,6 +45,8 @@ class SemanticReflectionNode(AnalysisNode):
             if semantic_routing.get("is_chitchat"):
                 return await self._handle_chitchat(state)
             else:
+                orchestrator = Orchestrator()
+                state["agents_structure"] = await orchestrator.agents_structure(state["user_context"])
                 return await self._handle_reflection(state)
 
         except Exception as e:
@@ -56,53 +59,51 @@ class SemanticReflectionNode(AnalysisNode):
             query = state["query"]
             message_history = state.get("messages", [])
             user_context = state["user_context"]
-            provider = state.get("provider")
+            provider_name = state.get("provider_name")
 
-            if not provider:
-                logger.warning("No provider available, using simple chitchat/language detection")
-                from utils.language_utils import detect_language
+            semantic_result = {
+                "is_chitchat": False,
+                "refined_query": query,
+                "summary_history": "",
+                "detected_language": "english"
+            }
 
-                detected_language = detect_language(query)
-                semantic_result = {
-                    "is_chitchat": True, 
-                    "refined_query": query,
-                    "summary_history": "",
-                    "detected_language": detected_language,
-                    "confidence": 0.5
-                }
-            else:
-                # Convert LangChain messages to readable text
-                history_text = self._format_message_history(message_history)
+            if provider_name:
+                orchestrator = Orchestrator()
+                provider = await orchestrator.llm(provider_name)
+                history_text = self._format_message_history(message_history, limit=5)
                 semantic_determination_prompt = self._build_semantic_determination_prompt(history_text, query)
 
                 temperature = user_context.get("temperature", 0.1)
+                tenant_id = state.get("tenant_id")
                 semantic_response = await provider.ainvoke(
                     semantic_determination_prompt,
+                    tenant_id,
                     response_format="json_object",
                     json_mode=True,
                     temperature=temperature,
-                    max_tokens=1024
+                    max_tokens=4096
                 )
 
                 semantic_content = semantic_response.content.strip()
                 if not semantic_content:
                     raise RuntimeError("Provider returned empty response for semantic determination")
 
-                semantic_result = json.loads(semantic_content)
-
-            if "is_chitchat" not in semantic_result:
-                semantic_result["is_chitchat"] = False
-            if "refined_query" not in semantic_result:
-                semantic_result["refined_query"] = query
-            if "summary_history" not in semantic_result:
-                semantic_result["summary_history"] = ""
-            if "detected_language" not in semantic_result:
-                semantic_result["detected_language"] = "english"
+                try:
+                    semantic_result = json.loads(semantic_content)
+                except (json.JSONDecodeError, KeyError) as json_err:
+                    logger.error(f"Failed to parse semantic analysis JSON: {json_err}")
+                    semantic_result = {
+                        "is_chitchat": False,
+                        "refined_query": query,
+                        "summary_history": "",
+                        "detected_language": "english"
+                    }
 
             result = {
                 "semantic_analysis": semantic_result,
                 "original_query": query,
-                "detected_language": semantic_result["detected_language"] ,
+                "detected_language": semantic_result["detected_language"],
                 "is_chitchat": semantic_result.get("is_chitchat", False),
                 "summary_history": semantic_result.get("summary_history", "")
             }
@@ -113,8 +114,17 @@ class SemanticReflectionNode(AnalysisNode):
             logger.error(f"Semantic analysis failed: {e}")
             raise
 
-    def _format_message_history(self, messages) -> str:
-        """Convert LangChain messages to readable text format"""
+    def _format_message_history(self, messages, limit: int = 5) -> str:
+        """
+        Convert LangChain messages to a readable text format.
+        
+        Args:
+            messages (list): List of message objects.
+            limit (int): Number of last messages to include (default 5).
+        
+        Returns:
+            str: Formatted message history.
+        """
         if not messages:
             return "No previous conversation."
         
@@ -129,11 +139,13 @@ class SemanticReflectionNode(AnalysisNode):
             else:
                 formatted_messages.append(f"Message: {str(msg)}")
         
-        return "\n".join(formatted_messages[-5:])  
-    
+        if limit and limit > 0:
+            formatted_messages = formatted_messages[-limit:]
+        
+        return "\n".join(formatted_messages)
+
     def _build_semantic_determination_prompt(self, message_history: str, query: str) -> str:
         """Build semantic determination prompt to analyze chat history and context"""
-    
         return f"""You are a semantic analyzer. Analyze the chat history and current query to determine if this is chitchat or a task that needs execution.
 
 CHAT HISTORY:
@@ -178,7 +190,15 @@ TOOL/AGENT EXECUTION (is_chitchat = false):
 - summary_history should capture the main topic/theme of the conversation
 - Language detection is handled separately (ignore this field)"""
 
-    def _build_reflection_prompt(self, query: str, detected_language: str, user_access_levels: list, history_context: str, agents_json: str, semantic_result: dict, user_context: Dict[str, Any]) -> str:
+    def _build_reflection_prompt(self,
+        query: str, detected_language: str,
+        user_access_levels: list,
+        history_context: str,
+        agents_json: str,
+        semantic_result: dict,
+        user_context: Dict[str, Any],
+        tenant_timezone: str
+    ) -> str:
         """Build reflection prompt for execution planning (only called when NOT chitchat)"""
         return f"""You are an expert at planning and delegating tasks. Create detailed execution plan for the user's request.
 
@@ -186,15 +206,23 @@ Information:
 
 LANGUAGE: {detected_language}
 ACCESS LEVELS: {user_access_levels}
-Conversation Summary: {semantic_result.get("summary_history", "")}
+HISTORY CONTEXT: {history_context}
+CONVERSATION SUMMARY FOCUSING ON: {semantic_result.get("summary_history", "")}
+TENANT TIMEZONE: {tenant_timezone}
+
 AVAILABLE AGENTS AND TOOLS (nested structure):
 {agents_json}
 
-CRITICAL: For time queries like "Mấy giờ rồi?", "What time is it?", use an agent that has "datetime" tool.
-For weather queries, use an agent that has "weather" tool.
-For calculations, use an agent that has "calculator" tool.
+CRITICAL EXAMPLE: 
+Query: "What time is it?", use an agent that has "datetime" tool.
+Query: weather queries, use an agent that has "weather" tool.
+Query: calculations, use an agent that has "calculator" tool.
+Query: "Find the lateness policy and a brief summary" -> rag tool -> summary tool  
+Query: "How many times have I been late this month/year?" -> rag tool(search policy) -> late search tool
+Query: "Execute the Internal Training & Evaluation process for employee list X"-> HR Database API / SQL tool -> LMS API / Email Service tool -> Report Generator tool
 
-Return ONLY valid JSON for task execution (use EXACT agent names and tool names from the available agents above):
+CRITICAL STRUCTURE - Return ONLY valid JSON for task execution:
+
 {{
     "original_query": "{query}",
     "refined_query": "{semantic_result.get("refined_query", query)}",
@@ -204,42 +232,63 @@ Return ONLY valid JSON for task execution (use EXACT agent names and tool names 
     }},
     "execution_flow": {{
         "planning": {{
-            "tasks": [{{
-                "1": [{{
-                    "agent": "hr",
-                    "agent_id": "hr-agent-id-here",
-                    "tool": "rag_tool",
-                    "purpose": "Search for relevant HR information in {detected_language}",
-                    "message": "Find information about HR policy in {detected_language}",
-                    "status": "pending"
-                }}],
-                "2": [{{
-                    "agent": "it",
-                    "agent_id": "it-agent-id-here",
-                    "tool": "log_tool",
-                    "purpose": "Check system logs for IT issues in {detected_language}",
-                    "message": "Analyze logs for IT problem in {detected_language}",
-                    "status": "pending"
-                }}]
-            }}],
+            "tasks": [
+                {{
+                    "step_1": [
+                        {{
+                            "agent": "agent_name_from_available_list",
+                            "agent_id": "exact_agent_id_from_structure",
+                            "purpose": "Overall purpose of this task in {detected_language}",
+                            "tools": [
+                                {{
+                                    "tool": "tool_1_name",
+                                    "message": "Specific message for tool_1 in {detected_language}"
+                                }},
+                                {{
+                                    "tool": "tool_2_name", 
+                                    "message": "Specific message for tool_2 in {detected_language}"
+                                }}
+                            ],
+                            "queries": ["subquery_1_in_{detected_language}", "subquery_2_in_{detected_language}"],
+                            "status": "pending"
+                        }}
+                    ]
+                }},
+                {{
+                    "step_2": [
+                        {{
+                            "agent": "another_agent_name",
+                            "agent_id": "another_agent_id",
+                            "purpose": "Purpose of step 2 in {detected_language}",
+                            "tools": [
+                                {{
+                                    "tool": "tool_name",
+                                    "message": "Message for this tool in {detected_language}"
+                                }}
+                            ],
+                            "queries": ["subquery_in_{detected_language}"],
+                            "status": "pending"
+                        }}
+                    ]
+                }}
+            ],
             "aggregate_status": "pending"
         }},
         "conflict_resolution": "Handle conflicts using evidence quality"
     }}
 }}
 
-CRITICAL RULES:
-- Use ONLY agent names, agent_ids and tool names that exist in the AVAILABLE AGENTS structure above
-- Include BOTH agent name AND agent_id from the agents structure for each task
-- Respect user access levels - only use tools with matching access_level
-- Tasks with same number (e.g., "1") run in parallel, different numbers run sequentially
-- Make purposes user-friendly and in {detected_language}
-- Use {detected_language} for all user-facing text
-- Return ONLY valid JSON object with proper structure
-- Do NOT add agents or tools that are not in the available list"""
+CRITICAL EXTRACTION RULES:
+- Use ONLY agent names and agent_ids that exist in AVAILABLE AGENTS structure
+- Each step object contains step_X as key with array of task objects as value
+- Tools array must contain tool names that exist for the specified agent
+- All user-facing text (purpose, message, queries) must be in {detected_language}
+- Respect user access levels when selecting tools
+- Tasks with same step number run in parallel, different steps run sequentially
+- Return ONLY valid JSON object - no extra text or formatting"""
 
     def _create_execution_plan(self, semantic_routing: dict, agents_structure: dict = None, conversation_context: dict = None) -> dict:
-        """Create execution plan from semantic routing"""
+        """Create execution plan from semantic routing with improved structure parsing"""
         try:
             execution_flow = semantic_routing.get("execution_flow", {})
             planning = execution_flow.get("planning", {})
@@ -251,81 +300,78 @@ CRITICAL RULES:
             if tasks_data and isinstance(tasks_data, list):
                 for task_batch in tasks_data:
                     if isinstance(task_batch, dict):
-                        for step_id, task_list in task_batch.items():
-                            step_counter += 1
-                            planning_tasks = []
-                            
-                            if isinstance(task_list, list):
-                                for task_data in task_list:
-                                    if isinstance(task_data, dict):
-                                        agent_name = task_data.get("agent", "")
-                                        agent_id = task_data.get("agent_id", "")
-                                        
-                                        if not agent_id and agent_name and agents_structure:
-                                            agent_name_lower = agent_name.lower()
-                                            if agent_name_lower in agents_structure:
-                                                agent_id = agents_structure[agent_name_lower].get("agent_id", "")
-                                                logger.info(f"Auto-filled agent_id '{agent_id}' for agent '{agent_name}'")
-                                        
-                                        original_message = task_data.get("message", "")
-                                        enhanced_message = original_message
-                                        
-                                        if conversation_context:
-                                            summary = conversation_context.get("summary_history", "")
-                                            original_query = conversation_context.get("original_query", "")
+                        for step_key, task_list in task_batch.items():
+                            if step_key.startswith("step_"):
+                                step_counter += 1
+                                planning_tasks = []
+                                
+                                if isinstance(task_list, list):
+                                    for task_data in task_list:
+                                        if isinstance(task_data, dict):
+                                            agent_name = task_data.get("agent", "")
+                                            agent_id = task_data.get("agent_id", "")
+                                            tools = task_data.get("tools", [])
                                             
-                                            if summary:
-                                                enhanced_message = f"Context: {summary}\nCurrent query: {original_query}\nTask: {original_message}"
-                                        
-                                        planning_task = {
-                                            "agent": agent_name,
-                                            "agent_id": agent_id,
-                                            "tool": task_data.get("tool", ""),
-                                            "message": enhanced_message,
-                                            "status": "pending"
-                                        }
-                                        planning_tasks.append(planning_task)
-
-                            if planning_tasks: 
-                                planning_step = {
-                                    "step_id": f"step_{step_counter}",
-                                    "tasks": planning_tasks,
-                                    "status": "pending",
-                                    "parallel_execution": len(planning_tasks) > 1
-                                }
-                                steps.append(planning_step)
-
-            if not steps:
-                agents = semantic_routing.get("agents", {})
-                if agents and isinstance(agents, dict):
-                    logger.info("Creating execution plan from agents structure")
-                    for agent_name, agent_data in agents.items():
-                        if isinstance(agent_data, dict):
-                            queries = agent_data.get("queries", [])
-                            tools = agent_data.get("tools", ["rag_tool"])
-
-                            if queries and isinstance(queries, list):
-                                for query_item in queries:
-                                    if isinstance(query_item, dict):
-                                        for query_id, query_text in query_item.items():
-                                            step_counter += 1
+                                            if not agent_id and agent_name and agents_structure:
+                                                agent_name_lower = agent_name.lower()
+                                                if agent_name_lower in agents_structure:
+                                                    agent_id = agents_structure[agent_name_lower].get("agent_id", "")
+                                                    logger.info(f"Auto-filled agent_id '{agent_id}' for agent '{agent_name}'")
+                                            
+                                            purpose = task_data.get("purpose", "")
+                                            
+                                            if conversation_context:
+                                                summary = conversation_context.get("summary_history", "")
+                                                original_query = conversation_context.get("original_query", "")
+                                                
+                                                if summary:
+                                                    enhanced_purpose = f"Context: {summary}\nCurrent query: {original_query}\nTask: {purpose}"
+                                                else:
+                                                    enhanced_purpose = purpose
+                                            else:
+                                                enhanced_purpose = purpose
+                                            
                                             planning_task = {
                                                 "agent": agent_name,
-                                                "tool": tools[0] if tools else "rag_tool",
-                                                "message": str(query_text),
+                                                "agent_id": agent_id,
+                                                "purpose": enhanced_purpose,
+                                                "tools": tools if isinstance(tools, list) else [{"tool": "rag_tool", "message": purpose}],
+                                                "queries": task_data.get("queries", []),
                                                 "status": "pending"
                                             }
+                                            planning_tasks.append(planning_task)
 
-                                            planning_step = {
-                                                "step_id": f"step_{step_counter}",
-                                                "tasks": [planning_task],
-                                                "status": "pending",
-                                                "parallel_execution": False
-                                            }
-                                            steps.append(planning_step)
+                                if planning_tasks: 
+                                    planning_step = {
+                                        "step_id": step_key,
+                                        "step_number": step_counter,
+                                        "tasks": planning_tasks,
+                                        "status": "pending",
+                                        "parallel_execution": len(planning_tasks) > 1
+                                    }
+                                    steps.append(planning_step)
 
             if not steps:
-                raise RuntimeError("No execution steps could be created from semantic routing")
+                logger.warning("No steps found in execution flow, creating fallback plan")
+                step_counter = 1
+                planning_task = {
+                    "agent": "default",
+                    "agent_id": "",
+                    "tools": ["rag_tool"],
+                    "queries": [semantic_routing.get("refined_query", "")],
+                    "purpose": "Process user query",
+                    "message": semantic_routing.get("refined_query", ""),
+                    "status": "pending"
+                }
+
+                planning_step = {
+                    "step_id": "step_1",
+                    "step_number": 1,
+                    "tasks": [planning_task],
+                    "status": "pending",
+                    "parallel_execution": False
+                }
+                steps.append(planning_step)
 
             execution_plan = {
                 "total_steps": len(steps),
@@ -367,39 +413,35 @@ CRITICAL RULES:
             detected_language = state.get("detected_language", "english")
             user_context = state.get("user_context", {})
 
-            provider = state.get("provider")
+            provider_name = state.get("provider_name")
             agents_structure_full = state.get("agents_structure")
 
-            if not provider or agents_structure_full is None:
+            if not provider_name or agents_structure_full is None:
                 return await self._handle_error("Provider or agents structure not available")
 
             agents_json = json.dumps(agents_structure_full, ensure_ascii=False, indent=2)
             logger.info(f"Available agents structure: {agents_json}")
 
-            history_context = state.get("summary_history", "")
-
-            user_access_levels = user_context.get("permissions", ["public"])
-            access_scope_override = user_context.get("access_scope")
-            if access_scope_override:
-                if access_scope_override == "public":
-                    user_access_levels = ["public"]
-                elif access_scope_override == "private":
-                    user_access_levels = ["private"]
-                elif access_scope_override == "both":
-                    user_access_levels = ["public", "private"]
+            history_context = self._format_message_history(state.get("messages", []), limit=3)
+            tenant_timezone = state.get("tenant_timezone", "UTC")
+            user_access_levels = state.get("access_scope", "public")
 
             prompt = self._build_reflection_prompt(
                 query, detected_language, user_access_levels, history_context,
-                agents_json, semantic_routing, user_context
+                agents_json, semantic_routing, user_context, tenant_timezone
             )
 
             temperature = user_context.get("temperature", 0.1)
+            tenant_id = state.get("tenant_id")
+            orchestrator = Orchestrator()
+            provider = await orchestrator.llm(provider_name)
             reflection_response = await provider.ainvoke(
                 prompt,
+                tenant_id,
                 response_format="json_object",
                 json_mode=True,
                 temperature=temperature,
-                max_tokens=2048
+                max_tokens=4096
             )
 
             reflection_content = reflection_response.content.strip()
@@ -463,7 +505,6 @@ CRITICAL RULES:
             "should_yield": True
         }
 
-
     async def _handle_error(self, error=None) -> Dict[str, Any]:
         """Handle error with proper error information"""
         if error is None:
@@ -524,8 +565,8 @@ CRITICAL RULES:
                     try:
                         provider = await agent_service._get_agent_llm_provider(agent_id, tenant_id)
                         if provider:
-                            agent_providers[agent_id] = provider
-                            logger.debug(f"Loaded provider for agent_id {agent_id}")
+                            agent_providers[agent_id] = getattr(provider, 'name', f'provider_{agent_id}')
+                            logger.debug(f"Loaded provider name for agent_id {agent_id}")
                         else:
                             logger.warning(f"No provider found for agent_id {agent_id}")
                     except Exception as e:

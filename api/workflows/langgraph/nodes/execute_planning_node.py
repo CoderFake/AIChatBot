@@ -2,6 +2,7 @@
 Execute Planning Node
 Executes the structured planning created by semantic reflection
 Coordinates multiple agents and their tools based on the execution plan
+workflows/langgraph/nodes/execution/execute_planning_node.py
 """
 import asyncio
 import time
@@ -19,20 +20,17 @@ logger = get_logger(__name__)
 class ExecutePlanningNode(ExecutionNode):
     """
     Execute the structured planning created by semantic reflection
-    Coordinates multiple agents and their tools based on the execution plan
+    Steps (step_1, step_2...) run in PARALLEL
+    Tools within each task run SEQUENTIALLY (tool1 -> tool2 -> tool3)
     """
 
     def __init__(self):
         super().__init__("execute_planning")
-        self._progress_callback = None
-        self._start_time = None
 
     def _calculate_progress_percentage(self, step: str, current_step: int = 0, total_steps: int = 0) -> int:
-        """
-        Calculate real progress percentage based on workflow step and completion
-        """
+        """Calculate real progress percentage based on workflow step and completion"""
         base_progress = {
-            "plan_ready": 0,
+            "plan_ready": 20,
             "executing_agents": 75,
             "executing_task": 75,
             "task_completed": 75,
@@ -49,18 +47,14 @@ class ExecutePlanningNode(ExecutionNode):
         return progress
 
     async def execute(self, state: RAGState, config: RunnableConfig) -> Dict[str, Any]:
-        """
-        Execute the structured planning with agent coordination
-        """
+        """Execute the structured planning with agent coordination"""
         results = []
         async for result in self.execute_with_progress(state, config):
             results.append(result)
         return results[-1] if results else {}
 
     async def execute_with_progress(self, state: RAGState, config: RunnableConfig):
-        """
-        Execute with step-by-step progress yielding
-        """
+        """Execute with step-by-step progress yielding"""
         try:
             semantic_routing = state.get("semantic_routing", {})
             execution_plan = state.get("execution_plan", {})
@@ -79,38 +73,21 @@ class ExecutePlanningNode(ExecutionNode):
                 return
 
             logger.info("Starting execution of structured planning")
-
             detected_language = state.get("detected_language", "english")
 
-            plan_tasks = []
-            task_counter = 1
-
-            steps = execution_plan.get("steps", [])
-            for step in steps:
-                if isinstance(step, dict):
-                    tasks = step.get("tasks", [])
-                    for task in tasks:
-                        if isinstance(task, dict):
-                            task_copy = task.copy()
-                            task_copy["step_number"] = task_counter
-                            task_copy["step_id"] = step.get("step_id", f"step_{task_counter}")
-                            plan_tasks.append(task_copy)
-                            task_counter += 1
+            formatted_tasks = self._format_tasks_for_display(execution_plan)
 
             yield {
                 "processing_status": "plan_ready",
                 "progress_percentage": self._calculate_progress_percentage("plan_ready"),
                 "progress_message": get_workflow_message("execution_plan_ready", detected_language),
                 "execution_plan": execution_plan,
-                "plan_summary": {
-                    "total_tasks": len(plan_tasks),
-                    "tasks": plan_tasks
-                },
+                "formatted_tasks": formatted_tasks,
                 "should_yield": True
             }
 
             execution_results = []
-            async for progress_update in self._execute_sequential_tasks(
+            async for progress_update in self._execute_parallel_steps(
                 state, execution_plan, original_query, user_context, detected_language, semantic_routing
             ):
                 if progress_update.get("type") == "progress":
@@ -187,71 +164,103 @@ class ExecutePlanningNode(ExecutionNode):
                 "should_yield": True
             }
 
-    async def _execute_planning_parallel(
+    def _format_tasks_for_display(self, execution_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Format tasks from execution plan for user display:
+        {
+            "task_name": "purpose",
+            "messages": {
+                "1": "Tool 1 message",
+                "2": "Tool 2 message"
+            },
+            "status": "pending"
+        }
+        """
+        formatted_tasks = []
+        
+        steps = execution_plan.get("steps", [])
+        for step in steps:
+            if isinstance(step, dict):
+                tasks = step.get("tasks", [])
+                for i, task in enumerate(tasks):
+                    if isinstance(task, dict):
+                        purpose = task.get("purpose", f"Task {i+1}")
+                        tools = task.get("tools", [])
+                        
+                        messages = {}
+                        for j, tool in enumerate(tools, 1):
+                            if isinstance(tool, dict):
+                                tool_message = tool.get("message", "")
+                                if tool_message:
+                                    messages[str(j)] = tool_message
+                            else:
+                                messages[str(j)] = f"Execute {tool}"
+                        
+                        formatted_task = {
+                            "task_name": purpose,
+                            "messages": messages,
+                            "status": task.get("status", "pending"),
+                            "agent": task.get("agent", ""),
+                            "task_index": len(formatted_tasks)
+                        }
+                        formatted_tasks.append(formatted_task)
+        
+        return formatted_tasks
+
+    async def _execute_parallel_steps(
         self,
         state: RAGState,
         execution_plan: Dict[str, Any],
         original_query: str,
         user_context: Dict[str, Any],
         detected_language: str,
-        semantic_routing: Dict[str, Any] = None,
-        progress_callback: callable = None
-    ) -> List[AgentResponse]:
+        semantic_routing: Dict[str, Any] = None
+    ):
         """
-        Execute the planning in parallel using asyncio.gather
+        Execute all steps in PARALLEL (step_1, step_2, step_3... run simultaneously)
+        But tools within each task run SEQUENTIALLY (tool1 -> tool2 -> tool3...)
         """
         try:
-            planning_tasks = execution_plan.get("execution_flow", {}).get("planning", {}).get("tasks", [])
+            steps = execution_plan.get("steps", [])
 
-            if not planning_tasks:
-                logger.warning("No planning tasks found in execution plan")
-                return []
+            if not steps:
+                logger.warning("No planning steps found in execution plan")
+                yield {"type": "result", "results": []}
+                return
 
             all_tasks = []
-            for step_tasks in planning_tasks:
-                if isinstance(step_tasks, dict):
-                    for step_key, tasks in step_tasks.items():
-                        if isinstance(tasks, list):
-                            all_tasks.extend(tasks)
+            for step in steps:
+                if isinstance(step, dict):
+                    tasks = step.get("tasks", [])
+                    if isinstance(tasks, list):
+                        all_tasks.extend(tasks)
 
             if not all_tasks:
                 logger.warning("No executable tasks found")
-                return []
+                yield {"type": "result", "results": []}
+                return
 
-            logger.info(f"Found {len(all_tasks)} tasks to execute")
+            logger.info(f"Found {len(all_tasks)} tasks to execute in parallel")
 
-            if progress_callback:
-                await progress_callback({
-                    "node": "execute_planning",
-                    "output": {
-                        "processing_status": "executing_agents",
-                        "progress_percentage": self._calculate_progress_percentage("executing_agents"),
-                        "progress_message": get_workflow_message("execution_started", detected_language, total=len(all_tasks)),
-                        "current_step": 0,
-                        "total_steps": len(all_tasks),
-                        "execution_plan": execution_plan,
-                        "should_yield": True
-                    }
-                })
+            yield {
+                "type": "progress",
+                "node": "execute_planning",
+                "output": {
+                    "processing_status": "executing_agents",
+                    "progress_percentage": self._calculate_progress_percentage("executing_agents"),
+                    "progress_message": get_workflow_message("execution_started", detected_language, total=len(all_tasks)),
+                    "current_step": 0,
+                    "total_steps": len(all_tasks),
+                    "formatted_tasks": self._format_tasks_for_display(execution_plan),
+                    "should_yield": True
+                }
+            }
 
             execution_tasks = []
-            task_info = []
-
             for i, task in enumerate(all_tasks):
                 if isinstance(task, dict):
-                    agent_name = task.get("agent", "general")
-                    tool_name = task.get("tool", "rag_tool")
-
-                    task_future = self._execute_single_task(
-                        state, task, i
-                    )
+                    task_future = self._execute_single_task(state, task, i)
                     execution_tasks.append(task_future)
-                    task_info.append({
-                        "index": i,
-                        "agent": agent_name,
-                        "tool": tool_name,
-                        "status": "pending"
-                    })
 
             if execution_tasks:
                 results = await asyncio.gather(*execution_tasks, return_exceptions=True)
@@ -260,12 +269,10 @@ class ExecutePlanningNode(ExecutionNode):
                 completed_count = 0
 
                 for i, result in enumerate(results):
-                    task_info[i]["status"] = "completed" if not isinstance(result, Exception) else "failed"
-
                     if isinstance(result, Exception):
                         logger.error(f"Task {i} failed with exception: {result}")
                         processed_results.append({
-                            "agent_name": task_info[i]["agent"],
+                            "agent_name": f"Task_{i}",
                             "content": f"Task execution failed: {str(result)}",
                             "status": "failed",
                             "confidence": 0.0,
@@ -278,30 +285,14 @@ class ExecutePlanningNode(ExecutionNode):
                         processed_results.append(result)
                         completed_count += 1
 
-                        if progress_callback:
-                            progress_pct = 75 + (completed_count / len(all_tasks)) * 10
-                            await progress_callback({
-                                "node": "execute_planning",
-                                "output": {
-                                    "processing_status": "executing_agents",
-                                    "progress_percentage": progress_pct,
-                                    "progress_message": get_workflow_message("task_completed", detected_language,
-                                        agent=task_info[i]["agent"], tool=task_info[i]["tool"],
-                                        completed=completed_count, total=len(all_tasks)),
-                                    "current_step": completed_count,
-                                    "total_steps": len(all_tasks),
-                                    "task_info": task_info[i],
-                                    "should_yield": True
-                                }
-                            })
-
-                return processed_results
-
-            return []
+                logger.info(f"Parallel execution completed: {completed_count}/{len(all_tasks)} tasks successful")
+                yield {"type": "result", "results": processed_results}
+            else:
+                yield {"type": "result", "results": []}
 
         except Exception as e:
             logger.error(f"Parallel execution failed: {e}")
-            return []
+            yield {"type": "result", "results": []}
 
     async def _execute_single_task(
         self,
@@ -311,37 +302,56 @@ class ExecutePlanningNode(ExecutionNode):
     ) -> AgentResponse:
         """
         Execute a single task from the execution plan
+        Tools structure: [{"tool": "tool_name", "message": "specific_message"}]
         """
         start_time = time.time()
 
         try:
-            semantic_routing = state.get("semantic_routing", {})
             agent_name = task.get("agent", "general")
             agent_id = task.get("agent_id")
-            tool_name = task.get("tool", "rag_tool")
-            message = task.get("message", "")
+            tools = task.get("tools", [])
+            purpose = task.get("purpose", "")
 
-            logger.debug(f"Executing task {task_index}: {agent_name} -> {tool_name}")
+            logger.debug(f"Executing task {task_index}: {agent_name} -> Purpose: {purpose}")
 
-            tools_sequence = self._get_tools_sequence_for_task(task, agent_name, semantic_routing)
-
-            if len(tools_sequence) > 1:
-                logger.info(f"Task {task_index} using sequential tools: {tools_sequence}")
+            if isinstance(tools, list) and len(tools) > 1:
+                tools_names = [t.get('tool', t) if isinstance(t, dict) else t for t in tools]
+                logger.info(f"Task {task_index} using sequential tools: {tools_names}")
                 agent_response = await self._execute_agent_with_sequential_tools(
-                    state, agent_name, tools_sequence, message, agent_id
+                    state, agent_name, tools, purpose, agent_id
                 )
             else:
+                if tools and isinstance(tools, list) and len(tools) > 0:
+                    tool_obj = tools[0]
+                    if isinstance(tool_obj, dict):
+                        tool_name = tool_obj.get("tool", "rag_tool")
+                        tool_message = tool_obj.get("message", purpose)
+                    else:
+                        tool_name = str(tool_obj)
+                        tool_message = purpose
+                else:
+                    tool_name = "rag_tool"
+                    tool_message = purpose
+
                 agent_response = await self._execute_agent_task(
-                    state, agent_name, tool_name, message, agent_id
+                    state, agent_name, tool_name, tool_message, agent_id
                 )
 
             execution_time = time.time() - start_time
+
+            tools_used = []
+            for tool in tools:
+                if isinstance(tool, dict):
+                    tools_used.append(tool.get("tool", "unknown"))
+                else:
+                    tools_used.append(str(tool))
 
             enhanced_response = {
                 **agent_response,
                 "task_index": task_index,
                 "agent_name": agent_name,
-                "tool_used": tool_name,
+                "tools_used": tools_used,
+                "purpose": purpose,
                 "execution_time": execution_time,
                 "status": "completed"
             }
@@ -371,9 +381,7 @@ class ExecutePlanningNode(ExecutionNode):
         message: str = None,
         agent_id: str = None
     ) -> Dict[str, Any]:
-        """
-        Execute a specific agent with a specific tool
-        """
+        """Execute a specific agent with a specific tool"""
         try:
             original_query = state.get("query", "")
             user_context = state.get("user_context", {})
@@ -419,50 +427,18 @@ class ExecutePlanningNode(ExecutionNode):
                 "query_used": original_query
             }
 
-    def _get_tools_sequence_for_task(
-        self,
-        task: Dict[str, Any],
-        agent_name: str,
-        semantic_routing: Dict[str, Any] = None
-    ) -> List[str]:
-        """
-        Determine the sequence of tools to execute for a task
-        Can be specified in task, agent config, or default to single tool
-        """
-        try:
-            if "tools" in task and isinstance(task["tools"], list):
-                return task["tools"]
-
-            if semantic_routing and "agents" in semantic_routing:
-                agent_config = semantic_routing["agents"].get(agent_name, {})
-                if "sequential_tools" in agent_config and isinstance(agent_config["sequential_tools"], list):
-                    sequential_tools = agent_config["sequential_tools"]
-                    if len(sequential_tools) > 1: 
-                        return sequential_tools
-
-                if "tools" in agent_config and isinstance(agent_config["tools"], list):
-                    return agent_config["tools"]
-
-            if "tool" in task:
-                return [task["tool"]]
-
-            return ["rag_tool"]
-
-        except Exception as e:
-            logger.warning(f"Error determining tools sequence for task: {e}")
-            return ["rag_tool"]
-
     async def _execute_agent_with_sequential_tools(
         self,
         state: RAGState,
         agent_name: str,
-        tools_sequence: List[str],
-        message: str = None,
+        tools_sequence: List[Any],
+        purpose: str = None,
         agent_id: str = None
     ) -> Dict[str, Any]:
         """
-        Execute an agent with sequential tools where each tool's result
-        becomes context for the next tool
+        Execute an agent with SEQUENTIAL tools
+        tools_sequence: [{"tool": "tool1", "message": "msg1"}, {"tool": "tool2", "message": "msg2"}]
+        Each tool's result becomes context for the next tool
         """
         try:
             original_query = state.get("query", "")
@@ -470,21 +446,34 @@ class ExecutePlanningNode(ExecutionNode):
             detected_language = state.get("detected_language", "english")
             agent_providers = state.get("agent_providers", {})
 
-            current_query = message if message else original_query
             all_sources = []
             all_tools_used = []
             accumulated_context = ""
             final_content = ""
             final_confidence = 0.5
 
-            logger.info(f"Agent {agent_name} executing {len(tools_sequence)} tools sequentially: {tools_sequence}")
+            tools_names = []
+            for tool in tools_sequence:
+                if isinstance(tool, dict):
+                    tools_names.append(tool.get("tool", "unknown"))
+                else:
+                    tools_names.append(str(tool))
 
-            for i, current_tool in enumerate(tools_sequence):
+            logger.info(f"Agent {agent_name} executing {len(tools_sequence)} tools sequentially: {tools_names}")
+
+            for i, tool_obj in enumerate(tools_sequence):
+                if isinstance(tool_obj, dict):
+                    current_tool = tool_obj.get("tool", "rag_tool")
+                    tool_message = tool_obj.get("message", purpose or original_query)
+                else:
+                    current_tool = str(tool_obj)
+                    tool_message = purpose or original_query
+
                 logger.debug(f"Agent {agent_name} executing tool {i+1}/{len(tools_sequence)}: {current_tool}")
 
                 if accumulated_context and i > 0:
                     enriched_query = f"""
-{current_query}
+{tool_message}
 
 CONTEXT FROM PREVIOUS TOOLS:
 {accumulated_context}
@@ -498,7 +487,7 @@ Use the results from previous tools as context to:
 5. Build upon previous findings to create a comprehensive response
 """
                 else:
-                    enriched_query = current_query
+                    enriched_query = tool_message
 
                 async def execute_agent_operation(db):
                     agent_service = AgentService(db)
@@ -518,6 +507,7 @@ Use the results from previous tools as context to:
                 current_content = agent_result.get("content", "")
                 current_sources = agent_result.get("sources", [])
                 current_confidence = agent_result.get("confidence", 0.5)
+
                 if current_content:
                     if final_content:
                         final_content += f"\n\n--- {current_tool.upper()} RESULTS ---\n{current_content}"
@@ -547,250 +537,33 @@ Sources: {len(current_sources)} sources found
                 "sources": all_sources,
                 "tools_used": all_tools_used,
                 "metadata": {
-                    "tools_sequence": tools_sequence,
+                    "tools_sequence": tools_names,
                     "sequential_execution": True,
                     "total_tools": len(tools_sequence),
-                    "accumulated_context_length": len(accumulated_context)
+                    "accumulated_context_length": len(accumulated_context),
+                    "purpose": purpose
                 },
-                "query_used": current_query
+                "query_used": purpose or original_query
             }
 
         except Exception as e:
             logger.error(f"Agent {agent_name} sequential execution failed: {str(e)}")
+            tools_names = []
+            for tool in tools_sequence:
+                if isinstance(tool, dict):
+                    tools_names.append(tool.get("tool", "unknown"))
+                else:
+                    tools_names.append(str(tool))
+            
             return {
                 "agent_name": agent_name,
                 "content": f"Agent {agent_name} sequential execution failed: {str(e)}",
                 "confidence": 0.0,
                 "sources": [],
-                "tools_used": tools_sequence,
+                "tools_used": tools_names,
                 "error": str(e),
-                "query_used": original_query
+                "query_used": purpose or original_query
             }
-
-    async def _execute_with_detailed_progress(
-        self,
-        state: RAGState,
-        execution_plan: Dict[str, Any],
-        original_query: str,
-        user_context: Dict[str, Any],
-        detected_language: str,
-        semantic_routing: Dict[str, Any] = None
-    ):
-        """
-        Execute planning with detailed progress tracking and yielding
-        """
-        try:
-            steps = execution_plan.get("steps", [])
-
-            if not steps:
-                logger.warning("No planning steps found in execution plan")
-                yield {"type": "result", "results": []}
-                return
-
-            all_tasks = []
-            for step in steps:
-                if isinstance(step, dict):
-                    tasks = step.get("tasks", [])
-                    if isinstance(tasks, list):
-                        all_tasks.extend(tasks)
-
-            if not all_tasks:
-                logger.warning("No executable tasks found")
-                yield {"type": "result", "results": []}
-                return
-
-            logger.info(f"Found {len(all_tasks)} tasks to execute")
-
-            execution_tasks = []
-            task_info = []
-
-            for i, task in enumerate(all_tasks):
-                if isinstance(task, dict):
-                    agent_name = task.get("agent", "general")
-                    tool_name = task.get("tool", "rag_tool")
-
-                    task_future = self._execute_single_task(
-                        state, task, i
-                    )
-                    execution_tasks.append(task_future)
-                    task_info.append({
-                        "index": i,
-                        "agent": agent_name,
-                        "tool": tool_name,
-                        "status": "pending"
-                    })
-
-            if execution_tasks:
-                results = await asyncio.gather(*execution_tasks, return_exceptions=True)
-
-                processed_results = []
-                completed_count = 0
-
-                for i, result in enumerate(results):
-                    task_info[i]["status"] = "completed" if not isinstance(result, Exception) else "failed"
-
-                    if isinstance(result, Exception):
-                        logger.error(f"Task {i} failed with exception: {result}")
-                        processed_results.append({
-                            "agent_name": task_info[i]["agent"],
-                            "content": f"Task execution failed: {str(result)}",
-                            "status": "failed",
-                            "confidence": 0.0,
-                            "sources": [],
-                            "execution_time": 0.0,
-                            "error": str(result),
-                            "task_index": i
-                        })
-                    else:
-                        processed_results.append(result)
-                        completed_count += 1
-
-                        progress_pct = 75 + (completed_count / len(all_tasks)) * 10
-                        yield {
-                            "type": "progress",
-                            "node": "execute_planning",
-                            "output": {
-                                "processing_status": "executing_agents",
-                                "progress_percentage": progress_pct,
-                                "progress_message": get_workflow_message("task_completed", detected_language,
-                                    agent=task_info[i]["agent"], tool=task_info[i]["tool"],
-                                    completed=completed_count, total=len(all_tasks)),
-                                "current_step": completed_count,
-                                "total_steps": len(all_tasks),
-                                "task_info": task_info[i],
-                                "should_yield": True
-                            }
-                        }
-
-                yield {"type": "result", "results": processed_results}
-
-        except Exception as e:
-            logger.error(f"Detailed progress execution failed: {e}")
-            yield {"type": "result", "results": []}
-
-    async def _execute_sequential_tasks(
-        self,
-        state: RAGState,
-        execution_plan: Dict[str, Any],
-        original_query: str,
-        user_context: Dict[str, Any],
-        detected_language: str,
-        semantic_routing: Dict[str, Any] = None
-    ):
-        """
-        Execute tasks sequentially like Cursor - one by one with progress
-        """
-        try:
-            # Get tasks from execution plan steps
-            steps = execution_plan.get("steps", [])
-
-            if not steps:
-                logger.warning("No planning steps found in execution plan")
-                yield {"type": "result", "results": []}
-                return
-
-            all_tasks = []
-            for step in steps:
-                if isinstance(step, dict):
-                    tasks = step.get("tasks", [])
-                    if isinstance(tasks, list):
-                        all_tasks.extend(tasks)
-
-            if not all_tasks:
-                logger.warning("No executable tasks found")
-                yield {"type": "result", "results": []}
-                return
-
-            logger.info(f"Found {len(all_tasks)} tasks to execute sequentially")
-
-            processed_results = []
-
-            for i, task in enumerate(all_tasks):
-                if isinstance(task, dict):
-                    agent_name = task.get("agent", "general")
-                    tool_name = task.get("tool", "rag_tool")
-
-                    task_purpose = task.get("purpose", f"Execute {agent_name} with {tool_name}")
-
-                    progress_pct = 75 + (i / len(all_tasks)) * 10
-                    yield {
-                        "type": "progress",
-                        "node": "execute_planning",
-                        "output": {
-                            "processing_status": "executing_task",
-                            "progress_percentage": progress_pct,
-                            "progress_message": f"Task {i+1}/{len(all_tasks)}: {task_purpose}",
-                            "current_step": i + 1,
-                            "total_steps": len(all_tasks),
-                            "current_task": {
-                                "agent": agent_name,
-                                "tool": tool_name,
-                                "purpose": task_purpose,
-                                "index": i
-                            },
-                            "should_yield": True
-                        }
-                    }
-
-                    try:
-                        result = await self._execute_single_task(
-                            state, task, i
-                        )
-
-                        if isinstance(result, Exception):
-                            logger.error(f"Task {i} failed with exception: {result}")
-                            processed_results.append({
-                                "agent_name": agent_name,
-                                "content": f"Task execution failed: {str(result)}",
-                                "status": "failed",
-                                "confidence": 0.0,
-                                "sources": [],
-                                "execution_time": 0.0,
-                                "error": str(result),
-                                "task_index": i
-                            })
-                        else:
-                            processed_results.append(result)
-
-                            completion_pct = 75 + ((i + 1) / len(all_tasks)) * 10
-                            yield {
-                                "type": "progress",
-                                "node": "execute_planning",
-                                "output": {
-                                    "processing_status": "task_completed",
-                                    "progress_percentage": completion_pct,
-                                    "progress_message": f"Completed {i+1}/{len(all_tasks)}: {task_purpose}",
-                                    "current_step": i + 1,
-                                    "total_steps": len(all_tasks),
-                                    "completed_task": {
-                                        "agent": agent_name,
-                                        "tool": tool_name,
-                                        "purpose": task_purpose,
-                                        "index": i,
-                                        "status": "completed"
-                                    },
-                                    "should_yield": True
-                                }
-                            }
-
-                    except Exception as e:
-                        logger.error(f"Task {i} execution failed: {e}")
-                        processed_results.append({
-                            "agent_name": agent_name,
-                            "content": f"Task execution failed: {str(e)}",
-                            "status": "failed",
-                            "confidence": 0.0,
-                            "sources": [],
-                            "execution_time": 0.0,
-                            "error": str(e),
-                            "task_index": i
-                        })
-
-            yield {"type": "result", "results": processed_results}
-
-        except Exception as e:
-            logger.error(f"Sequential execution failed: {e}")
-            yield {"type": "result", "results": []}
 
     def _analyze_execution_plan_for_routing(
         self,
@@ -809,25 +582,15 @@ Sources: {len(current_sources)} sources found
         try:
             unique_agents = set()
 
-            execution_flow = execution_plan.get("execution_flow", {})
-            planning = execution_flow.get("planning", {})
-            tasks_data = planning.get("tasks", [])
-
-            if tasks_data and isinstance(tasks_data, list):
-                for task_batch in tasks_data:
-                    if isinstance(task_batch, dict):
-                        for step_id, task_list in task_batch.items():
-                            if isinstance(task_list, list):
-                                for task_data in task_list:
-                                    if isinstance(task_data, dict):
-                                        agent_name = task_data.get("agent", "")
-                                        if agent_name:
-                                            unique_agents.add(agent_name)
-
-            if semantic_routing:
-                agents = semantic_routing.get("agents", {})
-                if isinstance(agents, dict):
-                    unique_agents.update(agents.keys())
+            steps = execution_plan.get("steps", [])
+            for step in steps:
+                if isinstance(step, dict):
+                    tasks = step.get("tasks", [])
+                    for task in tasks:
+                        if isinstance(task, dict):
+                            agent_name = task.get("agent", "")
+                            if agent_name:
+                                unique_agents.add(agent_name)
 
             if not unique_agents and successful_responses:
                 unique_agents.update([
@@ -839,33 +602,23 @@ Sources: {len(current_sources)} sources found
 
             if len(unique_agents) == 1:
                 single_agent = list(unique_agents)[0]
+                
+                has_sequential_tools = False
+                for step in steps:
+                    if isinstance(step, dict):
+                        tasks = step.get("tasks", [])
+                        for task in tasks:
+                            if isinstance(task, dict) and task.get("agent") == single_agent:
+                                tools = task.get("tools", [])
+                                if isinstance(tools, list) and len(tools) > 1:
+                                    has_sequential_tools = True
+                                    break
+                        if has_sequential_tools:
+                            break
 
-                if semantic_routing:
-                    agent_config = semantic_routing.get("agents", {}).get(single_agent, {})
-                    tools = agent_config.get("tools", [])
-                    sequential_tools = agent_config.get("sequential_tools", [])
-
-                    if len(sequential_tools) > 1:
-                        logger.info(f"Single agent {single_agent} has sequential tools: {sequential_tools}")
-                        return "single_agent_sequential"
-                    elif len(tools) > 1:
-                        logger.info(f"Single agent {single_agent} has multiple tools: {tools}")
-                        return "single_agent_sequential"
-
-                if tasks_data:
-                    agent_tasks = []
-                    for task_batch in tasks_data:
-                        if isinstance(task_batch, dict):
-                            for step_id, task_list in task_batch.items():
-                                if isinstance(task_list, list):
-                                    for task_data in task_list:
-                                        if (isinstance(task_data, dict) and
-                                            task_data.get("agent") == single_agent):
-                                            agent_tasks.append(task_data)
-
-                    if len(agent_tasks) > 1:
-                        logger.info(f"Single agent {single_agent} has {len(agent_tasks)} sequential tasks")
-                        return "single_agent_sequential"
+                if has_sequential_tools:
+                    logger.info(f"Single agent {single_agent} has sequential tools")
+                    return "single_agent_sequential"
 
                 logger.info(f"Single agent {single_agent} - treating as single execution")
                 return "single_agent_sequential"
@@ -881,4 +634,3 @@ Sources: {len(current_sources)} sources found
         except Exception as e:
             logger.error(f"Failed to analyze execution plan for routing: {e}")
             return "complex"
-

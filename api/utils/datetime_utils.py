@@ -77,16 +77,11 @@ class DateTimeManager:
         Get tenant timezone with cache optimization.
         Returns system timezone as fallback.
         """
-        redis_client = None
         try:
-            from services.cache.redis_service import redis_client as _redis_client
-            redis_client = _redis_client
-        except Exception:
-            redis_client = None
-        
-        try:
-            if redis_client is not None:
-                cached = await redis_client.get_tenant_data(str(tenant_id), "basic")
+            from services.orchestrator.orchestrator import global_cache_manager
+            if global_cache_manager is not None:
+                cache_key = f"tenant:{tenant_id}:details"
+                cached = await global_cache_manager.get(cache_key)
                 if cached and isinstance(cached, dict):
                     tz_name = cached.get("timezone")
                     if tz_name:
@@ -102,8 +97,9 @@ class DateTimeManager:
                 if row and row[0]:
                     tz_name = str(row[0])
                     try:
-                        if redis_client is not None:
-                            await redis_client.set_tenant_data(str(tenant_id), "basic", {"timezone": tz_name})
+                        if global_cache_manager is not None:
+                            cache_key = f"tenant:{tenant_id}:details"
+                            await global_cache_manager.set(cache_key, {"timezone": tz_name})
                     except Exception:
                         pass
                     return tz_name

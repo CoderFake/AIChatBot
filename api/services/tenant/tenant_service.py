@@ -3,18 +3,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
 from sqlalchemy.orm import selectinload
 
-from models.database.tenant import Tenant
-from models.database.user import User
-from models.database.agent import WorkflowAgent
+from models.database.tenant import Tenant, Department
+from models.database.agent import WorkflowAgent, AgentToolConfig, Agent
+from models.database.provider import TenantProviderConfig, Provider, ProviderModel
+from models.database.tool import TenantToolConfig, Tool
 from services.auth.permission_service import PermissionService
 from services.cache.redis_service import redis_client
 from common.types import DefaultProviderConfig
 from utils.logging import get_logger
 from core.exceptions import ServiceError
 from services.storage.minio_service import MinioService
+from common.types import DocumentConstants
+from config.settings import get_settings
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 
+settings = get_settings()
 
 class TenantService:
     """
@@ -33,19 +38,16 @@ class TenantService:
     async def create_tenant(
         self,
         tenant_name: str,
-        timezone: str = "UTC",
+        timezone: str,
         locale: str = "en_US",
-        sub_domain: Optional[str] = None,
+        sub_domain: str = None,
         description: Optional[str] = None,
+        allowed_providers: Optional[List[str]] = None,
+        allowed_tools: Optional[List[str]] = None,
         created_by: str = "system",
-        config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Create new tenant with timezone configuration and base resources.
-        Side-effects within same transaction:
-        - Ensure MinIO bucket for tenant (bucket name = tenant_id)
-        - Create default groups/permissions
-        WorkflowAgent is NOT created here; call create_default_workflow_agent() afterwards.
+        Create tenant with optional provider and tools setup in single transaction
         """
         try:
             tenant = Tenant(
@@ -54,16 +56,21 @@ class TenantService:
                 locale=locale,
                 sub_domain=sub_domain,
                 description=description,
-                settings=config or {},
+                settings={},
                 created_by=created_by
             )
             
             self.db.add(tenant)
-            await self.db.flush()
+            await self.db.flush()  
 
             try:
                 minio = MinioService()
-                await minio.ensure_bucket(str(tenant.id))
+                await minio.ensure_bucket(
+                    DocumentConstants.BUCKET_NAME_TEMPLATE.format(
+                        prefix=settings.storage.bucket_prefix,
+                        tenant_id=str(tenant.id)
+                    )
+                )
             except Exception as storage_exc:
                 logger.error(f"Create tenant bucket failed: {storage_exc}")
                 raise
@@ -72,37 +79,135 @@ class TenantService:
                 tenant_id=tenant.id,
                 created_by=created_by
             )
-            
+
+            tenant_id = str(tenant.id)
+            setup_results = {
+                "allowed_providers": None,
+                "tools_setup": None
+            }
+
+            if allowed_providers:
+
+                created_configs = []
+                for provider_name in allowed_providers:
+                    provider_result = await self.db.execute(
+                        select(Provider).where(Provider.provider_name == provider_name)
+                    )
+                    provider = provider_result.scalar_one_or_none()
+
+                    if provider:
+                        config = TenantProviderConfig(
+                            tenant_id=tenant_id,
+                            provider_id=provider.id,
+                            api_keys=[],
+                            current_key_index=0,
+                            rotation_strategy="round_robin",
+                            is_enabled=True,
+                            configured_by=created_by
+                        )
+                        self.db.add(config)
+                        await self.db.flush()
+                        created_configs.append({
+                            "provider_name": provider_name,
+                            "config_id": str(config.id)
+                        })
+                    else:
+                        logger.warning(f"Provider {provider_name} not found, skipping")
+
+                setup_results["allowed_providers"] = {
+                    "tenant_id": tenant_id,
+                    "allowed_providers": allowed_providers,
+                    "created_configs": created_configs
+                }
+
+            if allowed_tools:
+
+                logger.info(f"Setting up tools for tenant {tenant_name}: {allowed_tools}")
+
+                tools_result = await self.db.execute(
+                    select(Tool).where(Tool.id.in_(allowed_tools))
+                )
+                available_tools = {str(tool.id): tool for tool in tools_result.scalars().all()}
+                logger.info(f"Found {len(available_tools)} available tools out of {len(allowed_tools)} requested")
+
+                enabled_tools = []
+                for tool_id in allowed_tools:
+                    tool_id_str = str(tool_id)
+                    if tool_id_str not in available_tools:
+                        logger.warning(f"Tool {tool_id} not found in available tools, skipping")
+                        continue
+
+                    tool = available_tools[tool_id_str]
+                    logger.info(f"Processing tool: {tool.tool_name} (ID: {tool.id})")
+
+                    config_result = await self.db.execute(
+                        select(TenantToolConfig).where(
+                            (TenantToolConfig.tenant_id == tenant_id) &
+                            (TenantToolConfig.tool_id == tool.id)
+                        )
+                    )
+                    existing_config = config_result.scalar_one_or_none()
+
+                    if existing_config:
+                        logger.info(f"Updating existing config for tool {tool.tool_name}")
+                        existing_config.is_enabled = True
+                        existing_config.updated_by = created_by
+                        config = existing_config
+                    else:
+                        logger.info(f"Creating new config for tool {tool.tool_name}")
+                        config = TenantToolConfig(
+                            tenant_id=tenant_id,
+                            tool_id=tool.id,
+                            is_enabled=True,
+                            config_data={},
+                            configured_by=created_by
+                        )
+                        self.db.add(config)
+                        await self.db.flush()
+
+                    enabled_tools.append({
+                        "tool_name": tool.tool_name,
+                        "config_id": str(config.id)
+                    })
+
+                logger.info(f"Successfully set up {len(enabled_tools)} tools for tenant {tenant_name}")
+                setup_results["tools_setup"] = {
+                    "tenant_id": tenant_id,
+                    "enabled_tools": enabled_tools,
+                    "total_enabled": len(enabled_tools)
+                }
+
             await self.db.commit()
-            
-            await self._load_tenant_to_cache(tenant)
-            await self._load_tenant_config_to_redis(tenant.id)
-            
+
+            await self.invalidate_tenant_caches(tenant.id)
+            await DateTimeManager.tenant_now_cached(tenant.id, self.db)
+
             result = {
-                "tenant_id": str(tenant.id),
+                "tenant_id": tenant_id,
                 "tenant_name": tenant.tenant_name,
                 "timezone": tenant.timezone,
                 "locale": tenant.locale,
                 "sub_domain": tenant.sub_domain,
                 "description": tenant.description,
                 "default_groups": default_groups,
-                "created_at": tenant.created_at.isoformat()
+                "created_at": tenant.created_at.isoformat(),
+                "setup_results": setup_results
             }
-            
-            logger.info(f"Created tenant: {tenant_name} with timezone {timezone}")
+
+            logger.info(f"Successfully created tenant {tenant_name} with setup: providers={len(allowed_providers) if allowed_providers else 0}, tools={len(allowed_tools) if allowed_tools else 0}")
+
             return result
-            
+
         except Exception as e:
+            logger.error(f"Failed to create tenant with setup: {e}")
             await self.db.rollback()
-            logger.error(f"Failed to create tenant: {e}")
-            raise ServiceError(f"Failed to create tenant: {str(e)}")
+            raise ServiceError(f"Failed to create tenant with setup: {str(e)}")
 
     async def get_provider_models(self, provider_name: str) -> Dict[str, Any]:
         """
         Get list of available models for a specific provider
         """
         try:
-            from models.database.provider import Provider, ProviderModel
 
             provider_result = await self.db.execute(
                 select(Provider).where(Provider.provider_name.ilike(f"%{provider_name}%"))
@@ -115,7 +220,7 @@ class TenantService:
             models_result = await self.db.execute(
                 select(ProviderModel).where(
                     ProviderModel.provider_id == provider.id,
-                    ProviderModel.is_enabled == True
+                    ProviderModel.is_enabled
                 )
             )
             models = models_result.scalars().all()
@@ -150,8 +255,6 @@ class TenantService:
         Configure provider with API keys for tenant
         """
         try:
-            from models.database.provider import Provider, TenantProviderConfig, ProviderModel
-
             tenant_result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_id))
             tenant = tenant_result.scalar_one_or_none()
             if not tenant:
@@ -230,15 +333,13 @@ class TenantService:
         Create WorkflowAgent with configured provider
         """
         try:
-            from models.database.provider import TenantProviderConfig, Provider
-
             config_result = await self.db.execute(
                 select(TenantProviderConfig)
                 .join(Provider, Provider.id == TenantProviderConfig.provider_id)
                 .where(
                     (TenantProviderConfig.tenant_id == tenant_id) &
                     (Provider.provider_name == provider_name) &
-                    (TenantProviderConfig.is_enabled == True)
+                    (TenantProviderConfig.is_enabled)
                 )
             )
             provider_config = config_result.scalar_one_or_none()
@@ -305,8 +406,6 @@ class TenantService:
         Enable tools for tenant
         """
         try:
-            from models.database.tool import TenantToolConfig, Tool
-
             tools_result = await self.db.execute(
                 select(Tool).where(Tool.id.in_(tool_ids))
             )
@@ -372,10 +471,6 @@ class TenantService:
         Enable tools for department
         """
         try:
-            from models.database.tool import Tool
-            from models.database.agent import AgentToolConfig, Agent
-            from models.database.tenant import Department
-
             dept_result = await self.db.execute(select(Department).where(Department.id == department_id))
             department = dept_result.scalar_one_or_none()
             if not department:
@@ -508,14 +603,14 @@ class TenantService:
             logger.error(f"Failed to create default WorkflowAgent for tenant {tenant_id}: {e}")
             raise ServiceError(f"Failed to create workflow agent: {str(e)}")
     
-    async def get_tenant_by_id(self, tenant_id: str) -> Optional[Dict[str, Any]]:
+    async def get_tenant_by_id(self, tenant_id: str) -> Dict[str, Any]:
         """
         Get full tenant detail by ID including workflow agent and user counters.
         Uses caching to improve performance.
         """
         from services.cache.cache_manager import cache_manager
         
-        cache_key = f"tenant:{tenant_id}:details"
+        cache_key = f"tenant_config_{tenant_id}"
         
         try:
             cached_result = await cache_manager.get(cache_key)
@@ -523,62 +618,15 @@ class TenantService:
                 logger.debug(f"Cache hit for tenant details: {tenant_id}")
                 return cached_result
             
-            result = await self.db.execute(
-                select(Tenant)
-                .options(selectinload(Tenant.workflow_agent))
-                .where(Tenant.id == tenant_id)
-            )
-            tenant = result.scalar_one_or_none()
-            
-            if not tenant:
-                return None
+            from services.tenant.settings_service import SettingsService
+            settings_service = SettingsService(self.db)
 
-            total_users_result = await self.db.execute(
-                select(func.count()).select_from(User).where(User.tenant_id == tenant.id)
-            )
-            total_users = int(total_users_result.scalar() or 0)
-
-            admin_users_result = await self.db.execute(
-                select(func.count()).select_from(User).where(
-                    (User.tenant_id == tenant.id) & (User.role.in_(["ADMIN", "DEPT_ADMIN"]))
-                )
-            )
-            admin_users = int(admin_users_result.scalar() or 0)
-
-            detail: Dict[str, Any] = {
-                "id": str(tenant.id),
-                "tenant_id": str(tenant.id),
-                "tenant_name": tenant.tenant_name,
-                "timezone": tenant.timezone,
-                "locale": tenant.locale,
-                "is_active": tenant.is_active,
-                "status": "active" if tenant.is_active else "inactive",
-                "settings": tenant.settings or {},
-                "sub_domain": tenant.sub_domain,
-                "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
-                "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
-                "is_deleted": bool(tenant.is_deleted),
-                "deleted_at": tenant.deleted_at.isoformat() if tenant.deleted_at else None,
-                "version": tenant.version,
-                "admin_count": admin_users,
-                "user_count": total_users,
-                "workflow_agent": {
-                    "id": str(tenant.workflow_agent.id),
-                    "provider_name": tenant.workflow_agent.provider_name,
-                    "model_name": tenant.workflow_agent.model_name,
-                    "model_config": tenant.workflow_agent.model_config,
-                    "max_iterations": tenant.workflow_agent.max_iterations,
-                    "timeout_seconds": tenant.workflow_agent.timeout_seconds,
-                    "confidence_threshold": tenant.workflow_agent.confidence_threshold,
-                    "is_active": tenant.workflow_agent.is_active,
-                } if tenant.workflow_agent else None,
-            }
-
-            # Cache the result with 5 minute TTL (300 seconds)
-            await cache_manager.set(cache_key, detail, ttl=300)
+            tenant = await settings_service.get_tenant_settings_with_mapping(tenant_id)
+           
+            await self.invalidate_tenant_caches(tenant_id)
             logger.debug(f"Cached tenant details for: {tenant_id}")
 
-            return detail
+            return tenant
             
         except Exception as e:
             logger.error(f"Failed to get tenant {tenant_id}: {e}")
@@ -594,44 +642,188 @@ class TenantService:
         Update tenant information including timezone.
         Invalidates cache after successful update.
         """
-        from services.cache.cache_manager import cache_manager
-        
         try:
             if "timezone" in updates:
                 logger.info(f"Updating timezone for tenant {tenant_id} to {updates['timezone']}")
-            
+
             updates["updated_by"] = updated_by
-            
+
+            tenant_updates = {k: v for k, v in updates.items()
+                            if k not in ["allowed_providers", "allowed_tools"]}
+
             await self.db.execute(
                 update(Tenant)
                 .where(Tenant.id == tenant_id)
-                .values(**updates)
+                .values(**tenant_updates)
             )
-            
-            await self.db.commit()
-            
-            cache_key = f"tenant:{tenant_id}:details"
-            try:
-                await cache_manager.delete(cache_key)
-                logger.debug(f"Invalidated cache for updated tenant: {tenant_id}")
-            except Exception as cache_error:
-                logger.warning(f"Could not invalidate cache for tenant {tenant_id}: {cache_error}")
-            
-            if "timezone" in updates:
-                result = await self.db.execute(
-                    select(Tenant).where(Tenant.id == tenant_id)
+
+            if "allowed_providers" in updates and updates["allowed_providers"] is not None:
+
+                # Get existing configs with provider names in one query
+                existing_configs_result = await self.db.execute(
+                    select(TenantProviderConfig, Provider.provider_name)
+                    .join(Provider, Provider.id == TenantProviderConfig.provider_id)
+                    .where(TenantProviderConfig.tenant_id == tenant_id)
                 )
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    await self._load_tenant_to_cache(tenant)
-            
+                existing_configs = {}
+                provider_names = {}
+                for config, provider_name in existing_configs_result.all():
+                    existing_configs[config.provider_id] = config
+                    provider_names[config.provider_id] = provider_name
+
+                created_configs = []
+                for provider_name in updates["allowed_providers"]:
+                    provider_result = await self.db.execute(
+                        select(Provider).where(Provider.provider_name == provider_name)
+                    )
+                    provider = provider_result.scalar_one_or_none()
+
+                    if provider:
+                        if provider.id in existing_configs:
+                            existing_configs[provider.id].is_enabled = True
+                            existing_configs[provider.id].updated_by = updated_by
+                            config = existing_configs[provider.id]
+                        else:
+                            config = TenantProviderConfig(
+                                tenant_id=tenant_id,
+                                provider_id=provider.id,
+                                api_keys=[],
+                                current_key_index=0,
+                                rotation_strategy="round_robin",
+                                is_enabled=True,
+                                configured_by=updated_by
+                            )
+                            self.db.add(config)
+                            await self.db.flush()
+
+                        created_configs.append({
+                            "provider_name": provider_name,
+                            "config_id": str(config.id),
+                            "action": "updated" if provider.id in existing_configs else "created"
+                        })
+                    else:
+                        logger.warning(f"Provider {provider_name} not found, skipping")
+
+                for config in existing_configs.values():
+                    provider_name = provider_names.get(config.provider_id)
+                    if provider_name and provider_name not in updates["allowed_providers"]:
+                        config.is_enabled = False
+                        config.updated_by = updated_by
+
+            if "allowed_tools" in updates and updates["allowed_tools"] is not None:
+
+                logger.info(f"Updating tools for tenant {tenant_id}: {updates['allowed_tools']}")
+
+                existing_tool_configs_result = await self.db.execute(
+                    select(TenantToolConfig).where(TenantToolConfig.tenant_id == tenant_id)
+                )
+                existing_tool_configs = {config.tool_id: config for config in existing_tool_configs_result.scalars().all()}
+
+                tools_result = await self.db.execute(
+                    select(Tool).where(Tool.id.in_(updates["allowed_tools"]))
+                )
+                available_tools = {str(tool.id): tool for tool in tools_result.scalars().all()}
+
+                enabled_tools = []
+                for tool_id in updates["allowed_tools"]:
+                    tool_id_str = str(tool_id)
+                    if tool_id_str not in available_tools:
+                        logger.warning(f"Tool {tool_id} not found in available tools, skipping")
+                        continue
+
+                    tool = available_tools[tool_id_str]
+
+                    if tool.id in existing_tool_configs:
+                        existing_tool_configs[tool.id].is_enabled = True
+                        existing_tool_configs[tool.id].updated_by = updated_by
+                        config = existing_tool_configs[tool.id]
+                    else:
+                        config = TenantToolConfig(
+                            tenant_id=tenant_id,
+                            tool_id=tool.id,
+                            is_enabled=True,
+                            config_data={},
+                            configured_by=updated_by
+                        )
+                        self.db.add(config)
+                        await self.db.flush()
+
+                    enabled_tools.append({
+                        "tool_name": tool.tool_name,
+                        "config_id": str(config.id),
+                        "action": "updated" if tool.id in existing_tool_configs else "created"
+                    })
+
+                for config in existing_tool_configs.values():
+                    if str(config.tool_id) not in [str(tid) for tid in updates["allowed_tools"]]:
+                        config.is_enabled = False
+                        config.updated_by = updated_by
+
+                logger.info(f"Successfully updated {len(enabled_tools)} tools for tenant {tenant_id}")
+
+            await self.db.commit()
+
+            await self.invalidate_tenant_caches(tenant_id)
+            await DateTimeManager.tenant_now_cached(tenant_id)
+
             logger.info(f"Updated tenant {tenant_id}")
             return True
-            
+
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Failed to update tenant {tenant_id}: {e}")
-            raise ServiceError(f"Failed to update tenant: {str(e)}")
+            raise
+
+    async def get_tenant_with_config(self, tenant_id: str) -> Dict[str, Any]:
+        """
+        Get tenant detail with allowed providers and tools configuration
+        """
+        try:
+            result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_id))
+            tenant = result.scalar_one_or_none()
+            if not tenant:
+                raise ServiceError(f"Tenant not found: {tenant_id}")
+
+            provider_result = await self.db.execute(
+                select(Provider.provider_name)
+                .join(TenantProviderConfig, Provider.id == TenantProviderConfig.provider_id)
+                .where(
+                    (TenantProviderConfig.tenant_id == tenant_id) &
+                    (TenantProviderConfig.is_enabled)
+                )
+            )
+            allowed_providers = [row[0] for row in provider_result.all()]
+
+            tool_result = await self.db.execute(
+                select(Tool.id)
+                .join(TenantToolConfig, Tool.id == TenantToolConfig.tool_id)
+                .where(
+                    (TenantToolConfig.tenant_id == tenant_id) &
+                    (TenantToolConfig.is_enabled)
+                )
+            )
+            allowed_tools = [str(row[0]) for row in tool_result.all()]
+
+            return {
+                "id": str(tenant.id),
+                "tenant_id": str(tenant.id),
+                "tenant_name": tenant.tenant_name,
+                "timezone": tenant.timezone,
+                "locale": tenant.locale,
+                "sub_domain": tenant.sub_domain,
+                "is_active": tenant.is_active,
+                "description": tenant.description,
+                "allowed_providers": allowed_providers,
+                "allowed_tools": allowed_tools,
+                "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+                "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
+                "status": "active" if tenant.is_active else "inactive",
+                "settings": tenant.settings or {},
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get tenant with config {tenant_id}: {e}")
+            raise
     
     async def update_workflow_agent(
         self,
@@ -673,42 +865,7 @@ class TenantService:
             await self.db.rollback()
             logger.error(f"Failed to update WorkflowAgent for tenant {tenant_id}: {e}")
             raise ServiceError(f"Failed to update workflow configuration: {str(e)}")
-    
-    async def _load_tenant_to_cache(self, tenant: Tenant):
-        """
-        Load basic tenant info to Redis cache for timezone resolution
-        ConfigManager handles detailed config caching separately
-        """
-        try:
-            tenant_cache_data = {
-                "timezone": tenant.timezone
-            }
-            
-            try:
-                await redis_client.set_tenant_data(str(tenant.id), "basic", tenant_cache_data)
-            except Exception:
-                pass
-            
-            logger.info(f"Loaded tenant {tenant.tenant_name} timezone {tenant.timezone} to cache")
-            
-        except Exception as e:
-            logger.error(f"Failed to load tenant to cache: {e}")
-    
-    async def _load_tenant_config_to_redis(self, tenant_id: str):
-        """
-        Load tenant configuration to ConfigManager Redis cache
-        Includes providers, agents, tools, and workflow config
-        """
-        try:
-            from config.config_manager import config_manager
-            
-            await config_manager.refresh_tenant_cache(tenant_id)
-            
-            logger.info(f"Loaded tenant {tenant_id} configuration to ConfigManager Redis cache")
-            
-        except Exception as e:
-            logger.error(f"Failed to load tenant config to Redis: {e}")
-    
+
     async def get_workflow_config(self, tenant_id: str) -> Optional[Dict[str, Any]]:
         """
         Get WorkflowAgent configuration for tenant
@@ -784,7 +941,7 @@ class TenantService:
         Returns only basic info for login pages
         """
         try:
-            query = select(Tenant).where(Tenant.id == tenant_id, Tenant.is_active == True)
+            query = select(Tenant).where(Tenant.id == tenant_id, Tenant.is_active.is_(True))
             result = await self.db.execute(query)
             tenant = result.scalar_one_or_none()
 
@@ -817,171 +974,6 @@ class TenantService:
         except Exception as e:
             logger.error(f"Failed to get tenant public info: {e}")
             raise ServiceError(f"Failed to get tenant public info: {str(e)}")
-
-    async def create_tenant_with_setup(
-        self,
-        tenant_name: str,
-        timezone: str,
-        locale: str = "en_US",
-        sub_domain: str = None,
-        description: Optional[str] = None,
-        allowed_providers: Optional[List[str]] = None,
-        allowed_tools: Optional[List[str]] = None,
-        created_by: str = "system",
-    ) -> Dict[str, Any]:
-        """
-        Create tenant with optional provider and tools setup in single transaction
-        """
-        try:
-            tenant = Tenant(
-                tenant_name=tenant_name,
-                timezone=timezone,
-                locale=locale,
-                sub_domain=sub_domain,
-                description=description,
-                settings={},
-                created_by=created_by
-            )
-            
-            self.db.add(tenant)
-            await self.db.flush()  
-
-            try:
-                minio = MinioService()
-                await minio.ensure_bucket(str(tenant.id))
-            except Exception as storage_exc:
-                logger.error(f"Create tenant bucket failed: {storage_exc}")
-                raise
-            
-            default_groups = await self.permission_service.create_default_groups_for_tenant(
-                tenant_id=tenant.id,
-                created_by=created_by
-            )
-
-            tenant_id = str(tenant.id)
-            setup_results = {
-                "allowed_providers": None,
-                "tools_setup": None
-            }
-
-            if allowed_providers:
-                from models.database.provider import TenantProviderConfig, Provider
-
-                created_configs = []
-                for provider_name in allowed_providers:
-                    provider_result = await self.db.execute(
-                        select(Provider).where(Provider.provider_name == provider_name)
-                    )
-                    provider = provider_result.scalar_one_or_none()
-
-                    if provider:
-                        config = TenantProviderConfig(
-                            tenant_id=tenant_id,
-                            provider_id=provider.id,
-                            api_keys=[],
-                            current_key_index=0,
-                            rotation_strategy="round_robin",
-                            is_enabled=True,
-                            configured_by=created_by
-                        )
-                        self.db.add(config)
-                        await self.db.flush()
-                        created_configs.append({
-                            "provider_name": provider_name,
-                            "config_id": str(config.id)
-                        })
-                    else:
-                        logger.warning(f"Provider {provider_name} not found, skipping")
-
-                setup_results["allowed_providers"] = {
-                    "tenant_id": tenant_id,
-                    "allowed_providers": allowed_providers,
-                    "created_configs": created_configs
-                }
-
-            if allowed_tools:
-                from models.database.tool import TenantToolConfig, Tool
-
-                logger.info(f"Setting up tools for tenant {tenant_name}: {allowed_tools}")
-
-                tools_result = await self.db.execute(
-                    select(Tool).where(Tool.id.in_(allowed_tools))
-                )
-                available_tools = {str(tool.id): tool for tool in tools_result.scalars().all()}
-                logger.info(f"Found {len(available_tools)} available tools out of {len(allowed_tools)} requested")
-
-                enabled_tools = []
-                for tool_id in allowed_tools:
-                    tool_id_str = str(tool_id)
-                    if tool_id_str not in available_tools:
-                        logger.warning(f"Tool {tool_id} not found in available tools, skipping")
-                        continue
-
-                    tool = available_tools[tool_id_str]
-                    logger.info(f"Processing tool: {tool.tool_name} (ID: {tool.id})")
-
-                    config_result = await self.db.execute(
-                        select(TenantToolConfig).where(
-                            (TenantToolConfig.tenant_id == tenant_id) &
-                            (TenantToolConfig.tool_id == tool.id)
-                        )
-                    )
-                    existing_config = config_result.scalar_one_or_none()
-
-                    if existing_config:
-                        logger.info(f"Updating existing config for tool {tool.tool_name}")
-                        existing_config.is_enabled = True
-                        existing_config.updated_by = created_by
-                        config = existing_config
-                    else:
-                        logger.info(f"Creating new config for tool {tool.tool_name}")
-                        config = TenantToolConfig(
-                            tenant_id=tenant_id,
-                            tool_id=tool.id,
-                            is_enabled=True,
-                            config_data={},
-                            configured_by=created_by
-                        )
-                        self.db.add(config)
-                        await self.db.flush()
-
-                    enabled_tools.append({
-                        "tool_name": tool.tool_name,
-                        "config_id": str(config.id)
-                    })
-
-                logger.info(f"Successfully set up {len(enabled_tools)} tools for tenant {tenant_name}")
-                setup_results["tools_setup"] = {
-                    "tenant_id": tenant_id,
-                    "enabled_tools": enabled_tools,
-                    "total_enabled": len(enabled_tools)
-                }
-
-            await self.db.commit()
-
-            await self._load_tenant_to_cache(tenant)
-            await self._load_tenant_config_to_redis(tenant.id)
-
-            result = {
-                "tenant_id": tenant_id,
-                "tenant_name": tenant.tenant_name,
-                "timezone": tenant.timezone,
-                "locale": tenant.locale,
-                "sub_domain": tenant.sub_domain,
-                "description": tenant.description,
-                "default_groups": default_groups,
-                "created_at": tenant.created_at.isoformat(),
-                "setup_results": setup_results
-            }
-
-            logger.info(f"Successfully created tenant {tenant_name} with setup: providers={len(allowed_providers) if allowed_providers else 0}, tools={len(allowed_tools) if allowed_tools else 0}")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to create tenant with setup: {e}")
-            await self.db.rollback()
-            raise ServiceError(f"Failed to create tenant with setup: {str(e)}")
 
     async def invalidate_tenant_caches(
         self,

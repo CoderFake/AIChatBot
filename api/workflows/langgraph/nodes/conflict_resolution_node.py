@@ -8,6 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from .base import ExecutionNode
 from workflows.langgraph.state.state import RAGState
 from utils.logging import get_logger
+from services.orchestrator.orchestrator import Orchestrator
 
 logger = get_logger(__name__)
 
@@ -73,9 +74,12 @@ class ConflictResolutionNode(ExecutionNode):
     ) -> Dict[str, Any]:
         """Use LLM to analyze and resolve conflicts between agent responses"""
         try:
-            provider = state.get("provider")
-            if not provider:
-                logger.warning("Provider not found in state, returning first response")
+            provider_name = state.get("provider_name")
+            if provider_name:
+                orchestrator = Orchestrator()
+                provider = await orchestrator.llm(provider_name)
+            else:
+                logger.warning("Provider name not found in state, returning first response")
                 return {
                     "final_answer": agent_responses[0]["content"] if agent_responses else "",
                     "resolution_method": "fallback",
@@ -153,12 +157,14 @@ IMPORTANT:
 - Clearly explain your reasoning process
 - Focus on factual accuracy over agent confidence scores
 """
+            tenant_id = state.get("tenant_id")
             response = await provider.ainvoke(
                 conflict_resolution_prompt,
+                tenant_id,
                 response_format="json_object",
                 json_mode=True,
                 temperature=0.1,
-                max_tokens=2048,
+                max_tokens=4096,
                 markdown=False 
             )
             

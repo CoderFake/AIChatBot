@@ -8,6 +8,7 @@ from typing import Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.orchestrator.orchestrator import Orchestrator
+from services.agents.workflow_agent_service import WorkflowAgentService
 from utils.logging import get_logger
 from utils.language_utils import detect_language
 from utils.prompt_utils import PromptUtils
@@ -22,7 +23,8 @@ class TitleService:
 
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.orchestrator = Orchestrator(db=db)
+        self.orchestrator = Orchestrator()
+        self.workflow_agent_service = WorkflowAgentService(db)
 
     async def generate_and_update_session_title(
         self,
@@ -107,49 +109,21 @@ class TitleService:
         Core title generation logic
         """
         try:
-            detected_language = detect_language(first_message)
-            
-            language_instruction = PromptUtils.get_language_instruction(detected_language)
-            
-            system_prompt = f"""You are creating a conversation title that helps users organize their chat history.
+            prompt = f"Create a short title for this conversation: {first_message}\n\nKeep it simple and under 10 words. Use the same language as the message.\n\nTitle:"
 
-{language_instruction}
+            workflow_agent = await self.workflow_agent_service.get_workflow_agent_config(tenant_id)
+            provider_name = workflow_agent.get("provider_name")
 
-Rules for creating titles:
-- Create a natural, conversational title (5-15 words maximum)
-- Focus on the main topic, question, or intent
-- Use simple, everyday language 
-- Avoid meta-commentary like "(không có nội dung cụ thể)" or explanatory phrases
-- Make it specific enough to be memorable
-- Think like a human organizing their conversations
+            provider = await self.orchestrator.llm(provider_name)
 
-Examples of GOOD titles:
-- "Hỏi về thời tiết hôm nay"
-- "Cách nấu phở bò"  
-- "Giải thích machine learning"
-- "Lịch trình du lịch Đà Nẵng"
+            invoke_params = {
+                "prompt": prompt,
+                "tenant_id": tenant_id,
+                "temperature": 0.1,
+                "max_tokens": 50
+            }
 
-Examples of BAD titles:
-- "Chào buổi sáng (không có nội dung cụ thể)"
-- "Cuộc trò chuyện về nhiều chủ đề khác nhau"
-- "Người dùng hỏi một câu hỏi"
-
-Return ONLY the title, nothing else."""
-
-            user_prompt = self._build_user_prompt(first_message, detected_language)
-
-            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-
-            provider = await self.orchestrator.get_provider_for_tenant(tenant_id)
-            if not provider:
-                logger.error(f"No provider available for tenant {tenant_id}")
-                return None
-
-            title_response = await provider.ainvoke(
-                prompt=combined_prompt,
-                temperature=0.1,
-                max_tokens=100
-            )
+            title_response = await provider.ainvoke(**invoke_params)
 
             title = self._extract_clean_title(title_response)
             title = self._validate_and_fallback_title(title, first_message, session_id)
@@ -159,20 +133,7 @@ Return ONLY the title, nothing else."""
 
         except Exception as e:
             logger.error(f"Title generation failed for session {session_id}: {e}")
-            return None
-
-    def _build_user_prompt(self, first_message: str, detected_language: str) -> str:
-        """Build user prompt based on detected language"""
-        if detected_language == "vietnamese":
-            return f"Tin nhắn đầu tiên: \"{first_message}\"\n\nTạo tiêu đề ngắn gọn, tự nhiên cho cuộc trò chuyện này:"
-        elif detected_language == "japanese":
-            return f"最初のメッセージ: \"{first_message}\"\n\nこの会話の簡潔で自然なタイトルを作成してください："
-        elif detected_language == "korean":
-            return f"첫 번째 메시지: \"{first_message}\"\n\n이 대화의 간결하고 자연스러운 제목을 만들어주세요:"
-        elif detected_language == "chinese":
-            return f"第一条消息: \"{first_message}\"\n\n为这次对话创建一个简洁自然的标题："
-        else:
-            return f"First message: \"{first_message}\"\n\nCreate a concise, natural title for this conversation:"
+            raise
 
     def _extract_clean_title(self, title_response) -> str:
         """Extract clean title from LLM response"""
@@ -194,7 +155,6 @@ Return ONLY the title, nothing else."""
 
     def _validate_and_fallback_title(self, title: str, first_message: str, session_id: uuid.UUID) -> str:
         """Validate title and create fallback if needed"""
-        # Limit to 30 words
         words = title.split()
         if len(words) > 30:
             title = ' '.join(words[:30])

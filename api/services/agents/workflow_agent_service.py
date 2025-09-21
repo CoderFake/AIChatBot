@@ -6,14 +6,11 @@ import uuid
 from typing import Dict, Any, Optional, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, insert
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, update
 
 from models.database.agent import WorkflowAgent
-from models.database.tenant import Tenant
 from models.database.provider import Provider
 from services.cache.cache_manager import cache_manager
-from services.llm.provider_service import ProviderService
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -133,10 +130,8 @@ class WorkflowAgentService:
         Update workflow agent configuration
         """
         try:
-            # Validate provider and model availability
             await self._validate_provider_model(tenant_id, provider_name, model_name)
 
-            # Get current workflow agent
             stmt = select(WorkflowAgent).where(WorkflowAgent.tenant_id == uuid.UUID(tenant_id))
             result = await self.db.execute(stmt)
             workflow_agent = result.scalar_one_or_none()
@@ -237,8 +232,6 @@ class WorkflowAgentService:
         Get list of available models for provider
         """
         try:
-            # This would typically query provider configurations or use provider service
-            # For now, return common models based on provider
             if provider_name.lower() == "gemini":
                 return ["gemini-pro", "gemini-pro-vision", "gemini-1.5-pro"]
             elif provider_name.lower() == "openai":
@@ -260,12 +253,13 @@ class WorkflowAgentService:
         try:
             workflow_agent = await self.get_or_create_workflow_agent(tenant_id)
             
-            provider_config = await self._get_tenant_provider_config(tenant_id, workflow_agent["provider_name"])
+            result = await self._get_tenant_provider_config(tenant_id, workflow_agent["provider_name"])
             
             return {
                 "provider_name": workflow_agent["provider_name"],
                 "model_name": workflow_agent["model_name"],
                 "model_config": workflow_agent["model_config"],
+                "api_keys": result["api_keys"],
                 "max_iterations": workflow_agent["max_iterations"],
                 "timeout_seconds": workflow_agent["timeout_seconds"],
                 "confidence_threshold": workflow_agent["confidence_threshold"],
@@ -289,7 +283,6 @@ class WorkflowAgentService:
                 api_keys = cached_config.get("api_keys", [])
                 return cached_config
             
-            # Query database
             from models.database.provider import TenantProviderConfig, Provider
             from sqlalchemy import select
             import uuid
@@ -307,7 +300,6 @@ class WorkflowAgentService:
             
             if not provider_data:
                 logger.warning(f"No enabled provider config found for {provider_name} in tenant {tenant_id}")
-                # Return fallback config
                 fallback_config = {
                     "api_keys": [],
                     "base_config": {},
@@ -325,10 +317,8 @@ class WorkflowAgentService:
             provider_config = {
                 "api_keys": api_keys,
                 "base_config": provider.base_config or {},
-                "is_fallback": False,
-                "rate_limit_config": getattr(tenant_config, 'rate_limit_config', {}) or {},
-                "provider_display_name": getattr(provider, 'display_name', ''),
-                "provider_description": getattr(provider, 'description', '')
+                "provider_name": provider.provider_name,
+                "is_enabled": provider.is_enabled
             }
             
             # Cache the config
@@ -365,16 +355,12 @@ class WorkflowAgentService:
         """
         logger.warning(f"Using fallback workflow config for tenant {tenant_id}")
 
-        # Try to get available providers
         available_providers = await self._get_available_providers(tenant_id)
 
-        # Choose first available provider or default
         if available_providers:
             provider_name = available_providers[0]
         else:
-            provider_name = "gemini"  # Default fallback
-
-        # Set appropriate model based on provider
+            provider_name = "gemini" 
         if provider_name == "gemini":
             model_name = "gemini-2.0-flash"
         elif provider_name == "openai":

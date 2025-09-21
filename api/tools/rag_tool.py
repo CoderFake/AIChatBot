@@ -1,16 +1,18 @@
 """
 RAG Tool implementation
 """
-from typing import Dict, List, Any, Optional, Type
+from typing import List, Optional, Type
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from pydantic import BaseModel
 
-from common.types import AccessLevel, DBDocumentPermissionLevel
-
+from common.types import AccessLevel
 from models.models import RAGSearchInput
 from utils.logging import get_logger
+from config.settings import get_settings
 import json
+
+settings = get_settings()
 
 logger = get_logger(__name__)
 
@@ -50,8 +52,6 @@ class RAGSearchTool(BaseTool):
             JSON string containing search results, context, and metadata
         """
         try:
-            logger.info(f"RAG search - User: {user_id}, Dept: {department}, Query: {query[:50]}...")
-            
             import asyncio
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -216,18 +216,21 @@ class RAGSearchTool(BaseTool):
                 for collection_name in all_accessible_collections:
                     try:
                         if collection_name.endswith("_public"):
-                            milvus_instance = DBDocumentPermissionLevel.PUBLIC.value
+                            milvus_instance = settings.MILVUS_PUBLIC_HOST
                             collection_type = "public"
                         else:
-                            milvus_instance = DBDocumentPermissionLevel.PRIVATE.value
+                            milvus_instance = settings.MILVUS_PRIVATE_HOST
                             collection_type = "private"
-                        
+
+                        department_filter = f'department == "{department}"'
+
                         collection_results = await milvus_service.search_documents(
                             query=query,
                             collection_name=collection_name,
                             milvus_instance=milvus_instance,
                             top_k=10,
-                            score_threshold=0.7
+                            score_threshold=0.7,
+                            filter_expr=department_filter
                         )
                         
                         for result in collection_results:
@@ -272,7 +275,7 @@ class RAGSearchTool(BaseTool):
                         context_parts.append(content)
                     
                     documents.append({
-                        "document_id": result.get("id", metadata.get("document_id", "unknown")),
+                        "document_id": metadata.get("document_id", result.get("id", "unknown")),
                         "content": content,
                         "score": round(result.get("score", 0.0), 3),
                         "source": metadata.get("document_source", "Unknown"),

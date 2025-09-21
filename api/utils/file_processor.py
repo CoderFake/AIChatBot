@@ -1,6 +1,5 @@
 import os
 import platform
-import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -16,7 +15,6 @@ os.environ["MKL_NUM_THREADS"] = str(thread_count)
 os.environ["OPENBLAS_NUM_THREADS"] = str(thread_count)
 
 try:
-    import docling
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
