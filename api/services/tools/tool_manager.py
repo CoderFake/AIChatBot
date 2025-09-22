@@ -241,23 +241,18 @@ class ToolManager:
             if not tool_instance:
                 raise ValueError(f"Tool {tool_name} not found or not initialized")
 
-            # Special handling for datetime tool - inject tenant timezone
             if tool_name == "datetime" and user_context:
                 tenant_timezone = user_context.get("timezone", "UTC")
                 if "timezone" not in params or params.get("timezone") == "UTC":
                     params["timezone"] = tenant_timezone
                     logger.debug(f"Using tenant timezone for datetime tool: {tenant_timezone}")
 
-            agent_provider = None
+            agent_provider_name = None
             if agent_providers and agent_id and agent_id in agent_providers:
-                agent_provider = agent_providers[agent_id]
-                if agent_provider and hasattr(tool_instance, 'llm'):
-                    tool_instance.llm = agent_provider
+                agent_provider_name = agent_providers[agent_id]
             elif agent_providers and not agent_id:
                 if agent_providers:
-                    agent_provider = next(iter(agent_providers.values()))
-                    if agent_provider and hasattr(tool_instance, 'llm'):
-                        tool_instance.llm = agent_provider
+                    agent_provider_name = next(iter(agent_providers.values()))
 
             execution_params = params.copy()
             
@@ -266,11 +261,12 @@ class ToolManager:
                 
                 parser = DynamicToolParser(self._tool_instances)
                 if parser.should_parse_parameters(tool_name):
-                    if not agent_provider:
-                        raise ValueError(f"Agent provider is required for {tool_name} tool parameter parsing")
-                    
+                    if not agent_provider_name:
+                        raise ValueError(f"Agent provider name is required for {tool_name} tool parameter parsing")
+
                     query = params.get("query", "")
-                    parsed_params = await parser.parse_tool_parameters(tool_name, query, agent_provider)
+                    tenant_id = user_context.get("tenant_id") if user_context else None
+                    parsed_params = await parser.parse_tool_parameters(tool_name, query, agent_provider_name, tenant_id)
                     execution_params = parsed_params
             
             if hasattr(tool_instance, '_arun'):
