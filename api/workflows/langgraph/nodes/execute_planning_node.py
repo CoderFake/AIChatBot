@@ -1,9 +1,3 @@
-"""
-Execute Planning Node
-Executes the structured planning created by semantic reflection
-Coordinates multiple agents and their tools based on the execution plan
-workflows/langgraph/nodes/execution/execute_planning_node.py
-"""
 import asyncio
 import time
 from typing import Dict, Any, List
@@ -87,23 +81,36 @@ class ExecutePlanningNode(ExecutionNode):
             }
 
             execution_results = []
-            async for progress_update in self._execute_parallel_steps(
-                state,
-                execution_plan,
-                original_query,
-                user_context,
-                detected_language,
-                formatted_tasks,
-                semantic_routing
-            ):
-                if progress_update.get("type") == "progress":
-                    if progress_update.get("formatted_tasks") is not None:
-                        formatted_tasks = progress_update["formatted_tasks"]
-                    yield progress_update
-                elif progress_update.get("type") == "result":
-                    execution_results = progress_update.get("results", [])
-                    if progress_update.get("formatted_tasks") is not None:
-                        formatted_tasks = progress_update["formatted_tasks"]
+            try:
+                async for progress_update in self._execute_parallel_steps(
+                    state,
+                    execution_plan,
+                    original_query,
+                    user_context,
+                    detected_language,
+                    formatted_tasks,
+                    semantic_routing
+                ):
+                    if progress_update.get("type") == "progress":
+                        if progress_update.get("formatted_tasks") is not None:
+                            formatted_tasks = progress_update["formatted_tasks"]
+                        yield progress_update
+                    elif progress_update.get("type") == "result":
+                        execution_results = progress_update.get("results", [])
+                        if progress_update.get("formatted_tasks") is not None:
+                            formatted_tasks = progress_update["formatted_tasks"]
+            except Exception as e:
+                logger.error(f"Parallel execution failed in execute method: {e}")
+                execution_results = [{
+                    "agent_name": "System",
+                    "content": f"Parallel execution failed: {str(e)}",
+                    "status": "failed",
+                    "confidence": 0.0,
+                    "sources": [],
+                    "execution_time": 0.0,
+                    "error": str(e),
+                    "task_index": 0
+                }]
 
             successful_responses = [r for r in execution_results if r.get("status") == "completed"]
             failed_responses = [r for r in execution_results if r.get("status") == "failed"]
@@ -210,9 +217,16 @@ class ExecutePlanningNode(ExecutionNode):
                                     messages[str(j)] = tool_message
                             else:
                                 messages[str(j)] = f"Execute {tool}"
-                        
+                    
+                        task_name = purpose
+                        if "Task: " in purpose:
+                            task_name = purpose.split("Task: ")[-1].strip()
+                        elif isinstance(purpose, str) and len(purpose.split('\n')) > 1:
+                            task_name = purpose.split('\n')[-1].strip()
+
                         formatted_task = {
-                            "task_name": purpose,
+                            "task_name": task_name,
+                            "purpose": purpose,
                             "messages": messages,
                             "status": task.get("status", "pending"),
                             "agent": task.get("agent", ""),
@@ -236,6 +250,8 @@ class ExecutePlanningNode(ExecutionNode):
         Execute all steps in PARALLEL (step_1, step_2, step_3... run simultaneously)
         But tools within each task run SEQUENTIALLY (tool1 -> tool2 -> tool3...)
         """
+        execution_tasks = []
+        
         try:
             steps = execution_plan.get("steps", [])
 
@@ -286,96 +302,135 @@ class ExecutePlanningNode(ExecutionNode):
                 }
             }
 
-            execution_tasks = []
-            future_to_index = {}
+            processed_results: List[Any] = [None] * len(all_tasks)
+            completed_success = 0
+            processed_count = 0
+
             for i, task in enumerate(all_tasks):
-                if isinstance(task, dict):
-                    if i < len(formatted_tasks):
-                        formatted_tasks[i]["status"] = "in_progress"
-                        formatted_tasks[i]["agent"] = task.get("agent", formatted_tasks[i].get("agent", ""))
-                    task_future = asyncio.create_task(self._execute_single_task(state, task, i))
-                    execution_tasks.append(task_future)
-                    future_to_index[task_future] = i
+                try:
+                    if isinstance(task, dict):
+                        if i < len(formatted_tasks):
+                            formatted_tasks[i]["status"] = "in_progress"
+                            formatted_tasks[i]["agent"] = task.get("agent", formatted_tasks[i].get("agent", ""))
+                        task_future = asyncio.create_task(self._execute_single_task(state, task, i))
+                        execution_tasks.append((task_future, i))
+                    else:
+                        logger.warning(f"Task {i} is not a dict, skipping")
+                except Exception as e:
+                    logger.error(f"Failed to create task {i}: {e}")
+                    failed_result = {
+                        "agent_name": f"Task_{i}",
+                        "content": f"Task creation failed: {str(e)}",
+                        "status": "failed",
+                        "confidence": 0.0,
+                        "sources": [],
+                        "execution_time": 0.0,
+                        "error": str(e),
+                        "task_index": i
+                    }
+                    processed_results[i] = failed_result
+                    processed_count += 1
 
             if not execution_tasks:
                 yield {"type": "result", "results": [], "formatted_tasks": formatted_tasks}
                 return
 
-            processed_results: List[Any] = [None] * len(all_tasks)
-            completed_success = 0
-            processed_count = 0
-
-            for future in asyncio.as_completed(list(future_to_index.keys())):
-                idx = future_to_index[future]
+            # Process completed tasks
+            pending_tasks = [future for future, idx in execution_tasks]
+            
+            while pending_tasks:
                 try:
-                    result = await future
-                except Exception as exc:  # pragma: no cover - defensive logging
-                    logger.error(f"Task {idx} failed with exception: {exc}")
-                    result = {
-                        "agent_name": f"Task_{idx}",
-                        "content": f"Task execution failed: {str(exc)}",
-                        "status": "failed",
-                        "confidence": 0.0,
-                        "sources": [],
-                        "execution_time": 0.0,
-                        "error": str(exc),
-                        "task_index": idx
-                    }
+                    done, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    
+                    for completed_task in done:
+                        task_idx = None
+                        for future, idx in execution_tasks:
+                            if future == completed_task:
+                                task_idx = idx
+                                break
+                        
+                        if task_idx is None:
+                            logger.error("Could not find task index for completed task")
+                            continue
+                            
+                        try:
+                            result = await completed_task
+                        except Exception as exc:
+                            logger.error(f"Task {task_idx} failed with exception: {exc}")
+                            result = {
+                                "agent_name": f"Task_{task_idx}",
+                                "content": f"Task execution failed: {str(exc)}",
+                                "status": "failed",
+                                "confidence": 0.0,
+                                "sources": [],
+                                "execution_time": 0.0,
+                                "error": str(exc),
+                                "task_index": task_idx
+                            }
 
-                processed_results[idx] = result
-                processed_count += 1
+                        processed_results[task_idx] = result
+                        processed_count += 1
 
-                status = result.get("status", "completed")
-                if status == "completed":
-                    completed_success += 1
+                        status = result.get("status", "completed")
+                        if status == "completed":
+                            completed_success += 1
 
-                if idx < len(formatted_tasks):
-                    formatted_tasks[idx]["status"] = "completed" if status == "completed" else "failed"
-                    formatted_tasks[idx]["result"] = result
-                    if status != "completed":
-                        formatted_tasks[idx]["error"] = result.get("error") or result.get("content")
+                        if task_idx < len(formatted_tasks):
+                            formatted_tasks[task_idx]["status"] = "completed" if status == "completed" else "failed"
+                            formatted_tasks[task_idx]["result"] = result
+                            if status != "completed":
+                                formatted_tasks[task_idx]["error"] = result.get("error") or result.get("content")
 
-                tools_used = result.get("tools_used") or []
-                tool_display = ", ".join(tools_used) if isinstance(tools_used, list) and tools_used else result.get("tool") or "tool"
-                agent_display = result.get("agent_name") or result.get("agent") or "Agent"
+                        tools_used = result.get("tools_used") or []
+                        tool_display = ", ".join(tools_used) if isinstance(tools_used, list) and tools_used else result.get("tool") or "tool"
+                        agent_display = result.get("agent_name") or result.get("agent") or "Agent"
 
-                if status == "completed":
-                    progress_message = get_workflow_message(
-                        "task_completed_sequential",
-                        detected_language,
-                        current=completed_success,
-                        total=len(all_tasks),
-                        agent=agent_display,
-                        tool=tool_display
-                    )
-                else:
-                    error_detail = result.get("error") or result.get("content", "")
-                    progress_message = (
-                        f"Task {agent_display} failed: {error_detail}" if error_detail else get_workflow_message(
-                            "generic_error",
-                            detected_language
-                        )
-                    )
+                        if status == "completed":
+                            progress_message = get_workflow_message(
+                                "task_completed_sequential",
+                                detected_language,
+                                current=completed_success,
+                                total=len(all_tasks),
+                                agent=agent_display,
+                                tool=tool_display
+                            )
+                        else:
+                            error_detail = result.get("error") or result.get("content", "")
+                            progress_message = (
+                                f"Task {agent_display} failed: {error_detail}" if error_detail else get_workflow_message(
+                                    "generic_error",
+                                    detected_language
+                                )
+                            )
 
-                yield {
-                    "type": "progress",
-                    "node": "execute_planning",
-                    "output": {
-                        "processing_status": "task_completed" if status == "completed" else "task_failed",
-                        "progress_percentage": self._calculate_progress_percentage(
-                            "task_completed", processed_count, len(all_tasks)
-                        ),
-                        "progress_message": progress_message,
-                        "current_step": processed_count,
-                        "total_steps": len(all_tasks),
-                        "formatted_tasks": formatted_tasks,
-                        "should_yield": True
-                    }
-                }
+                        yield {
+                            "type": "progress",
+                            "node": "execute_planning",
+                            "output": {
+                                "processing_status": "task_completed" if status == "completed" else "task_failed",
+                                "progress_percentage": self._calculate_progress_percentage(
+                                    "task_completed", processed_count, len(all_tasks)
+                                ),
+                                "progress_message": progress_message,
+                                "current_step": processed_count,
+                                "total_steps": len(all_tasks),
+                                "formatted_tasks": formatted_tasks,
+                                "should_yield": True
+                            }
+                        }
+                        
+                except Exception as wait_exc:
+                    logger.error(f"Error in asyncio.wait: {wait_exc}")
+                    # Cancel remaining tasks
+                    for task in pending_tasks:
+                        if not task.done():
+                            task.cancel()
+                    break
 
             filtered_results = [res for res in processed_results if res is not None]
+            actual_successful = sum(1 for r in filtered_results if r.get("status") == "completed")
             logger.info(
-                f"Parallel execution completed: {completed_success}/{len(all_tasks)} tasks successful"
+                f"Parallel execution completed: {actual_successful}/{len(all_tasks)} tasks successful"
             )
             yield {
                 "type": "result",
@@ -385,7 +440,14 @@ class ExecutePlanningNode(ExecutionNode):
 
         except Exception as e:
             logger.error(f"Parallel execution failed: {e}")
-            yield {"type": "result", "results": [], "formatted_tasks": formatted_tasks}
+
+            # Cancel all pending tasks
+            for task_future, _ in execution_tasks:
+                if not task_future.done():
+                    task_future.cancel()
+
+            # Re-raise the exception to let the caller handle it
+            raise e
 
     async def _execute_single_task(
         self,
@@ -410,8 +472,9 @@ class ExecutePlanningNode(ExecutionNode):
             if isinstance(tools, list) and len(tools) > 1:
                 tools_names = [t.get('tool', t) if isinstance(t, dict) else t for t in tools]
                 logger.info(f"Task {task_index} using sequential tools: {tools_names}")
+                queries = task.get("queries", [])
                 agent_response = await self._execute_agent_with_sequential_tools(
-                    state, agent_name, tools, purpose, agent_id
+                    state, agent_name, tools, purpose, agent_id, queries
                 )
             else:
                 if tools and isinstance(tools, list) and len(tools) > 0:
@@ -426,8 +489,15 @@ class ExecutePlanningNode(ExecutionNode):
                     tool_name = "rag_tool"
                     tool_message = purpose
 
+                # Use queries from task if available, otherwise use tool_message
+                queries = task.get("queries", [])
+                if queries and isinstance(queries, list) and len(queries) > 0:
+                    query_to_use = queries[0]  # Use first query as main query
+                else:
+                    query_to_use = tool_message
+
                 agent_response = await self._execute_agent_task(
-                    state, agent_name, tool_name, tool_message, agent_id
+                    state, agent_name, tool_name, query_to_use, agent_id
                 )
 
             execution_time = time.time() - start_time
@@ -526,11 +596,13 @@ class ExecutePlanningNode(ExecutionNode):
         agent_name: str,
         tools_sequence: List[Any],
         purpose: str = None,
-        agent_id: str = None
+        agent_id: str = None,
+        queries: List[str] = None
     ) -> Dict[str, Any]:
         """
         Execute an agent with SEQUENTIAL tools
         tools_sequence: [{"tool": "tool1", "message": "msg1"}, {"tool": "tool2", "message": "msg2"}]
+        queries: ["query_for_tool1", "query_for_tool2"] - specific queries for each tool
         Each tool's result becomes context for the next tool
         """
         try:
@@ -557,10 +629,16 @@ class ExecutePlanningNode(ExecutionNode):
             for i, tool_obj in enumerate(tools_sequence):
                 if isinstance(tool_obj, dict):
                     current_tool = tool_obj.get("tool", "rag_tool")
-                    tool_message = tool_obj.get("message", purpose or original_query)
+                    if queries and isinstance(queries, list) and i < len(queries):
+                        tool_message = queries[i]
+                    else:
+                        tool_message = tool_obj.get("message", purpose or original_query)
                 else:
                     current_tool = str(tool_obj)
-                    tool_message = purpose or original_query
+                    if queries and isinstance(queries, list) and i < len(queries):
+                        tool_message = queries[i]
+                    else:
+                        tool_message = purpose or original_query
 
                 logger.debug(f"Agent {agent_name} executing tool {i+1}/{len(tools_sequence)}: {current_tool}")
 
@@ -710,10 +788,7 @@ Sources: {len(current_sources)} sources found
                             break
 
                 if has_sequential_tools:
-                    logger.info(f"Single agent {single_agent} has sequential tools")
-                    return "single_agent_sequential"
-
-                logger.info(f"Single agent {single_agent} - treating as single execution")
+                    logger.info(f"Single agent {single_agent} - treating as single execution")
                 return "single_agent_sequential"
 
             elif len(unique_agents) > 1:
