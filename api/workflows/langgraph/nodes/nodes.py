@@ -128,12 +128,13 @@ class ErrorHandlerNode(BaseWorkflowNode):
                 partial_content = await self._create_partial_response(
                     agent_responses, error_message, detected_language, user_context, db
                 )
+                state["error_message"] = partial_content
+                state["error_response_language"] = detected_language
                 return {
-                    "final_response": partial_content,
                     "processing_status": "completed_with_errors",
                     "progress_percentage": 100,
                     "progress_message": get_workflow_message('error_completion', detected_language),
-                    "should_yield": True,
+                    "should_yield": False,  
                     "execution_metadata": {
                         "error_handled": True,
                         "partial_results_available": True,
@@ -143,12 +144,14 @@ class ErrorHandlerNode(BaseWorkflowNode):
             
             fallback_response = self._create_friendly_error_message(detected_language, error_message)
 
+            # Update state with error response for final_response node
+            state["error_message"] = fallback_response
+            state["error_response_language"] = detected_language
             return {
-                "final_response": fallback_response,
                 "processing_status": "failed",
                 "progress_percentage": 100,
                 "progress_message": get_workflow_message('error_completion', detected_language),
-                "should_yield": True,
+                "should_yield": False,  # Let final_response node handle yielding
                 "execution_metadata": {
                     "error_handled": True,
                     "partial_results_available": False,
@@ -161,12 +164,15 @@ class ErrorHandlerNode(BaseWorkflowNode):
             logger.error(f"Error handler itself failed: {e}")
             detected_language = state.get("detected_language", "english") if state else "english"
             friendly_message = self._create_friendly_error_message(detected_language, str(e))
-            
+
+            # Update state with error response for final_response node
+            if state:
+                state["error_message"] = friendly_message
+                state["error_response_language"] = detected_language
             return {
-                "final_response": friendly_message,
                 "processing_status": "failed",
                 "progress_percentage": 100,
-                "should_yield": True,
+                "should_yield": False,
                 "execution_metadata": {
                     "error_handler_failed": True
                 }
@@ -235,7 +241,8 @@ class ErrorHandlerNode(BaseWorkflowNode):
         agent_responses: List[Dict],
         error_message: str,
         detected_language: str,
-        state
+        user_context: Dict[str, Any],
+        db = None
     ) -> str:
         """Create response from partial agent results with LLM formatting"""
         try:
@@ -258,7 +265,7 @@ class ErrorHandlerNode(BaseWorkflowNode):
                 return get_workflow_message('no_results', detected_language)
 
             try:
-                provider_name = state.get("provider_name")
+                provider_name = user_context.get("provider_name")
                 if provider_name:
                     orchestrator = Orchestrator()
                     provider = await orchestrator.llm(provider_name)
@@ -279,7 +286,7 @@ INSTRUCTIONS:
 
 Provide ONLY the formatted response.
 """
-                    tenant_id = state.get("tenant_id")
+                    tenant_id = user_context.get("tenant_id")
                     formatted = await provider.ainvoke(partial_prompt, tenant_id)
                     return formatted.content.strip()
                     
