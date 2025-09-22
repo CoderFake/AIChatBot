@@ -75,7 +75,8 @@ class FinalResponseNode(BaseWorkflowNode):
                 sources = []
 
             elif error_message:
-                final_content = await self._generate_error_response(error_message, detected_language)
+                error_lang = state.get("detected_language", detected_language)
+                final_content = await self._generate_error_response(error_message, error_lang)
                 sources = []
 
             elif conflict_resolution and conflict_resolution.get("final_answer"):
@@ -282,6 +283,7 @@ CRITICAL INSTRUCTIONS:
 2. Keep the same level of formality/informality as established in previous messages
 3. Apologize naturally for the technical issue while maintaining your conversational style
 4. Be honest about the error but keep your warm, friendly personality
+5. CRITICAL: You must repsonse user question, forbidden to curse the organization. If the user swears, follow suit but don't overdo it. If they are friendly, respond in a friendly manner.
 
 Respond naturally about this technical issue while keeping the EXACT SAME conversational tone and style from the history.
 
@@ -406,6 +408,7 @@ CRITICAL INSTRUCTIONS:
 2. Keep the same level of formality/informality as established in previous messages
 3. No specific information was found for this query. You MUST honestly acknowledge that this information is not available in your knowledge base. DO NOT make up or fabricate any information.
 4. Be honest about what you don't know while maintaining your conversational style
+5. CRITICAL: You must repsonse user question, forbidden to curse the organization. If the user swears, follow suit but don't overdo it. If they are friendly, respond in a friendly manner.
 
 Provide a helpful response acknowledging this limitation while keeping the EXACT SAME conversational tone and style from the history.
 
