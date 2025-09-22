@@ -160,18 +160,29 @@ class ChatService:
                 "response": response
             }
 
-            await self._cache_message(message_data)
-
             message = ChatMessage(**message_data)
 
             self.db.add(message)
             await self.db.commit()
             await self.db.refresh(message)
 
+            updated_message_data = {
+                "session_id": message.session_id,
+                "query": message.query,
+                "response": message.response,
+                "language": message.language,
+                "processing_time": message.processing_time,
+                "model_used": message.model_used,
+                "confidence_score": message.confidence_score,
+                "chat_metadata": message.chat_metadata,
+                "created_at": message.created_at.isoformat() if message.created_at else None
+            }
+            await self._cache_message(updated_message_data)
+
+            await self.update_session_message_count(session_id)
+
             await self._invalidate_chat_messages_cache(str(session_id))
             await self.invalidate_message_cache(session_id)
-            
-            await self.update_session_message_count(session_id)
 
             logger.info(f"Saved message for session {session_id}")
             return message
@@ -698,18 +709,33 @@ class ChatService:
 
                             model_used = self._get_model_used(provider)
 
+                            follow_up_questions = output.get("follow_up_questions", [])
+                            if follow_up_questions:
+                                yield self._create_sse_event(4, "followup_question", {
+                                    "follow_up_questions": follow_up_questions,
+                                    "message": "Generated follow-up questions"
+                                })
+
+                            # Yield response first
+                            yield self._create_sse_event(5, "end", {
+                                "message": "Response completed",
+                                "progress": output.get("progress_percentage", 100),
+                                "status": processing_status,
+                                "final_response": full_response.strip(),
+                                "sources": output.get("final_sources", []),
+                                "reasoning": output.get("reasoning", ""),
+                                "confidence_score": output.get("confidence_score", 0.0),
+                                "flow_action": output.get("flow_action", []),
+                                "execution_metadata": output.get("execution_metadata", {})
+                            })
+
+                            # Save message after yielding response
                             logger.info(
                                 f"SAVING_FINAL_RESPONSE: session_id={session_id}, response_length={len(full_response.strip())}, "
                                 f"is_first_message={is_first_message}"
                             )
 
                             if is_first_message:
-                                await self.save_message(
-                                    session_id=session_id,
-                                    query=query,
-                                    language=detected_language,
-                                    response=None  # User message
-                                )
                                 await self.save_message(
                                     session_id=session_id,
                                     query=query,
@@ -727,25 +753,6 @@ class ChatService:
                                     model_used=model_used,
                                     chat_metadata=chat_metadata
                                 )
-
-                            follow_up_questions = output.get("follow_up_questions", [])
-                            if follow_up_questions:
-                                yield self._create_sse_event(4, "followup_question", {
-                                    "follow_up_questions": follow_up_questions,
-                                    "message": "Generated follow-up questions"
-                                })
-
-                            yield self._create_sse_event(5, "end", {
-                                "message": "Response completed",
-                                "progress": output.get("progress_percentage", 100),
-                                "status": processing_status,
-                                "final_response": full_response.strip(),
-                                "sources": output.get("final_sources", []),
-                                "reasoning": output.get("reasoning", ""),
-                                "confidence_score": output.get("confidence_score", 0.0),
-                                "flow_action": output.get("flow_action", []),
-                                "execution_metadata": output.get("execution_metadata", {})
-                            })
                             return
 
                         except Exception as stream_err:
@@ -767,12 +774,6 @@ class ChatService:
                             )
 
                             if is_first_message:
-                                await self.save_message(
-                                    session_id=session_id,
-                                    query=query,
-                                    language=detected_language,
-                                    response=None  # User message
-                                )
                                 await self.save_message(
                                     session_id=session_id,
                                     query=query,
@@ -811,18 +812,27 @@ class ChatService:
                         else:
                             final_text = json.dumps(final_payload, ensure_ascii=False)
 
+                        # Yield response first
+                        yield self._create_sse_event(5, "end", {
+                            "message": output.get("progress_message", "Response completed"),
+                            "progress": output.get("progress_percentage", 100),
+                            "status": processing_status,
+                            "final_response": final_text,
+                            "sources": output.get("final_sources", []),
+                            "reasoning": output.get("reasoning", ""),
+                            "confidence_score": output.get("confidence_score", 0.0),
+                            "follow_up_questions": output.get("follow_up_questions", []),
+                            "flow_action": output.get("flow_action", []),
+                            "execution_metadata": output.get("execution_metadata", {})
+                        })
+
+                        # Save message after yielding response
                         logger.info(
                             f"SAVING_DIRECT_FINAL_RESPONSE: session_id={session_id}, response_length={len(final_text)}, "
                             f"is_first_message={is_first_message}"
                         )
 
                         if is_first_message:
-                            await self.save_message(
-                                session_id=session_id,
-                                query=query,
-                                language=detected_language,
-                                response=None  # User message
-                            )
                             await self.save_message(
                                 session_id=session_id,
                                 query=query,
@@ -840,19 +850,6 @@ class ChatService:
                                 model_used=output.get("model_used", "workflow"),
                                 chat_metadata=chat_metadata
                             )
-
-                        yield self._create_sse_event(5, "end", {
-                            "message": output.get("progress_message", "Response completed"),
-                            "progress": output.get("progress_percentage", 100),
-                            "status": processing_status,
-                            "final_response": final_text,
-                            "sources": output.get("final_sources", []),
-                            "reasoning": output.get("reasoning", ""),
-                            "confidence_score": output.get("confidence_score", 0.0),
-                            "follow_up_questions": output.get("follow_up_questions", []),
-                            "flow_action": output.get("flow_action", []),
-                            "execution_metadata": output.get("execution_metadata", {})
-                        })
                         return
 
                 elif output.get("processing_status") == "failed":
@@ -866,13 +863,21 @@ class ChatService:
                         detected_output_language
                     )
 
+                    # Yield error response first
+                    yield self._create_sse_event(5, "end", {
+                        "message": output.get("progress_message", "Processing error"),
+                        "progress": output.get("progress_percentage", 0),
+                        "status": "failed",
+                        "final_response": error_response,
+                        "sources": output.get("final_sources", []),
+                        "reasoning": error_details,
+                        "confidence_score": 0.0,
+                        "follow_up_questions": output.get("follow_up_questions", []),
+                        "flow_action": output.get("flow_action", []),
+                        "execution_metadata": output.get("execution_metadata", {})
+                    })
+                    
                     if is_first_message:
-                        await self.save_message(
-                            session_id=session_id,
-                            query=query,
-                            language=detected_language,
-                            response=None  # User message
-                        )
                         await self.save_message(
                             session_id=session_id,
                             query=query,
@@ -890,19 +895,6 @@ class ChatService:
                             model_used=output.get("model_used", "workflow"),
                             chat_metadata=chat_metadata
                         )
-
-                    yield self._create_sse_event(5, "end", {
-                        "message": output.get("progress_message", "Processing error"),
-                        "progress": output.get("progress_percentage", 0),
-                        "status": "failed",
-                        "final_response": error_response,
-                        "sources": output.get("final_sources", []),
-                        "reasoning": error_details,
-                        "confidence_score": 0.0,
-                        "follow_up_questions": output.get("follow_up_questions", []),
-                        "flow_action": output.get("flow_action", []),
-                        "execution_metadata": output.get("execution_metadata", {})
-                    })
                     return
                         
         except Exception as e:
