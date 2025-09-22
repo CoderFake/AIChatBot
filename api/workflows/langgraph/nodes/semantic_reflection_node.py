@@ -51,68 +51,6 @@ class SemanticReflectionNode(AnalysisNode):
 
         except Exception as e:
             logger.error(f"Semantic reflection failed: {e}")
-            return await self._handle_error(e)
-
-    async def _perform_semantic_analysis(self, state: RAGState) -> dict:
-        """Perform semantic analysis to detect chitchat and language"""
-        try:
-            query = state["query"]
-            message_history = state.get("messages", [])
-            user_context = state["user_context"]
-            provider_name = state.get("provider_name")
-
-            semantic_result = {
-                "is_chitchat": False,
-                "refined_query": query,
-                "summary_history": "",
-                "detected_language": "english"
-            }
-
-            if provider_name:
-                orchestrator = Orchestrator()
-                provider = await orchestrator.llm(provider_name)
-                history_text = self._format_message_history(message_history, limit=5)
-                semantic_determination_prompt = self._build_semantic_determination_prompt(history_text, query)
-
-                temperature = user_context.get("temperature", 0.1)
-                tenant_id = state.get("tenant_id")
-                semantic_response = await provider.ainvoke(
-                    semantic_determination_prompt,
-                    tenant_id,
-                    response_format="json_object",
-                    json_mode=True,
-                    temperature=temperature,
-                    max_tokens=4096
-                )
-
-                semantic_content = semantic_response.content.strip()
-                if not semantic_content:
-                    raise RuntimeError("Provider returned empty response for semantic determination")
-
-                try:
-                    semantic_result = json.loads(semantic_content)
-                except (json.JSONDecodeError, KeyError) as json_err:
-                    logger.error(f"Failed to parse semantic analysis JSON: {json_err}")
-                    semantic_result = {
-                        "is_chitchat": False,
-                        "refined_query": query,
-                        "summary_history": "",
-                        "detected_language": "english"
-                    }
-
-            result = {
-                "semantic_analysis": semantic_result,
-                "original_query": query,
-                "detected_language": semantic_result["detected_language"],
-                "is_chitchat": semantic_result.get("is_chitchat", False),
-                "summary_history": semantic_result.get("summary_history", "")
-            }
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Semantic analysis failed: {e}")
-            raise
 
     def _format_message_history(self, messages, limit: int = 5) -> str:
         """
@@ -153,42 +91,105 @@ CHAT HISTORY:
 
 CURRENT QUERY: {query}
 
-Analyze the conversation and determine:
-1. Is this a casual conversation (chitchat) or a task that requires tool/agent execution?
-   - If user asks for current time, weather, calculations, or specific information → NOT chitchat
-   - If user just greets, thanks, or makes general conversation → chitchat
-2. What is the refined, clear version of the current query?
-3. What is the main focus/topic of this conversation?
-4. Full description of information compiled from previous conversation not too long but meaningful
-5. Accurately judge what language the question is in, for example vietnamese, english, japanese, korean,..
+CRITICAL ANALYSIS:
+1. Is this chitchat (casual conversation) or tool execution (needs real-time data/tools)?
+   - CHITCHAT ONLY: pure greetings, thanks, small talk with no specific request
+   - TOOL EXECUTION: any question requiring current info, calculations, or external data
+
+2. What is the clear, specific version of the query in English?
+
+3. What is the main topic/focus of this conversation?
+
+4. Brief summary of previous conversation context
+
+5. Query language (vietnamese, english, etc.)
 
 Return ONLY valid JSON:
 {{
     "detected_language": "english",
     "is_chitchat": true/false,
-    "refined_query": "Clear, specific version of the query",
+    "refined_query": "The query version must be clear and specific in the language the user asks.",
     "summary_history": "Brief summary of what this conversation is focusing on..."
 }}
 
 CRITICAL RULES:
 - Return ONLY valid JSON object
+- refined_query is MUST be clear and specific in the language the user asks.
+"""
 
-CHITCHAT (is_chitchat = true):
-- Simple greetings: "Xin chào", "Hello", "Hi"
-- Thank you: "Cảm ơn", "Thanks"
-- Casual conversation without specific request
-- Small talk about general topics
+    async def _perform_semantic_analysis(self, state: RAGState) -> dict:
+        """Perform semantic analysis to detect chitchat and language"""
+        try:
+            query = state["query"]
+            message_history = state.get("messages", [])
+            user_context = state["user_context"]
+            provider_name = state.get("provider_name")
 
-TOOL/AGENT EXECUTION (is_chitchat = false):
-- Time-related queries: "Mấy giờ rồi?", "What time is it?", "Bây giờ là mấy giờ?"
-- Weather queries: "Thời tiết hôm nay", "Weather today"
-- Information search: specific questions about facts, data
-- Task execution: calculations, document search, analysis
-- Any query that needs real-time data or specific information
+            semantic_result = {
+                "is_chitchat": False,
+                "refined_query": query,
+                "summary_history": "",
+                "detected_language": "english"
+            }
 
-- refined_query should be clear and specific
-- summary_history should capture the main topic/theme of the conversation
-- Language detection is handled separately (ignore this field)"""
+            if provider_name:
+                try:
+                    orchestrator = Orchestrator()
+                    provider = await orchestrator.llm(provider_name)
+                    history_text = self._format_message_history(message_history, limit=5)
+                    semantic_determination_prompt = self._build_semantic_determination_prompt(history_text, query)
+
+                    temperature = user_context.get("temperature", 0.1)
+                    tenant_id = state.get("tenant_id")
+                    semantic_response = await provider.ainvoke(
+                        semantic_determination_prompt,
+                        tenant_id,
+                        response_format="json_object",
+                        json_mode=True,
+                        temperature=temperature,
+                        max_tokens=4096
+                    )
+
+                    semantic_content = semantic_response.content.strip()
+                    if not semantic_content:
+                        raise RuntimeError("Provider returned empty response for semantic determination")
+
+                    try:
+                        semantic_result = json.loads(semantic_content)
+                        logger.info(f"Semantic analysis result: {semantic_result}")
+                    except (json.JSONDecodeError, KeyError) as json_err:
+                        logger.error(f"Failed to parse semantic analysis JSON: {json_err}, raw content: {semantic_content[:500]}")
+                        semantic_result = {
+                            "is_chitchat": False,
+                            "refined_query": query,
+                            "summary_history": "",
+                            "detected_language": "english"
+                        }
+                except RuntimeError as provider_err:
+                    if "not found" in str(provider_err).lower():
+                        logger.warning(f"Provider {provider_name} not available for semantic analysis, falling back to default: {provider_err}")
+                        semantic_result = {
+                            "is_chitchat": False,
+                            "refined_query": query,
+                            "summary_history": "",
+                            "detected_language": "english"
+                        }
+                    else:
+                        raise
+
+            result = {
+                "semantic_analysis": semantic_result,
+                "original_query": query,
+                "detected_language": semantic_result["detected_language"],
+                "is_chitchat": semantic_result.get("is_chitchat", False),
+                "summary_history": semantic_result.get("summary_history", "")
+            }
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Semantic analysis failed: {e}")
+            raise
 
     def _build_reflection_prompt(self,
         query: str, detected_language: str,
@@ -209,6 +210,8 @@ ACCESS LEVELS: {user_access_levels}
 HISTORY CONTEXT: {history_context}
 CONVERSATION SUMMARY FOCUSING ON: {semantic_result.get("summary_history", "")}
 TENANT TIMEZONE: {tenant_timezone}
+
+QUERY YOU MUST FOLLOW: {semantic_result.get("refined_query", query)}
 
 AVAILABLE AGENTS AND TOOLS (nested structure):
 {agents_json}
@@ -249,7 +252,7 @@ CRITICAL STRUCTURE - Return ONLY valid JSON for task execution:
                                     "message": "Specific message for tool_2 in {detected_language}"
                                 }}
                             ],
-                            "queries": ["subquery_1_in_{detected_language}", "subquery_2_in_{detected_language}"],
+                            "queries": ["refined_subquery_1_in_{detected_language}", "refined_subquery_2_in_{detected_language}"],
                             "status": "pending"
                         }}
                     ]
@@ -266,7 +269,7 @@ CRITICAL STRUCTURE - Return ONLY valid JSON for task execution:
                                     "message": "Message for this tool in {detected_language}"
                                 }}
                             ],
-                            "queries": ["subquery_in_{detected_language}"],
+                            "queries": ["refined_subquery_in_{detected_language}"],
                             "status": "pending"
                         }}
                     ]
@@ -282,17 +285,27 @@ CRITICAL EXTRACTION RULES:
 - Use ONLY agent names and agent_ids that exist in AVAILABLE AGENTS structure
 - Each step object contains step_X as key with array of task objects as value
 - Tools array must contain tool names that exist for the specified agent
-- All user-facing text (purpose, message, queries) must be in {detected_language}
 - Respect user access levels when selecting tools
 - Tasks with same step number run in parallel, different steps run sequentially
-- Return ONLY valid JSON object - no extra text or formatting"""
+- "queries" should contain specific sub-queries that break down the task into actionable steps
+- For time queries: queries like ["Get current time", "Format for user"]
+- For weather: queries like ["Get location weather", "Check forecast"]
+- Return ONLY valid JSON object - no extra text or formatting
+
+- CRITICAL: All user-facing text (purpose, message, queries) must be in {detected_language} and related to the user's query, refined query.
+- CRITICAL: All user-facing text (purpose, message, queries) must be in {detected_language} and related to the user's query, refined query.
+- CRITICAL: All user-facing text (purpose, message, queries) must be in {detected_language} and related to the user's query, refined query.
+
+"""
 
     def _create_execution_plan(self, semantic_routing: dict, agents_structure: dict = None, conversation_context: dict = None) -> dict:
         """Create execution plan from semantic routing with improved structure parsing"""
         try:
+            logger.info(f"Creating execution plan from semantic_routing: {semantic_routing}")
             execution_flow = semantic_routing.get("execution_flow", {})
             planning = execution_flow.get("planning", {})
             tasks_data = planning.get("tasks", [])
+            logger.info(f"Tasks data: {tasks_data}")
 
             steps = []
             step_counter = 0
@@ -449,6 +462,7 @@ CRITICAL EXTRACTION RULES:
                 raise RuntimeError("Provider returned empty response for reflection")
 
             parsed_result = json.loads(reflection_content)
+            logger.info(f"Reflection result: {parsed_result}")
 
             conversation_context = {
                 "summary_history": state.get("summary_history", ""),
