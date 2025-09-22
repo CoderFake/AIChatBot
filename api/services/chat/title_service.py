@@ -2,6 +2,7 @@
 Unified Title Service
 Handles all title-related operations for chat sessions
 """
+import json
 import re
 import uuid
 from typing import Optional, Any
@@ -10,8 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from services.orchestrator.orchestrator import Orchestrator
 from services.agents.workflow_agent_service import WorkflowAgentService
 from utils.logging import get_logger
-from utils.language_utils import detect_language
-from utils.prompt_utils import PromptUtils
 
 logger = get_logger(__name__)
 
@@ -106,52 +105,108 @@ class TitleService:
         user_id: Optional[str] = None
     ) -> Optional[str]:
         """
-        Core title generation logic
+        Core title generation logic with JSON mode - only use workflow agent provider
         """
         try:
-            prompt = f"Create a short title for this conversation: {first_message}\n\nKeep it simple and under 10 words. Use the same language as the message.\n\nTitle:"
+            return await self._generate_title_with_provider(session_id, first_message, tenant_id, None)
+        except Exception as primary_error:
+            logger.error(f"Title generation failed: {primary_error}")
+            raise
 
-            workflow_agent = await self.workflow_agent_service.get_workflow_agent_config(tenant_id)
-            provider_name = workflow_agent.get("provider_name")
+    async def _generate_title_with_provider(
+        self,
+        session_id: uuid.UUID,
+        first_message: str,
+        tenant_id: str,
+        override_provider: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Generate title with specific provider
+        """
+        try:
+            prompt = f"""Create a short title for this conversation.
+
+Message: {first_message[:200]}...
+
+Keep it under 10 words. Use the same language as the message.
+
+Format: {{"title": "Your title here"}}"""
+
+            if override_provider:
+                provider_name = override_provider
+            else:
+                workflow_agent = await self.workflow_agent_service.get_workflow_agent_config(tenant_id)
+                provider_name = workflow_agent.get("provider_name")
 
             provider = await self.orchestrator.llm(provider_name)
 
             invoke_params = {
                 "prompt": prompt,
                 "tenant_id": tenant_id,
-                "temperature": 0.1,
-                "max_tokens": 50
+                "response_format": "json_object",
+                "json_mode": True,
+                "temperature": 0.3,
+                "max_tokens": 100,
+                "system_instruction": "You are a helpful assistant that creates conversation titles. Always respond with valid JSON."
             }
 
             title_response = await provider.ainvoke(**invoke_params)
 
-            title = self._extract_clean_title(title_response)
-            title = self._validate_and_fallback_title(title, first_message, session_id)
+            title = self._extract_and_parse_title_json(title_response, first_message, session_id)
 
-            logger.info(f"Generated title for session {session_id}: {title}")
+            logger.info(f"Generated title for session {session_id} using {provider_name}: {title}")
             return title
 
         except Exception as e:
-            logger.error(f"Title generation failed for session {session_id}: {e}")
+            logger.error(f"Title generation failed with provider {provider_name}: {e}")
             raise
 
-    def _extract_clean_title(self, title_response) -> str:
-        """Extract clean title from LLM response"""
-        if hasattr(title_response, 'content'):
-            title = title_response.content.strip()
-        elif isinstance(title_response, dict) and 'content' in title_response:
-            title = title_response['content'].strip()
-        elif isinstance(title_response, str):
-            title = title_response.strip()
-        else:
-            title = str(title_response).strip()
+    def _extract_and_parse_title_json(self, title_response, first_message: str, session_id: uuid.UUID) -> str:
+        """Extract and parse title from JSON response with fallback handling"""
+        try:
+            # Get content from response
+            if hasattr(title_response, 'content'):
+                content = title_response.content.strip()
+            elif isinstance(title_response, dict) and 'content' in title_response:
+                content = title_response['content'].strip()
+            elif isinstance(title_response, str):
+                content = title_response.strip()
+            else:
+                content = str(title_response).strip()
 
-        title = re.sub(r'[*#`]', '', title)  
-        title = re.sub(r'```.*?```', '', title, flags=re.DOTALL)  
-        title = re.sub(r'\{.*?\}', '', title)  
-        title = title.strip()
+            if not content:
+                raise RuntimeError("Provider returned empty response for title generation")
 
-        return title
+            # Parse JSON response
+            try:
+                json_response = json.loads(content)
+                title = json_response.get("title", "").strip()
+            except (json.JSONDecodeError, KeyError) as json_err:
+                logger.error(f"Failed to parse title JSON: {json_err}")
+                # Fallback to regex extraction if JSON parsing fails
+                title_match = re.search(r'"title"\s*:\s*"([^"]*)"', content, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                else:
+                    raise RuntimeError(f"Could not extract title from response: {content[:200]}")
+
+            # Clean and validate title
+            title = self._clean_title_text(title)
+            title = self._validate_and_fallback_title(title, first_message, session_id)
+
+            return title
+
+        except Exception as e:
+            logger.error(f"Title extraction failed: {e}")
+            # Return fallback title
+            return self._create_fallback_title(session_id)
+
+    def _clean_title_text(self, title: str) -> str:
+        """Clean title text by removing unwanted characters"""
+        title = re.sub(r'[*#`]', '', title)
+        title = re.sub(r'```.*?```', '', title, flags=re.DOTALL)
+        title = re.sub(r'\{.*?\}', '', title)
+        return title.strip()
 
     def _validate_and_fallback_title(self, title: str, first_message: str, session_id: uuid.UUID) -> str:
         """Validate title and create fallback if needed"""
