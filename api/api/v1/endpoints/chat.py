@@ -261,7 +261,7 @@ async def chat(
                     department_id=department_id,
                     user_context=user_context,
                     detected_language=detected_language,
-                    user_message_id=None,  # Will be created in workflow for first message
+                    user_message_id=None, 
                     session_title=session_title,
                     is_first_message=is_first_message
                 ):
