@@ -115,6 +115,9 @@ async def create_or_update_workflow_agent(
     try:
         tenant_id = user_ctx.get("tenant_id")
 
+        from services.agents.workflow_agent_service import WorkflowAgentService
+        workflow_service = WorkflowAgentService(db)
+
         result = await db.execute(
             select(WorkflowAgent).where(WorkflowAgent.tenant_id == tenant_id)
         )
@@ -154,12 +157,15 @@ async def create_or_update_workflow_agent(
         settings_service = SettingsService(db)
         await settings_service._invalidate_settings_cache(tenant_id)
 
+        workflow_agent_config = await workflow_service.get_workflow_agent_config(tenant_id)
+
         return WorkflowAgentResponse(
             id=str(workflow_agent.id),
             tenant_id=str(workflow_agent.tenant_id),
             provider_name=workflow_agent.provider_name,
             model_name=workflow_agent.model_name,
             model_config=workflow_agent.model_config or {},
+            api_keys=workflow_agent_config["api_keys"],
             max_iterations=workflow_agent.max_iterations,
             timeout_seconds=workflow_agent.timeout_seconds,
             confidence_threshold=workflow_agent.confidence_threshold,
