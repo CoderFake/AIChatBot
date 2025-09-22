@@ -615,6 +615,15 @@ class ChatService:
             )
 
             progress_messages = []
+            pending_error_response: Optional[str] = None
+            pending_error_details: Optional[str] = None
+            pending_error_sources: List[Any] = []
+            pending_error_followups: List[Any] = []
+            pending_error_flow_actions: List[Any] = []
+            pending_error_execution_metadata: Dict[str, Any] = {}
+            pending_error_progress: int = 0
+            workflow_status: str = "running"
+            final_response_emitted = False
 
             messages = await self._get_conversation_history(session_id, user_context)
 
@@ -679,12 +688,41 @@ class ChatService:
                 processing_status = output.get("processing_status", "completed")
                 detected_output_language = output.get("detected_language", detected_language)
 
+                if processing_status == "failed":
+                    workflow_status = "failed"
+                    pending_error_details = output.get("error_message") or output.get("reasoning")
+                    pending_error_response = output.get("final_response") or output.get("error_message")
+                    pending_error_sources = output.get("final_sources", [])
+                    pending_error_followups = output.get("follow_up_questions", [])
+                    pending_error_flow_actions = output.get("flow_action", [])
+                    pending_error_execution_metadata = output.get("execution_metadata", {})
+                    pending_error_progress = output.get("progress_percentage", 0)
+
+                    if output.get("next_action") == "error" and not final_payload:
+                        continue
+
                 if final_payload is not None:
+                    status_to_emit = workflow_status if workflow_status != "running" else processing_status
+                    error_details = pending_error_details if status_to_emit == "failed" else None
+                    output_for_metadata = dict(output)
+                    if error_details and "error_message" not in output_for_metadata:
+                        output_for_metadata["error_message"] = error_details
+                    if not output_for_metadata.get("final_sources") and pending_error_sources:
+                        output_for_metadata["final_sources"] = pending_error_sources
+                    if not output_for_metadata.get("follow_up_questions") and pending_error_followups:
+                        output_for_metadata["follow_up_questions"] = pending_error_followups
+                    if not output_for_metadata.get("flow_action") and pending_error_flow_actions:
+                        output_for_metadata["flow_action"] = pending_error_flow_actions
+                    if pending_error_execution_metadata and not output_for_metadata.get("execution_metadata"):
+                        output_for_metadata["execution_metadata"] = pending_error_execution_metadata
+
                     workflow_metadata = self._create_workflow_metadata(
-                        output,
+                        output_for_metadata,
                         progress_messages,
-                        "response" if processing_status == "completed" else processing_status,
-                        None,
+                        "error" if status_to_emit == "failed" else (
+                            "response" if status_to_emit == "completed" else status_to_emit
+                        ),
+                        error_details,
                         detected_output_language
                     )
 
@@ -709,27 +747,26 @@ class ChatService:
 
                             model_used = self._get_model_used(provider)
 
-                            follow_up_questions = output.get("follow_up_questions", [])
+                            follow_up_questions = output_for_metadata.get("follow_up_questions", [])
                             if follow_up_questions:
                                 yield self._create_sse_event(4, "followup_question", {
                                     "follow_up_questions": follow_up_questions,
                                     "message": "Generated follow-up questions"
                                 })
 
-                            # Yield response first
                             yield self._create_sse_event(5, "end", {
                                 "message": "Response completed",
                                 "progress": output.get("progress_percentage", 100),
-                                "status": processing_status,
+                                "status": status_to_emit,
                                 "final_response": full_response.strip(),
-                                "sources": output.get("final_sources", []),
+                                "sources": output_for_metadata.get("final_sources", []),
                                 "reasoning": output.get("reasoning", ""),
                                 "confidence_score": output.get("confidence_score", 0.0),
-                                "flow_action": output.get("flow_action", []),
-                                "execution_metadata": output.get("execution_metadata", {})
+                                "follow_up_questions": output_for_metadata.get("follow_up_questions", []),
+                                "flow_action": output_for_metadata.get("flow_action", []),
+                                "execution_metadata": output_for_metadata.get("execution_metadata", {})
                             })
 
-                            # Save message after yielding response
                             logger.info(
                                 f"SAVING_FINAL_RESPONSE: session_id={session_id}, response_length={len(full_response.strip())}, "
                                 f"is_first_message={is_first_message}"
@@ -753,6 +790,7 @@ class ChatService:
                                     model_used=model_used,
                                     chat_metadata=chat_metadata
                                 )
+                            final_response_emitted = True
                             return
 
                         except Exception as stream_err:
@@ -761,7 +799,7 @@ class ChatService:
                             error_response = self._get_error_response(detected_output_language, "general")
                             model_used = f"{self._get_model_used(provider)} (error)"
                             workflow_metadata = self._create_workflow_metadata(
-                                output,
+                                output_for_metadata,
                                 progress_messages,
                                 "error",
                                 str(stream_err),
@@ -795,15 +833,16 @@ class ChatService:
                             yield self._create_sse_event(5, "end", {
                                 "message": "Response completed",
                                 "progress": output.get("progress_percentage", 100),
-                                "status": "failed",
+                                "status": status_to_emit,
                                 "final_response": error_response,
-                                "sources": output.get("final_sources", []),
+                                "sources": output_for_metadata.get("final_sources", []),
                                 "reasoning": f"LLM streaming failed: {str(stream_err)}",
                                 "confidence_score": 0.0,
-                                "follow_up_questions": [],
-                                "flow_action": output.get("flow_action", []),
-                                "execution_metadata": output.get("execution_metadata", {})
+                                "follow_up_questions": output_for_metadata.get("follow_up_questions", []),
+                                "flow_action": output_for_metadata.get("flow_action", []),
+                                "execution_metadata": output_for_metadata.get("execution_metadata", {})
                             })
+                            final_response_emitted = True
                             return
 
                     else:
@@ -812,21 +851,19 @@ class ChatService:
                         else:
                             final_text = json.dumps(final_payload, ensure_ascii=False)
 
-                        # Yield response first
                         yield self._create_sse_event(5, "end", {
                             "message": output.get("progress_message", "Response completed"),
                             "progress": output.get("progress_percentage", 100),
-                            "status": processing_status,
+                            "status": status_to_emit,
                             "final_response": final_text,
-                            "sources": output.get("final_sources", []),
+                            "sources": output_for_metadata.get("final_sources", []),
                             "reasoning": output.get("reasoning", ""),
                             "confidence_score": output.get("confidence_score", 0.0),
-                            "follow_up_questions": output.get("follow_up_questions", []),
-                            "flow_action": output.get("flow_action", []),
-                            "execution_metadata": output.get("execution_metadata", {})
+                            "follow_up_questions": output_for_metadata.get("follow_up_questions", []),
+                            "flow_action": output_for_metadata.get("flow_action", []),
+                            "execution_metadata": output_for_metadata.get("execution_metadata", {})
                         })
 
-                        # Save message after yielding response
                         logger.info(
                             f"SAVING_DIRECT_FINAL_RESPONSE: session_id={session_id}, response_length={len(final_text)}, "
                             f"is_first_message={is_first_message}"
@@ -850,11 +887,17 @@ class ChatService:
                                 model_used=output.get("model_used", "workflow"),
                                 chat_metadata=chat_metadata
                             )
+                        final_response_emitted = True
                         return
 
                 elif output.get("processing_status") == "failed":
-                    error_details = output.get("error_message", "Workflow execution failed")
-                    error_response = self._get_error_response(detected_output_language, "general")
+                    error_response = (
+                        pending_error_response
+                        or output.get("final_response")
+                        or output.get("error_message")
+                        or self._get_error_response(detected_output_language, "general")
+                    )
+                    error_details = pending_error_details or output.get("error_message", "Workflow execution failed")
                     workflow_metadata = self._create_workflow_metadata(
                         output,
                         progress_messages,
@@ -863,20 +906,19 @@ class ChatService:
                         detected_output_language
                     )
 
-                    # Yield error response first
                     yield self._create_sse_event(5, "end", {
                         "message": output.get("progress_message", "Processing error"),
-                        "progress": output.get("progress_percentage", 0),
+                        "progress": pending_error_progress or output.get("progress_percentage", 0),
                         "status": "failed",
                         "final_response": error_response,
-                        "sources": output.get("final_sources", []),
+                        "sources": pending_error_sources or output.get("final_sources", []),
                         "reasoning": error_details,
                         "confidence_score": 0.0,
-                        "follow_up_questions": output.get("follow_up_questions", []),
-                        "flow_action": output.get("flow_action", []),
-                        "execution_metadata": output.get("execution_metadata", {})
+                        "follow_up_questions": pending_error_followups or output.get("follow_up_questions", []),
+                        "flow_action": pending_error_flow_actions or output.get("flow_action", []),
+                        "execution_metadata": pending_error_execution_metadata or output.get("execution_metadata", {})
                     })
-                    
+
                     if is_first_message:
                         await self.save_message(
                             session_id=session_id,
@@ -895,8 +937,60 @@ class ChatService:
                             model_used=output.get("model_used", "workflow"),
                             chat_metadata=chat_metadata
                         )
+                    final_response_emitted = True
                     return
-                        
+
+            if not final_response_emitted and workflow_status == "failed" and pending_error_response:
+                fallback_response = pending_error_response or self._get_error_response(detected_output_language, "general")
+                yield self._create_sse_event(5, "end", {
+                    "message": "Processing error",
+                    "progress": pending_error_progress,
+                    "status": "failed",
+                    "final_response": fallback_response,
+                    "sources": pending_error_sources,
+                    "reasoning": pending_error_details or "Workflow execution failed",
+                    "confidence_score": 0.0,
+                    "follow_up_questions": pending_error_followups,
+                    "flow_action": pending_error_flow_actions,
+                    "execution_metadata": pending_error_execution_metadata
+                })
+
+                workflow_metadata = self._create_workflow_metadata(
+                    {
+                        "final_sources": pending_error_sources,
+                        "follow_up_questions": pending_error_followups,
+                        "flow_action": pending_error_flow_actions,
+                        "execution_metadata": pending_error_execution_metadata,
+                        "progress_percentage": pending_error_progress,
+                        "processing_status": "failed"
+                    },
+                    progress_messages,
+                    "error",
+                    pending_error_details,
+                    detected_output_language
+                )
+
+                if is_first_message:
+                    await self.save_message(
+                        session_id=session_id,
+                        query=query,
+                        response=fallback_response,
+                        language=detected_output_language,
+                        model_used="workflow",
+                        chat_metadata={"workflow": workflow_metadata} if workflow_metadata else None
+                    )
+                else:
+                    chat_metadata = {"workflow": workflow_metadata} if workflow_metadata else None
+                    await self.save_message(
+                        session_id=session_id,
+                        query=query,
+                        response=fallback_response,
+                        model_used="workflow",
+                        chat_metadata=chat_metadata
+                    )
+                final_response_emitted = True
+                return
+
         except Exception as e:
             logger.error(f"Multi-agent workflow error: {e}")
             yield self._create_sse_event(5, "end", {

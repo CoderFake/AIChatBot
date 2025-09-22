@@ -100,8 +100,26 @@ class FinalResponseNode(BaseWorkflowNode):
                 final_content = await self._build_no_response_prompt(original_query, detected_language, user_context, state)
                 sources = []
 
+            references_lines: List[str] = []
+            if sources:
+                reference_index = 1
+                for source in sources:
+                    if not isinstance(source, dict):
+                        continue
+                    url = source.get("url") or source.get("evidence_url")
+                    if not url:
+                        continue
+                    title = source.get("title") or source.get("document_id") or f"Reference {reference_index}"
+                    references_lines.append(f"[{reference_index}]. [{title}]({url})")
+                    reference_index += 1
+
+            final_output = final_content
+            if references_lines:
+                references_block = "\n".join(references_lines)
+                final_output = f"{final_content}\n\nReferences\n{references_block}"
+
             return {
-                "final_response": final_content,
+                "final_response": final_output,
                 "final_sources": sources,
                 "provider_name": state.get("provider_name"),
                 "processing_status": "completed",

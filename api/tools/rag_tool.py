@@ -1,7 +1,8 @@
 """
 RAG Tool implementation
 """
-from typing import List, Optional, Type
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Type
 import uuid
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
@@ -40,6 +41,8 @@ class RAGSearchTool(BaseTool):
         department: str,
         user_id: str,
         access_levels: List[str] = ["public"],
+        access_scope_override: Optional[str] = None,
+        user_role: Optional[str] = None,
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> dict:
         """
@@ -63,11 +66,27 @@ class RAGSearchTool(BaseTool):
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         asyncio.run,
-                        self._async_search(query, department, user_id, access_levels)
+                        self._async_search(
+                            query,
+                            department,
+                            user_id,
+                            access_levels,
+                            access_scope_override,
+                            user_role=user_role,
+                        )
                     )
                     return future.result()
 
-            return asyncio.run(self._async_search(query, department, user_id, access_levels))
+            return asyncio.run(
+                self._async_search(
+                    query,
+                    department,
+                    user_id,
+                    access_levels,
+                    access_scope_override,
+                    user_role=user_role,
+                )
+            )
             
         except Exception as e:
             error_msg = f"RAG search failed: {str(e)}"
@@ -88,6 +107,7 @@ class RAGSearchTool(BaseTool):
         user_id: str,
         access_levels: List[str] = ["public"],
         access_scope_override: Optional[str] = None,
+        user_role: Optional[str] = None,
         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
     ) -> dict:
         """
@@ -126,7 +146,14 @@ class RAGSearchTool(BaseTool):
             else:
                 effective_access_levels = access_levels
 
-            results = await self._async_search(query, department, user_id, effective_access_levels, access_scope_override)
+            results = await self._async_search(
+                query,
+                department,
+                user_id,
+                effective_access_levels,
+                access_scope_override,
+                user_role=user_role,
+            )
 
             if run_manager:
                 await run_manager.on_tool_end(json.dumps(results, ensure_ascii=False))
@@ -149,13 +176,61 @@ class RAGSearchTool(BaseTool):
                 "user_id": user_id
             }
 
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        """Parse different datetime formats into a timezone-aware datetime."""
+
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+
+            # Try ISO format first
+            try:
+                parsed = datetime.fromisoformat(text)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+
+            formats = (
+                "%Y-%m-%d %H:%M:%S.%f%z",
+                "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            )
+
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    if "%z" in fmt:
+                        return parsed.astimezone(timezone.utc)
+                    return parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+
+        return None
+
     async def _async_search(
         self,
         query: str,
         department: str,
         user_id: str,
         access_levels: List[str] = ["public"],
-        access_scope_override: Optional[str] = None
+        access_scope_override: Optional[str] = None,
+        user_role: Optional[str] = None
     ) -> str:
         """
         Core async search implementation
@@ -167,6 +242,7 @@ class RAGSearchTool(BaseTool):
             user_id: User ID for permission validation
             access_levels: List of access levels - ["public"], ["private"], or ["public", "private"]
             access_scope_override: Override access scope for permission check
+            user_role: Optional user role hint for cross-department admin access
 
         Returns:
             JSON string containing search results, context, and metadata
@@ -182,18 +258,29 @@ class RAGSearchTool(BaseTool):
             if not access_levels:
                 access_levels = [AccessLevel.PUBLIC.value]
 
+            normalized_role = user_role.upper() if isinstance(user_role, str) else ""
+            normalized_department = (department or "").strip()
+
             async with get_db_context() as db_session:
                 permission_service = RAGPermissionService(db_session)
 
                 all_accessible_collections = []
                 effective_access_levels = []
 
+                admin_cross_department_access = False
+                if normalized_role in {"ADMIN", "MAINTAINER", "TENANT_ADMIN"}:
+                    if (access_scope_override and access_scope_override == "both") or not normalized_department:
+                        admin_cross_department_access = True
+                    elif normalized_department.lower() in {"all", "both", "*", "any"}:
+                        admin_cross_department_access = True
+
                 for access_level in access_levels:
                     has_access, accessible_collections, effective_level = await permission_service.check_rag_access_with_override(
                         user_id=user_id,
-                        department_name=department,
+                        department_name=normalized_department,
                         requested_access_level=access_level,
-                        access_scope_override=access_scope_override
+                        access_scope_override=access_scope_override,
+                        admin_cross_department_access=admin_cross_department_access
                     )
 
                     if has_access and accessible_collections:
@@ -209,11 +296,11 @@ class RAGSearchTool(BaseTool):
                         "documents": [],
                         "sources": [],
                         "error": "Access denied: No accessible collections found for requested access levels",
-                        "department": department,
+                        "department": normalized_department or "all",
                         "requested_access_levels": access_levels,
                         "effective_access_levels": []
                     }
-                
+
                 all_results = []
                 search_summary = {
                     "collections_searched": [],
@@ -230,7 +317,10 @@ class RAGSearchTool(BaseTool):
                             milvus_instance = settings.MILVUS_PRIVATE_HOST
                             collection_type = "private"
 
-                        department_filter = f'department == "{department}"'
+                        department_filter = None
+                        if normalized_department and normalized_department.lower() not in {"all", "both", "*", "any"}:
+                            safe_department = normalized_department.replace('"', '\\"')
+                            department_filter = f'department == "{safe_department}"'
 
                         collection_results = await milvus_service.search_documents(
                             query=query,
@@ -264,7 +354,7 @@ class RAGSearchTool(BaseTool):
                         "documents": [],
                         "sources": [],
                         "message": f"No relevant documents found in {department} collections for your query",
-                        "department": department,
+                        "department": normalized_department or "all",
                         "requested_access_levels": access_levels,
                         "effective_access_levels": effective_access_levels,
                         "search_summary": search_summary
@@ -273,31 +363,72 @@ class RAGSearchTool(BaseTool):
                 all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
                 top_results = all_results[:15]  
 
-                context_parts = []
-                documents = []
+                default_sort_dt = datetime.min.replace(tzinfo=timezone.utc)
+
+                documents_candidates: List[Dict[str, Any]] = []
 
                 for result in top_results:
                     content = result.get("content", "")
                     metadata = result.get("metadata", {})
 
-                    if content and content not in context_parts: 
-                        context_parts.append(content)
-                    
-                    documents.append({
+                    created_at_value = metadata.get("created_at") or metadata.get("timestamp")
+                    parsed_created_at = self._parse_datetime(created_at_value)
+
+                    documents_candidates.append({
                         "document_id": metadata.get("document_id", result.get("id", "unknown")),
                         "content": content,
                         "score": round(result.get("score", 0.0), 3),
                         "source": metadata.get("document_source", "Unknown"),
-                        "department": metadata.get("department", department),
+                        "department": metadata.get("department", normalized_department or "all"),
                         "collection": result.get("collection", "unknown"),
                         "collection_type": result.get("collection_type", "unknown"),
-                        "datetime": metadata.get("created_at", metadata.get("timestamp", "Unknown")),
-                        "metadata": metadata
+                        "datetime": created_at_value or "Unknown",
+                        "created_at": created_at_value or "Unknown",
+                        "metadata": metadata,
+                        "_parsed_created_at": parsed_created_at,
                     })
+
+                best_documents: Dict[str, Dict[str, Any]] = {}
+
+                for doc in documents_candidates:
+                    key = doc.get("document_id")
+                    if not key or key in {"", "unknown"}:
+                        key = f"{doc.get('collection', 'unknown')}::{doc.get('source', 'document')}::{hash(doc.get('content', ''))}"
+
+                    existing = best_documents.get(key)
+                    if not existing:
+                        best_documents[key] = doc
+                        continue
+
+                    new_dt = doc.get("_parsed_created_at")
+                    existing_dt = existing.get("_parsed_created_at")
+
+                    if new_dt and (not existing_dt or new_dt > existing_dt):
+                        best_documents[key] = doc
+                        continue
+
+                    if not new_dt and not existing_dt and doc.get("score", 0.0) > existing.get("score", 0.0):
+                        best_documents[key] = doc
+
+                documents = list(best_documents.values())
+
+                documents.sort(
+                    key=lambda item: (
+                        item.get("_parsed_created_at") or default_sort_dt,
+                        item.get("score", 0.0)
+                    ),
+                    reverse=True
+                )
+
+                context_parts = []
+                for doc in documents:
+                    content = doc.get("content", "")
+                    if content and content not in context_parts:
+                        context_parts.append(content)
 
                 context = "\n\n---\n\n".join(context_parts)
 
-                document_details = {}
+                document_details: Dict[str, Dict[str, Any]] = {}
                 document_ids: List[str] = []
                 for doc in documents:
                     doc_id = doc.get("document_id")
@@ -322,6 +453,9 @@ class RAGSearchTool(BaseTool):
                                 "filename": db_doc.filename,
                             }
 
+                api_base_url = getattr(settings, "API_URL", None) or f"http://localhost:{settings.APP_PORT}"
+                api_base_url = str(api_base_url).rstrip("/")
+
                 sources = []
                 seen_keys = set()
 
@@ -331,7 +465,7 @@ class RAGSearchTool(BaseTool):
                     title = detail_info.get("title") or doc.get("source") or doc.get("metadata", {}).get("source") or "Document"
                     evidence_url = None
                     if doc_id and doc_id not in ["", "unknown"]:
-                        evidence_url = f"/api/v1/documents/{doc_id}/download"
+                        evidence_url = f"{api_base_url}/api/v1/documents/{doc_id}/download"
 
                     doc["title"] = title
                     if evidence_url:
@@ -344,7 +478,8 @@ class RAGSearchTool(BaseTool):
                         "url": evidence_url,
                         "score": doc.get("score"),
                         "collection": doc.get("collection"),
-                        "access_level": doc.get("collection_type")
+                        "access_level": doc.get("collection_type"),
+                        "created_at": doc.get("created_at"),
                     }
 
                     dedup_key = evidence_url or doc_id or title
@@ -352,12 +487,18 @@ class RAGSearchTool(BaseTool):
                         sources.append(evidence_entry)
                         seen_keys.add(dedup_key)
 
+                for doc in documents:
+                    doc.pop("_parsed_created_at", None)
+
                 results_by_access_level = {}
                 for level in effective_access_levels:
-                    level_results = [doc for doc in documents if (
-                        (level == AccessLevel.PUBLIC.value and doc["collection_type"] == "public") or
-                        (level == AccessLevel.PRIVATE.value and doc["collection_type"] == "private")
-                    )]
+                    if level == "both":
+                        level_results = documents
+                    else:
+                        level_results = [doc for doc in documents if (
+                            (level == AccessLevel.PUBLIC.value and doc["collection_type"] == "public") or
+                            (level == AccessLevel.PRIVATE.value and doc["collection_type"] == "private")
+                        )]
                     results_by_access_level[level] = len(level_results)
 
                 result = {
@@ -365,8 +506,8 @@ class RAGSearchTool(BaseTool):
                     "documents": documents,
                     "sources": sources,
                     "total_results": len(all_results),
-                    "displayed_results": len(top_results),
-                    "department": department,
+                    "displayed_results": len(documents),
+                    "department": normalized_department or "all",
                     "requested_access_levels": access_levels,
                     "effective_access_levels": effective_access_levels,
                     "results_by_access_level": results_by_access_level,
@@ -390,7 +531,7 @@ class RAGSearchTool(BaseTool):
                 "documents": [],
                 "sources": [],
                 "error": f"Search failed: {str(e)}",
-                "department": department,
+                "department": normalized_department or "all",
                 "requested_access_levels": access_levels if 'access_levels' in locals() else ["public"]
             }
             return error_result

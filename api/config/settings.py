@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "2.0.0"
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
+    API_URL: str = Field(default="http://localhost:8000", env="API_URL")
     ENV: str = "development"
     DEBUG: bool = True
     TIMEZONE: str = "Asia/Ho_Chi_Minh"

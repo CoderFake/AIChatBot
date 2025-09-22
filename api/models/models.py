@@ -7,8 +7,16 @@ class RAGSearchInput(BaseModel):
     department: str = Field(description="User's department for access control")
     user_id: str = Field(description="User ID for permission checking")
     access_levels: List[str] = Field(
-        default=["public"], 
+        default=["public"],
         description="Access levels for search (public, private, etc.)"
+    )
+    access_scope_override: Optional[str] = Field(
+        default=None,
+        description="Explicit access scope override: 'public', 'private', or 'both'"
+    )
+    user_role: Optional[str] = Field(
+        default=None,
+        description="Role of the requesting user for cross-department checks"
     )
 
 

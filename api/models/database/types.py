@@ -137,6 +137,27 @@ WORKFLOW_MESSAGES = {
         "japanese": "タスク完了 {current}/{total}：{agent} が {tool} を使用",
         "korean": "작업 완료 {current}/{total}: {agent}이(가) {tool} 사용"
     },
+    "task_recovered": {
+        "vietnamese": "Hoàn thành tác vụ {current}/{total}: {agent} với {tool} sau {attempts} lần thử",
+        "english": "Completed task {current}/{total}: {agent} with {tool} after {attempts} attempts",
+        "chinese": "完成任务 {current}/{total}：{agent} 使用 {tool}，在第 {attempts} 次尝试后",
+        "japanese": "タスク完了 {current}/{total}：{agent} が {tool} を使用し {attempts} 回目の試行で達成",
+        "korean": "작업 완료 {current}/{total}: {agent}이(가) {tool} 사용으로 {attempts}번째 시도 후 완료"
+    },
+    "task_retrying": {
+        "vietnamese": "Tác vụ {agent} với {tool} gặp lỗi: {error}. Đang thử lại (lần {attempt}/{max_attempts}).",
+        "english": "Task {agent} with {tool} hit an error: {error}. Retrying ({attempt}/{max_attempts}).",
+        "chinese": "任务 {agent} 使用 {tool} 出现错误：{error}。正在重试（第 {attempt}/{max_attempts} 次）。",
+        "japanese": "タスク {agent} が {tool} を使用中にエラー: {error}。再試行中 ({attempt}/{max_attempts})。",
+        "korean": "작업 {agent}이(가) {tool} 사용 중 오류 발생: {error}. 재시도 중 ({attempt}/{max_attempts})."
+    },
+    "task_failed": {
+        "vietnamese": "Tác vụ {agent} với {tool} thất bại: {error}",
+        "english": "Task {agent} with {tool} failed: {error}",
+        "chinese": "任务 {agent} 使用 {tool} 失败：{error}",
+        "japanese": "タスク {agent} が {tool} を使用して失敗しました: {error}",
+        "korean": "작업 {agent}이(가) {tool} 사용에 실패했습니다: {error}"
+    },
 
     # Error messages
     "generic_error": {

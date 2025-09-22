@@ -127,15 +127,31 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                       const isCompleted = status === 'completed'
                       const isFailed = status === 'failed'
                       const isRunning = status === 'in_progress'
-                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : status === 'retrying' ? 'Retrying' : 'Pending'
 
-                      const baseClasses = allTasksCompleted && isCompleted
-                        ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
-                        : isCompleted
-                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
-                        : isFailed
-                        ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-                        : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                      const severity = task.severity || (isCompleted ? 'success' : isFailed ? 'danger' : isRunning || status === 'retrying' ? 'info' : 'pending')
+
+                      const baseClasses = (() => {
+                        if (severity === 'success') {
+                          return allTasksCompleted && isCompleted
+                            ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
+                            : 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                        }
+
+                        if (severity === 'danger') {
+                          return 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                        }
+
+                        if (severity === 'info') {
+                          return 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                        }
+
+                        return 'bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300'
+                      })()
+
+                      const retryHistory = Array.isArray(task.retry_history) ? task.retry_history : []
+                      const retryAttempts = typeof task.retry_attempts === 'number' ? task.retry_attempts : (typeof task.retry_count === 'number' ? task.retry_count : retryHistory.length) || 0
+                      const maxRetries = typeof task.max_retries === 'number' ? task.max_retries : 0
 
                       return (
                         <div
@@ -162,6 +178,40 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                           {task.error && (
                             <div className="text-[10px] mt-1 text-red-500 dark:text-red-300 truncate">
                               {task.error}
+                            </div>
+                          )}
+                          {retryHistory.length > 0 && (
+                            <div className="mt-1 space-y-1">
+                              <div className="text-[9px] uppercase tracking-wide font-semibold text-gray-500 dark:text-gray-400">
+                                Retry attempts ({Math.min(retryAttempts + 1, maxRetries || retryAttempts + 1)}/{maxRetries || retryAttempts + 1})
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {retryHistory.map((attempt: any, attemptIndex: number) => {
+                                  const attemptStatus = attempt?.status === 'completed' ? 'completed' : 'failed'
+                                  const chipClasses = attemptStatus === 'completed'
+                                    ? 'bg-green-100 text-green-700 dark:bg-green-900/60 dark:text-green-200 border border-green-200 dark:border-green-800'
+                                    : 'bg-red-100 text-red-700 dark:bg-red-900/60 dark:text-red-200 border border-red-200 dark:border-red-800'
+
+                                  const errorSnippet = typeof attempt?.error === 'string'
+                                    ? `${attempt.error.slice(0, 80)}${attempt.error.length > 80 ? '…' : ''}`
+                                    : ''
+
+                                  const toolLabel = attempt?.tool ? `${attempt.tool}` : 'Tool'
+
+                                  return (
+                                    <span
+                                      key={`${toolLabel}-${attempt?.attempt ?? attemptIndex}-${attemptStatus}`}
+                                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-medium ${chipClasses}`}
+                                    >
+                                      <span>#{attempt?.attempt ?? attemptIndex + 1}</span>
+                                      <span className="truncate">
+                                        {toolLabel}: {attemptStatus === 'completed' ? 'Success' : 'Failed'}
+                                        {errorSnippet ? ` — ${errorSnippet}` : ''}
+                                      </span>
+                                    </span>
+                                  )
+                                })}
+                              </div>
                             </div>
                           )}
                         </div>

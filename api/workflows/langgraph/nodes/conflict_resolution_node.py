@@ -3,14 +3,17 @@ LLM-based Conflict Resolution Node
 Uses LLM to decide conflict resolution based on evidence quality, recency, and accuracy consensus
 """
 import json
-from typing import Dict, Any, List, Union
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Union
 from langchain_core.runnables import RunnableConfig
 from .base import ExecutionNode
 from workflows.langgraph.state.state import RAGState
 from utils.logging import get_logger
 from services.orchestrator.orchestrator import Orchestrator
+from config.settings import get_settings
 
 logger = get_logger(__name__)
+settings = get_settings()
 
 
 class ConflictResolutionNode(ExecutionNode):
@@ -21,6 +24,8 @@ class ConflictResolutionNode(ExecutionNode):
     
     def __init__(self):
         super().__init__("conflict_resolution")
+        api_url = getattr(settings, "API_URL", None) or f"http://localhost:{settings.APP_PORT}"
+        self._api_base_url = str(api_url).rstrip("/")
     
     async def execute(self, state: RAGState, config: RunnableConfig) -> Dict[str, Any]:
         """
@@ -91,6 +96,15 @@ class ConflictResolutionNode(ExecutionNode):
                 sources = response.get("sources", [])
 
                 evidence_analysis = self._analyze_evidence(sources)
+                latest_evidence_dt: Optional[datetime] = None
+                if isinstance(sources, list):
+                    parsed_dates = [
+                        self._parse_source_datetime(source.get("created_at") if isinstance(source, dict) else None)
+                        for source in sources
+                    ]
+                    parsed_dates = [dt for dt in parsed_dates if dt]
+                    if parsed_dates:
+                        latest_evidence_dt = max(parsed_dates)
 
                 responses_with_evidence.append({
                     "agent_index": i,
@@ -100,7 +114,8 @@ class ConflictResolutionNode(ExecutionNode):
                     "tools_used": response.get("tools_used", []),
                     "execution_time": response.get("execution_time", 0.0),
                     "sources_count": len(sources),
-                    "evidence_analysis": evidence_analysis
+                    "evidence_analysis": evidence_analysis,
+                    "latest_evidence_at": latest_evidence_dt.isoformat() if latest_evidence_dt else None,
                 })
 
             merged_sources = self._merge_sources(agent_responses)
@@ -228,17 +243,34 @@ IMPORTANT:
 
             normalized_sources: List[str] = []
             source_list = sources if isinstance(sources, list) else [sources]
+            parsed_datetimes: List[datetime] = []
             for source in source_list:
                 if isinstance(source, dict):
                     candidate = source.get("url") or source.get("title") or source.get("document_id")
                     if candidate:
                         normalized_sources.append(str(candidate))
+                    parsed_dt = self._parse_source_datetime(source.get("created_at") or source.get("datetime"))
+                    if parsed_dt:
+                        parsed_datetimes.append(parsed_dt)
                         continue
                 normalized_sources.append(str(source))
 
             total_sources = len(normalized_sources)
 
             recency_score = 0.8
+            if parsed_datetimes:
+                newest = max(parsed_datetimes)
+                age_days = max(0.0, (datetime.now(timezone.utc) - newest).total_seconds() / 86400)
+                if age_days <= 1:
+                    recency_score = 1.0
+                elif age_days <= 7:
+                    recency_score = 0.95
+                elif age_days <= 30:
+                    recency_score = 0.9
+                elif age_days <= 90:
+                    recency_score = 0.8
+                else:
+                    recency_score = 0.6
 
             reliable_indicators = ['.gov', '.edu', '.org', 'intra.', 'wiki.']
             reliable_sources = sum(
@@ -279,11 +311,16 @@ IMPORTANT:
                 "score": source.get("score"),
                 "collection": source.get("collection"),
                 "access_level": source.get("access_level") or source.get("collection_type"),
+                "created_at": source.get("created_at") or source.get("datetime"),
             }
 
             snippet = source.get("content") or source.get("snippet")
             if isinstance(snippet, str) and snippet:
                 normalized["snippet"] = snippet[:400]
+
+            document_id = normalized.get("document_id")
+            if document_id and not normalized.get("url"):
+                normalized["url"] = self._build_document_url(document_id)
 
             return {key: value for key, value in normalized.items() if value is not None}
 
@@ -312,6 +349,11 @@ IMPORTANT:
 
                 merged.append(normalized)
 
+        merged.sort(
+            key=lambda item: self._parse_source_datetime(item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True
+        )
+
         return merged
 
     def _deduplicate_sources(self, sources: List[Any]) -> List[Dict[str, Any]]:
@@ -330,4 +372,62 @@ IMPORTANT:
                 seen.add(dedup_key)
             deduped.append(normalized)
 
+        deduped.sort(
+            key=lambda item: self._parse_source_datetime(item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True
+        )
+
         return deduped
+
+    def _build_document_url(self, document_id: Optional[str]) -> Optional[str]:
+        """Build an absolute download URL for a document."""
+
+        if not document_id or document_id in {"", "unknown"}:
+            return None
+
+        return f"{self._api_base_url}/api/v1/documents/{document_id}/download"
+
+    def _parse_source_datetime(self, value: Any) -> Optional[datetime]:
+        """Parse datetime information from evidence entries."""
+
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+
+            try:
+                parsed = datetime.fromisoformat(text)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+
+            formats = (
+                "%Y-%m-%d %H:%M:%S.%f%z",
+                "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            )
+
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    if "%z" in fmt:
+                        return parsed.astimezone(timezone.utc)
+                    return parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+
+        return None

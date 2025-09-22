@@ -1,8 +1,13 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from typing import Any, Optional
+
+try:
+    from sqlalchemy.ext.asyncio import AsyncSession  # type: ignore
+    from sqlalchemy import select  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional during tests
+    AsyncSession = Any  # type: ignore
+    select = None  # type: ignore
 
 from config.settings import get_settings
 
@@ -89,7 +94,7 @@ class DateTimeManager:
         except Exception:
             pass
         
-        if db is not None:
+        if db is not None and select is not None:
             try:
                 from models.database.tenant import Tenant
                 result = await db.execute(select(Tenant.timezone).where(Tenant.id == tenant_id))

@@ -11,10 +11,12 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
 import json
+import uuid
 
 from models.database.agent import Agent, AgentToolConfig
 from models.database.tenant import Department
 from models.database.tool import Tool, TenantToolConfig
+from common.types import AccessLevel, UserRole
 from utils.logging import get_logger
 from utils.datetime_utils import DateTimeManager
 
@@ -745,12 +747,51 @@ class AgentService:
             
             from services.tools.tool_manager import tool_manager
 
+            raw_role = user_context.get("role")
+            normalized_role = raw_role.upper() if isinstance(raw_role, str) else ""
+
+            requested_scope = str(user_context.get("access_scope") or AccessLevel.PUBLIC.value).lower()
+            if requested_scope not in {AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value, "both"}:
+                requested_scope = AccessLevel.PUBLIC.value
+
+            if normalized_role == UserRole.USER.value:
+                requested_scope = AccessLevel.PUBLIC.value
+
+            if requested_scope == "both":
+                access_levels = [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]
+            elif requested_scope == AccessLevel.PRIVATE.value:
+                access_levels = [AccessLevel.PRIVATE.value]
+            else:
+                access_levels = [AccessLevel.PUBLIC.value]
+
+            department_value = user_context.get("department") or user_context.get("department_name")
+            if not department_value:
+                department_id = user_context.get("department_id")
+                if department_id:
+                    dept_lookup_id = department_id
+                    if isinstance(dept_lookup_id, str):
+                        try:
+                            dept_lookup_id = uuid.UUID(dept_lookup_id)
+                        except (ValueError, TypeError):
+                            dept_lookup_id = department_id
+                    dept_result = await self.db.execute(
+                        select(Department.department_name).where(Department.id == dept_lookup_id)
+                    )
+                    department_value = dept_result.scalar_one_or_none()
+
+            if not department_value:
+                if normalized_role in {UserRole.ADMIN.value, UserRole.MAINTAINER.value}:
+                    department_value = "all"
+                else:
+                    department_value = "general"
+
             tool_params = {
                 "query": query,
-                "department": user_context.get("department_name", "general"),
+                "department": department_value,
                 "user_id": user_context.get("user_id", ""),
-                "access_levels": ["public"],
-                "access_scope_override": user_context.get("access_scope"),
+                "access_levels": access_levels,
+                "access_scope_override": requested_scope,
+                "user_role": raw_role,
                 "detected_language": detected_language
             }
             tool_result = await tool_manager.execute_tool(tool_name, tool_params, agent_providers, agent_id, user_context)

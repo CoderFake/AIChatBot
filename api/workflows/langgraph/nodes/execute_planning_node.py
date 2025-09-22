@@ -1,6 +1,7 @@
 import asyncio
 import time
-from typing import Dict, Any, List
+from asyncio import Queue
+from typing import Dict, Any, List, Optional
 from langchain_core.runnables import RunnableConfig
 from .base import ExecutionNode
 from workflows.langgraph.state.state import RAGState, AgentResponse
@@ -18,6 +19,8 @@ class ExecutePlanningNode(ExecutionNode):
     Tools within each task run SEQUENTIALLY (tool1 -> tool2 -> tool3)
     """
 
+    MAX_RETRY_ATTEMPTS = 3
+
     def __init__(self):
         super().__init__("execute_planning")
 
@@ -29,7 +32,8 @@ class ExecutePlanningNode(ExecutionNode):
             "executing_task": 75,
             "task_completed": 75,
             "completed": 85,
-            "conflict_resolution_needed": 85
+            "conflict_resolution_needed": 85,
+            "failed": 85
         }
 
         progress = base_progress.get(step, 75)
@@ -230,11 +234,69 @@ class ExecutePlanningNode(ExecutionNode):
                             "messages": messages,
                             "status": task.get("status", "pending"),
                             "agent": task.get("agent", ""),
-                            "task_index": len(formatted_tasks)
+                            "task_index": len(formatted_tasks),
+                            "retry_attempts": 0,
+                            "retry_history": [],
+                            "max_retries": self.MAX_RETRY_ATTEMPTS,
+                            "severity": "pending"
                         }
                         formatted_tasks.append(formatted_task)
         
         return formatted_tasks
+
+    def _augment_with_retry_context(self, base_message: str, retry_error: Optional[str], attempt: int) -> str:
+        """Append retry error context to the next tool/query execution message."""
+        if not retry_error:
+            return base_message
+
+        retry_instruction = (
+            "\n\nPREVIOUS ATTEMPT ERROR DETAILS:"
+            f"\nAttempt {max(attempt - 1, 1)} failed with error: {retry_error}"
+            "\nPlease adjust your approach, consider alternative parameters or data sources, and avoid repeating the same error."
+        )
+
+        return f"{base_message}{retry_instruction}"
+
+    def _get_tool_display(self, tools_used: List[str], result: Dict[str, Any]) -> str:
+        """Build a human-friendly representation of the tools used."""
+        if isinstance(tools_used, list) and tools_used:
+            return ", ".join(str(tool) for tool in tools_used)
+
+        return str(result.get("tool") or result.get("tool_name") or "tool")
+
+    def _build_retry_progress_message(
+        self,
+        retry_event: Dict[str, Any],
+        detected_language: str
+    ) -> str:
+        """Create a localized progress message for retry attempts."""
+        agent_display = retry_event.get("agent_name") or "Agent"
+        tools = retry_event.get("tools") or []
+        if isinstance(tools, list):
+            tool_names = [t.get("tool", "unknown") if isinstance(t, dict) else str(t) for t in tools]
+        else:
+            tool_names = [str(tools)]
+
+        tool_display = self._get_tool_display(tool_names, {})
+        attempt = retry_event.get("attempt", 0) + 1
+        max_attempts = retry_event.get("max_attempts", self.MAX_RETRY_ATTEMPTS)
+        error = retry_event.get("error", "")
+
+        try:
+            return get_workflow_message(
+                "task_retrying",
+                detected_language,
+                agent=agent_display,
+                tool=tool_display,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                error=error
+            )
+        except Exception:
+            return (
+                f"Retrying task {agent_display} ({tool_display}) "
+                f"attempt {attempt}/{max_attempts} due to error: {error}"
+            )
 
     async def _execute_parallel_steps(
         self,
@@ -251,6 +313,7 @@ class ExecutePlanningNode(ExecutionNode):
         But tools within each task run SEQUENTIALLY (tool1 -> tool2 -> tool3...)
         """
         execution_tasks = []
+        progress_queue: Queue = Queue()
         
         try:
             steps = execution_plan.get("steps", [])
@@ -280,8 +343,14 @@ class ExecutePlanningNode(ExecutionNode):
 
             for task_info in formatted_tasks:
                 task_info["status"] = "pending"
+                task_info["retry_count"] = 0
+                task_info["max_retries"] = self.MAX_RETRY_ATTEMPTS
+                task_info["retry_attempts"] = 0
+                task_info["retry_history"] = []
+                task_info["severity"] = "pending"
                 task_info.pop("result", None)
                 task_info.pop("error", None)
+                task_info.pop("last_error", None)
 
             initial_progress = self._calculate_progress_percentage("executing_agents")
             yield {
@@ -311,8 +380,19 @@ class ExecutePlanningNode(ExecutionNode):
                     if isinstance(task, dict):
                         if i < len(formatted_tasks):
                             formatted_tasks[i]["status"] = "in_progress"
+                            formatted_tasks[i]["severity"] = "info"
                             formatted_tasks[i]["agent"] = task.get("agent", formatted_tasks[i].get("agent", ""))
-                        task_future = asyncio.create_task(self._execute_single_task(state, task, i))
+                            formatted_tasks[i]["retry_count"] = 0
+                            formatted_tasks[i].pop("error", None)
+                            formatted_tasks[i].pop("last_error", None)
+                        task_future = asyncio.create_task(
+                            self._execute_single_task(
+                                state,
+                                task,
+                                i,
+                                progress_queue=progress_queue
+                            )
+                        )
                         execution_tasks.append((task_future, i))
                     else:
                         logger.warning(f"Task {i} is not a dict, skipping")
@@ -336,13 +416,68 @@ class ExecutePlanningNode(ExecutionNode):
                 return
 
             # Process completed tasks
-            pending_tasks = [future for future, idx in execution_tasks]
-            
+            pending_tasks = {future for future, idx in execution_tasks}
+            queue_listener: Optional[asyncio.Task] = asyncio.create_task(progress_queue.get()) if pending_tasks else None
+
             while pending_tasks:
                 try:
-                    done, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
-                    
-                    for completed_task in done:
+                    wait_items = set(pending_tasks)
+                    if queue_listener:
+                        wait_items.add(queue_listener)
+
+                    done, _ = await asyncio.wait(wait_items, return_when=asyncio.FIRST_COMPLETED)
+
+                    if queue_listener and queue_listener in done:
+                        listener_task = queue_listener
+                        try:
+                            retry_event = listener_task.result()
+                        except asyncio.CancelledError:
+                            retry_event = None
+
+                        if retry_event is not None:
+                            task_idx = retry_event.get("task_index")
+                            if task_idx is not None and 0 <= task_idx < len(formatted_tasks):
+                                formatted_tasks[task_idx]["status"] = "retrying"
+                                formatted_tasks[task_idx]["severity"] = "danger"
+                                formatted_tasks[task_idx]["retry_count"] = retry_event.get("attempt", 0)
+                                formatted_tasks[task_idx]["max_retries"] = retry_event.get("max_attempts", self.MAX_RETRY_ATTEMPTS)
+                                formatted_tasks[task_idx]["retry_attempts"] = retry_event.get("attempt", 0)
+                                formatted_tasks[task_idx]["error"] = retry_event.get("error")
+                                formatted_tasks[task_idx]["last_error"] = retry_event.get("error")
+
+                            progress_message = self._build_retry_progress_message(
+                                retry_event,
+                                detected_language
+                            )
+
+                            yield {
+                                "type": "progress",
+                                "node": "execute_planning",
+                                "output": {
+                                    "processing_status": "task_retrying",
+                                    "progress_percentage": self._calculate_progress_percentage(
+                                        "executing_task",
+                                        processed_count,
+                                        len(all_tasks)
+                                    ),
+                                    "progress_message": progress_message,
+                                    "current_step": processed_count,
+                                    "total_steps": len(all_tasks),
+                                    "formatted_tasks": formatted_tasks,
+                                    "should_yield": True
+                                }
+                            }
+
+                        if pending_tasks:
+                            queue_listener = asyncio.create_task(progress_queue.get())
+                        else:
+                            queue_listener = None
+
+                        done.discard(listener_task)
+
+                    completed_futures = [task for task in done if task in pending_tasks]
+
+                    for completed_task in completed_futures:
                         task_idx = None
                         for future, idx in execution_tasks:
                             if future == completed_task:
@@ -377,29 +512,59 @@ class ExecutePlanningNode(ExecutionNode):
 
                         if task_idx < len(formatted_tasks):
                             formatted_tasks[task_idx]["status"] = "completed" if status == "completed" else "failed"
+                            formatted_tasks[task_idx]["severity"] = (
+                                "success" if status == "completed" else "danger"
+                            )
                             formatted_tasks[task_idx]["result"] = result
+                            attempts_used = result.get("retry_attempts", result.get("attempts", 0))
+                            formatted_tasks[task_idx]["retry_count"] = attempts_used
+                            formatted_tasks[task_idx]["retry_attempts"] = attempts_used
+                            formatted_tasks[task_idx]["retry_history"] = result.get("retry_history", [])
+                            formatted_tasks[task_idx]["max_retries"] = result.get("max_retries", self.MAX_RETRY_ATTEMPTS)
                             if status != "completed":
-                                formatted_tasks[task_idx]["error"] = result.get("error") or result.get("content")
+                                error_message = result.get("error") or result.get("content")
+                                formatted_tasks[task_idx]["error"] = error_message
+                                formatted_tasks[task_idx]["last_error"] = error_message
+                            else:
+                                formatted_tasks[task_idx].pop("error", None)
+                                formatted_tasks[task_idx].pop("last_error", None)
 
                         tools_used = result.get("tools_used") or []
-                        tool_display = ", ".join(tools_used) if isinstance(tools_used, list) and tools_used else result.get("tool") or "tool"
+                        tool_display = self._get_tool_display(tools_used, result)
                         agent_display = result.get("agent_name") or result.get("agent") or "Agent"
 
+                        attempts_used = result.get("retry_attempts", result.get("attempts", 1)) or 1
+
                         if status == "completed":
-                            progress_message = get_workflow_message(
-                                "task_completed_sequential",
-                                detected_language,
-                                current=completed_success,
-                                total=len(all_tasks),
-                                agent=agent_display,
-                                tool=tool_display
-                            )
+                            if attempts_used > 1:
+                                progress_message = get_workflow_message(
+                                    "task_recovered",
+                                    detected_language,
+                                    current=completed_success,
+                                    total=len(all_tasks),
+                                    agent=agent_display,
+                                    tool=tool_display,
+                                    attempts=attempts_used
+                                )
+                            else:
+                                progress_message = get_workflow_message(
+                                    "task_completed_sequential",
+                                    detected_language,
+                                    current=completed_success,
+                                    total=len(all_tasks),
+                                    agent=agent_display,
+                                    tool=tool_display
+                                )
                         else:
                             error_detail = result.get("error") or result.get("content", "")
+                            base_error = error_detail or get_workflow_message("generic_error", detected_language)
                             progress_message = (
-                                f"Task {agent_display} failed: {error_detail}" if error_detail else get_workflow_message(
-                                    "generic_error",
-                                    detected_language
+                                f"Task {agent_display} failed after {attempts_used} attempts: {base_error}" if base_error else get_workflow_message(
+                                    "task_failed",
+                                    detected_language,
+                                    agent=agent_display,
+                                    tool=tool_display,
+                                    error=""
                                 )
                             )
 
@@ -418,14 +583,22 @@ class ExecutePlanningNode(ExecutionNode):
                                 "should_yield": True
                             }
                         }
-                        
+
+                        pending_tasks.discard(completed_task)
+
                 except Exception as wait_exc:
                     logger.error(f"Error in asyncio.wait: {wait_exc}")
                     # Cancel remaining tasks
-                    for task in pending_tasks:
+                    for task in list(pending_tasks):
                         if not task.done():
                             task.cancel()
+                    pending_tasks.clear()
+                    if queue_listener:
+                        queue_listener.cancel()
                     break
+
+            if queue_listener:
+                queue_listener.cancel()
 
             filtered_results = [res for res in processed_results if res is not None]
             actual_successful = sum(1 for r in filtered_results if r.get("status") == "completed")
@@ -453,88 +626,163 @@ class ExecutePlanningNode(ExecutionNode):
         self,
         state: RAGState,
         task: Dict[str, Any],
-        task_index: int
+        task_index: int,
+        progress_queue: Optional[Queue] = None
     ) -> AgentResponse:
         """
-        Execute a single task from the execution plan
+        Execute a single task from the execution plan with retry support.
         Tools structure: [{"tool": "tool_name", "message": "specific_message"}]
         """
         start_time = time.time()
 
-        try:
-            agent_name = task.get("agent", "general")
-            agent_id = task.get("agent_id")
-            tools = task.get("tools", [])
-            purpose = task.get("purpose", "")
+        agent_name = task.get("agent", "general")
+        agent_id = task.get("agent_id")
+        tools = task.get("tools", [])
+        purpose = task.get("purpose", "")
 
-            logger.debug(f"Executing task {task_index}: {agent_name} -> Purpose: {purpose}")
+        logger.debug(f"Executing task {task_index}: {agent_name} -> Purpose: {purpose}")
 
+        max_attempts = self.MAX_RETRY_ATTEMPTS
+        retry_history: List[Dict[str, Any]] = []
+        retry_error: Optional[str] = None
+
+        async def run_single_attempt(attempt: int) -> Dict[str, Any]:
             if isinstance(tools, list) and len(tools) > 1:
                 tools_names = [t.get('tool', t) if isinstance(t, dict) else t for t in tools]
-                logger.info(f"Task {task_index} using sequential tools: {tools_names}")
+                logger.info(f"Task {task_index} using sequential tools (attempt {attempt}): {tools_names}")
                 queries = task.get("queries", [])
-                agent_response = await self._execute_agent_with_sequential_tools(
-                    state, agent_name, tools, purpose, agent_id, queries
+                return await self._execute_agent_with_sequential_tools(
+                    state,
+                    agent_name,
+                    tools,
+                    purpose,
+                    agent_id,
+                    queries,
+                    attempt=attempt,
+                    retry_error=retry_error
                 )
-            else:
-                if tools and isinstance(tools, list) and len(tools) > 0:
-                    tool_obj = tools[0]
-                    if isinstance(tool_obj, dict):
-                        tool_name = tool_obj.get("tool", "rag_tool")
-                        tool_message = tool_obj.get("message", purpose)
-                    else:
-                        tool_name = str(tool_obj)
-                        tool_message = purpose
+
+            if tools and isinstance(tools, list) and len(tools) > 0:
+                tool_obj = tools[0]
+                if isinstance(tool_obj, dict):
+                    tool_name = tool_obj.get("tool", "rag_tool")
+                    tool_message = tool_obj.get("message", purpose)
                 else:
-                    tool_name = "rag_tool"
+                    tool_name = str(tool_obj)
                     tool_message = purpose
+            else:
+                tool_name = "rag_tool"
+                tool_message = purpose
 
-                # Use queries from task if available, otherwise use tool_message
-                queries = task.get("queries", [])
-                if queries and isinstance(queries, list) and len(queries) > 0:
-                    query_to_use = queries[0]  # Use first query as main query
-                else:
-                    query_to_use = tool_message
+            queries = task.get("queries", [])
+            if queries and isinstance(queries, list) and len(queries) > 0:
+                query_to_use = queries[0]
+            else:
+                query_to_use = tool_message
 
-                agent_response = await self._execute_agent_task(
-                    state, agent_name, tool_name, query_to_use, agent_id
+            return await self._execute_agent_task(
+                state,
+                agent_name,
+                tool_name,
+                query_to_use,
+                agent_id,
+                attempt=attempt,
+                retry_error=retry_error
+            )
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                agent_response = await run_single_attempt(attempt)
+
+                if agent_response.get("error"):
+                    raise RuntimeError(str(agent_response.get("error")))
+
+                execution_time = time.time() - start_time
+
+                tools_used = []
+                for tool in tools:
+                    if isinstance(tool, dict):
+                        tools_used.append(tool.get("tool", "unknown"))
+                    else:
+                        tools_used.append(str(tool))
+
+                response_status = agent_response.get("status", "completed")
+                enhanced_response = {
+                    **agent_response,
+                    "task_index": task_index,
+                    "agent_name": agent_name,
+                    "tools_used": tools_used,
+                    "purpose": purpose,
+                    "execution_time": execution_time,
+                    "status": response_status,
+                    "attempts": attempt,
+                    "retry_attempts": agent_response.get("retry_attempts", attempt),
+                    "retry_history": agent_response.get("retry_history", retry_history),
+                    "max_retries": agent_response.get("max_retries", self.MAX_RETRY_ATTEMPTS),
+                }
+
+                return enhanced_response
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                error_message = str(e)
+                retry_history.append({"attempt": attempt, "error": error_message})
+                logger.warning(
+                    f"Task {task_index} attempt {attempt} failed for agent {agent_name}: {error_message}"
                 )
 
-            execution_time = time.time() - start_time
+                if progress_queue and attempt < max_attempts:
+                    await progress_queue.put({
+                        "type": "retry",
+                        "task_index": task_index,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": error_message,
+                        "agent_name": agent_name,
+                        "tools": tools,
+                    })
 
-            tools_used = []
-            for tool in tools:
-                if isinstance(tool, dict):
-                    tools_used.append(tool.get("tool", "unknown"))
-                else:
-                    tools_used.append(str(tool))
+                if attempt >= max_attempts:
+                    execution_time = time.time() - start_time
+                    return {
+                        "agent_name": agent_name,
+                        "content": f"Task execution failed: {error_message}",
+                        "status": "failed",
+                        "confidence": 0.0,
+                        "sources": [],
+                        "execution_time": execution_time,
+                        "error": error_message,
+                        "task_index": task_index,
+                        "attempts": attempt,
+                        "retry_attempts": attempt,
+                        "retry_history": retry_history,
+                        "purpose": purpose,
+                        "tools_used": [t.get("tool", "unknown") if isinstance(t, dict) else str(t) for t in tools] if tools else [],
+                        "max_retries": self.MAX_RETRY_ATTEMPTS,
+                    }
 
-            enhanced_response = {
-                **agent_response,
-                "task_index": task_index,
-                "agent_name": agent_name,
-                "tools_used": tools_used,
-                "purpose": purpose,
-                "execution_time": execution_time,
-                "status": "completed"
-            }
+                retry_error = error_message
+                await asyncio.sleep(0.1 * attempt)
 
-            return enhanced_response
-
-        except Exception as e:
-            execution_time = time.time() - start_time
-            logger.error(f"Task {task_index} execution failed: {e}")
-
-            return {
-                "agent_name": f"Task_{task_index}",
-                "content": f"Task execution failed: {str(e)}",
-                "status": "failed",
-                "confidence": 0.0,
-                "sources": [],
-                "execution_time": execution_time,
-                "error": str(e),
-                "task_index": task_index
-            }
+        execution_time = time.time() - start_time
+        logger.error(f"Task {task_index} could not complete after retries")
+        return {
+            "agent_name": agent_name,
+            "content": "Task execution failed after retries",
+            "status": "failed",
+            "confidence": 0.0,
+            "sources": [],
+            "execution_time": execution_time,
+            "error": retry_error or "Unknown error",
+            "task_index": task_index,
+            "attempts": max_attempts,
+            "retry_attempts": max_attempts,
+            "retry_history": retry_history,
+            "purpose": purpose,
+            "tools_used": [t.get("tool", "unknown") if isinstance(t, dict) else str(t) for t in tools] if tools else [],
+            "max_retries": self.MAX_RETRY_ATTEMPTS,
+        }
 
     async def _execute_agent_task(
         self,
@@ -542,7 +790,9 @@ class ExecutePlanningNode(ExecutionNode):
         agent_name: str,
         tool_name: str,
         message: str = None,
-        agent_id: str = None
+        agent_id: str = None,
+        attempt: int = 1,
+        retry_error: Optional[str] = None
     ) -> Dict[str, Any]:
         """Execute a specific agent with a specific tool"""
         try:
@@ -551,7 +801,10 @@ class ExecutePlanningNode(ExecutionNode):
             detected_language = state.get("detected_language", "english")
 
             query_to_use = message if message else original_query
+            query_to_use = self._augment_with_retry_context(query_to_use, retry_error, attempt)
             agent_providers = state.get("agent_providers", {})
+
+            attempt_history: List[Dict[str, Any]] = []
 
             async def execute_agent_operation(db):
                 agent_service = AgentService(db)
@@ -568,6 +821,13 @@ class ExecutePlanningNode(ExecutionNode):
             from config.database import execute_db_operation
             agent_result = await execute_db_operation(execute_agent_operation)
 
+            attempt_history.append({
+                "attempt": attempt,
+                "status": "completed",
+                "tool": tool_name,
+                "query": query_to_use,
+            })
+
             return {
                 "agent_name": agent_name,
                 "content": agent_result.get("content", ""),
@@ -575,19 +835,36 @@ class ExecutePlanningNode(ExecutionNode):
                 "sources": agent_result.get("sources", []),
                 "tools_used": [tool_name],
                 "metadata": agent_result.get("metadata", {}),
-                "query_used": query_to_use
+                "query_used": query_to_use,
+                "attempt": attempt,
+                "retry_attempts": attempt,
+                "retry_history": attempt_history,
+                "max_retries": self.MAX_RETRY_ATTEMPTS,
+                "status": "completed",
             }
 
         except Exception as e:
             logger.error(f"Agent {agent_name} execution failed: {e}")
+            error_message = str(e)
+            attempt_history = [{
+                "attempt": attempt,
+                "status": "failed",
+                "tool": tool_name,
+                "error": error_message,
+                "query": query_to_use,
+            }]
             return {
                 "agent_name": agent_name,
-                "content": f"Agent {agent_name} failed: {str(e)}",
+                "content": f"Agent {agent_name} failed: {error_message}",
                 "confidence": 0.0,
                 "sources": [],
                 "tools_used": [tool_name],
-                "error": str(e),
-                "query_used": original_query
+                "error": error_message,
+                "query_used": original_query,
+                "status": "failed",
+                "retry_attempts": attempt,
+                "retry_history": attempt_history,
+                "max_retries": self.MAX_RETRY_ATTEMPTS,
             }
 
     async def _execute_agent_with_sequential_tools(
@@ -597,7 +874,9 @@ class ExecutePlanningNode(ExecutionNode):
         tools_sequence: List[Any],
         purpose: str = None,
         agent_id: str = None,
-        queries: List[str] = None
+        queries: List[str] = None,
+        attempt: int = 1,
+        retry_error: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Execute an agent with SEQUENTIAL tools
@@ -639,6 +918,9 @@ class ExecutePlanningNode(ExecutionNode):
                         tool_message = queries[i]
                     else:
                         tool_message = purpose or original_query
+
+                if retry_error and attempt > 1 and i == 0:
+                    tool_message = self._augment_with_retry_context(tool_message, retry_error, attempt)
 
                 logger.debug(f"Agent {agent_name} executing tool {i+1}/{len(tools_sequence)}: {current_tool}")
 
@@ -714,7 +996,11 @@ Sources: {len(current_sources)} sources found
                     "accumulated_context_length": len(accumulated_context),
                     "purpose": purpose
                 },
-                "query_used": purpose or original_query
+                "query_used": purpose or original_query,
+                "status": "completed",
+                "retry_attempts": attempt,
+                "retry_history": [],
+                "max_retries": self.MAX_RETRY_ATTEMPTS,
             }
 
         except Exception as e:
@@ -733,7 +1019,11 @@ Sources: {len(current_sources)} sources found
                 "sources": [],
                 "tools_used": tools_names,
                 "error": str(e),
-                "query_used": purpose or original_query
+                "query_used": purpose or original_query,
+                "status": "failed",
+                "retry_attempts": attempt,
+                "retry_history": [],
+                "max_retries": self.MAX_RETRY_ATTEMPTS,
             }
 
     def _analyze_execution_plan_for_routing(
