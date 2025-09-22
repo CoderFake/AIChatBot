@@ -119,30 +119,36 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                   <span>Task execution timeline</span>
                 </div>
                 <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                  {planningData.formatted_tasks.map((task: any, index: number) => {
-                    const status = task.status || 'pending'
-                    const isCompleted = status === 'completed'
-                    const isFailed = status === 'failed'
-                    const isRunning = status === 'in_progress'
-                    const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
-                    const baseClasses = isCompleted
-                      ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
-                      : isFailed
-                      ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-                      : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                  {(() => {
+                    const allTasksCompleted = planningData.formatted_tasks.every((task: any) => (task.status || 'pending') === 'completed')
 
-                    return (
-                      <div
-                        key={task.task_index ?? index}
-                        className={`flex items-start gap-2 border rounded-md px-2 py-2 text-[11px] ${baseClasses}`}
-                      >
-                        {isCompleted ? (
-                          <CheckCircle size={12} className="mt-0.5 text-green-500" />
-                        ) : isFailed ? (
-                          <AlertCircle size={12} className="mt-0.5 text-red-500" />
-                        ) : (
-                          <div className={`mt-0.5 w-2 h-2 rounded-full bg-blue-500 ${isRunning ? 'animate-pulse' : ''}`} />
-                        )}
+                    return planningData.formatted_tasks.map((task: any, index: number) => {
+                      const status = task.status || 'pending'
+                      const isCompleted = status === 'completed'
+                      const isFailed = status === 'failed'
+                      const isRunning = status === 'in_progress'
+                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+
+                      const baseClasses = allTasksCompleted && isCompleted
+                        ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
+                        : isCompleted
+                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                        : isFailed
+                        ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                        : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+
+                      return (
+                        <div
+                          key={task.task_index ?? index}
+                          className={`flex items-start gap-2 border rounded-md px-2 py-2 text-[11px] ${baseClasses}`}
+                        >
+                          {isCompleted ? (
+                            <CheckCircle size={12} className={`mt-0.5 ${allTasksCompleted ? 'text-green-600' : 'text-green-500'}`} />
+                          ) : isFailed ? (
+                            <AlertCircle size={12} className="mt-0.5 text-red-500" />
+                          ) : (
+                            <div className={`mt-0.5 w-2 h-2 rounded-full bg-blue-500 ${isRunning ? 'animate-pulse' : ''}`} />
+                          )}
                         <div className="flex-1 min-w-0">
                           <div className="font-semibold truncate">{task.task_name || `Task ${index + 1}`}</div>
                           <div className="text-[10px] opacity-80 truncate">
@@ -161,8 +167,8 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                         </div>
                         <span className="text-[10px] font-medium whitespace-nowrap">{statusText}</span>
                       </div>
-                    )
-                  })}
+                    )})
+                  })()}
                 </div>
               </div>
             )}
@@ -298,6 +304,44 @@ export function StreamingMessage({
   const [isExecutionExpanded, setIsExecutionExpanded] = useState(true) // Auto expand execution
   const messageRef = useRef<HTMLDivElement>(null)
 
+  const renderTaskContext = (purpose: any) => {
+    if (!purpose) return null
+
+    if (typeof purpose === 'object' && purpose.context) {
+      return (
+        <div className="space-y-1 text-xs">
+          {purpose.context && (
+            <div className="break-words">
+              <span className="font-medium text-gray-700 dark:text-gray-300">Context:</span>{' '}
+              <span className="text-gray-600 dark:text-gray-400">{purpose.context}</span>
+            </div>
+          )}
+          {purpose.task && (
+            <div className="break-words">
+              <span className="font-medium text-gray-700 dark:text-gray-300">Task:</span>{' '}
+              <span className="text-gray-600 dark:text-gray-400">{purpose.task}</span>
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    // Fallback for string format
+    if (typeof purpose === 'string') {
+      return (
+        <div className="text-xs text-gray-600 dark:text-gray-400 break-words">
+          {purpose.split('\n').map((line, idx) => (
+            <div key={idx} className={idx > 0 ? 'mt-1' : ''}>
+              {line.trim()}
+            </div>
+          ))}
+        </div>
+      )
+    }
+
+    return null
+  }
+
   useEffect(() => {
     if (isStreaming) {
       setDisplayedContent(content)
@@ -331,18 +375,18 @@ export function StreamingMessage({
     if (!planningData) return null
 
     return (
-      <div className="border border-blue-200 rounded-lg p-3 mb-3 bg-blue-50 dark:bg-blue-950 w-full max-w-full overflow-hidden">
+      <div className="border border-blue-200 rounded-md p-2 mb-3 bg-blue-50 dark:bg-blue-950 w-full overflow-hidden break-words">
         <button
           onClick={() => setIsPlanningExpanded(!isPlanningExpanded)}
-          className="flex items-center gap-2 text-blue-700 dark:text-blue-300 font-medium hover:text-blue-800 dark:hover:text-blue-200 transition-colors"
+          className="flex items-center gap-2 text-blue-700 dark:text-blue-300 text-sm font-medium hover:text-blue-800 dark:hover:text-blue-200 transition-colors"
         >
-          {isPlanningExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-          <span>Planning & Analysis</span>
-          <span className="text-xs bg-blue-200 dark:bg-blue-800 px-2 py-1 rounded flex items-center gap-1">
+          {isPlanningExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <span className="text-sm">Planning & Analysis</span>
+          <span className="text-xs bg-blue-200 dark:bg-blue-800 px-1.5 py-0.5 rounded flex items-center gap-1">
             {progress === 100 ? (
               <>
-                <CheckCircle size={10} className="text-green-600" />
-                <span>Completed</span>
+                <CheckCircle size={8} className="text-green-600" />
+                <span className="text-xs">Completed</span>
               </>
             ) : (
               `${progress || 0}%`
@@ -351,30 +395,38 @@ export function StreamingMessage({
         </button>
 
         {isPlanningExpanded && (
-          <div className="mt-3 space-y-3">
+          <div className="mt-3 space-y-3 max-w-full">
             {planningData.formatted_tasks && planningData.formatted_tasks.length > 0 && (
-              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden">
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden max-w-full">
                 <h4 className="font-medium text-sm mb-2">Task Progress</h4>
                 <div className="space-y-2">
-                  {planningData.formatted_tasks.map((task: any, index: number) => {
-                    const status = task.status || 'pending'
-                    const isCompleted = status === 'completed'
-                    const isFailed = status === 'failed'
-                    const isRunning = status === 'in_progress'
-                    const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
-                    return (
-                      <div
-                        key={task.task_index ?? index}
-                        className={`flex items-start gap-3 p-2 rounded text-xs border ${
-                          isCompleted
-                            ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
-                            : isFailed
-                            ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-                            : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
-                        }`}
-                      >
+                  {(() => {
+                    // Check if all tasks are completed
+                    const allTasksCompleted = planningData.formatted_tasks.every((task: any) => (task.status || 'pending') === 'completed')
+
+                    return planningData.formatted_tasks.map((task: any, index: number) => {
+                      const status = task.status || 'pending'
+                      const isCompleted = status === 'completed'
+                      const isFailed = status === 'failed'
+                      const isRunning = status === 'in_progress'
+                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+
+                      // Enhanced green styling when all tasks are completed
+                      const taskClasses = allTasksCompleted && isCompleted
+                        ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
+                        : isCompleted
+                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                        : isFailed
+                        ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                        : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+
+                      return (
+                        <div
+                          key={task.task_index ?? index}
+                          className={`flex items-start gap-3 p-2 rounded text-xs border ${taskClasses}`}
+                        >
                         {isCompleted ? (
-                          <CheckCircle size={12} className="mt-0.5 text-green-500" />
+                          <CheckCircle size={12} className={`mt-0.5 ${allTasksCompleted ? 'text-green-600' : 'text-green-500'}`} />
                         ) : isFailed ? (
                           <AlertCircle size={12} className="mt-0.5 text-red-500" />
                         ) : (
@@ -394,21 +446,45 @@ export function StreamingMessage({
                         </div>
                         <span className="text-[11px] font-medium whitespace-nowrap">{statusText}</span>
                       </div>
-                    )
-                  })}
+                      )
+                    })
+                  })()}
+                </div>
+              </div>
+            )}
+
+            {/* Task Details Section */}
+            {planningData.execution_plan?.steps?.some((step: any) =>
+              step.tasks?.some((task: any) => task.purpose)
+            ) && (
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden max-w-full">
+                <h4 className="font-medium text-sm mb-2">Task Details</h4>
+                <div className="space-y-3">
+                  {planningData.execution_plan.steps.map((step: any, stepIndex: number) =>
+                    step.tasks?.map((task: any, taskIndex: number) => (
+                      task.purpose && (
+                        <div key={`${stepIndex}-${taskIndex}`} className="border-l-2 border-blue-300 pl-3">
+                          <div className="font-medium text-xs text-gray-700 dark:text-gray-300 mb-1">
+                            {task.agent || 'Agent'}: {task.tool || 'Tool'}
+                          </div>
+                          {renderTaskContext(task.purpose)}
+                        </div>
+                      )
+                    ))
+                  )}
                 </div>
               </div>
             )}
 
             {planningData.execution_plan && (
-              <div className="bg-white dark:bg-gray-800 rounded p-3 border">
+              <div className="bg-white dark:bg-gray-800 rounded p-3 border overflow-hidden max-w-full">
                 <h4 className="font-medium text-sm mb-2">Execution Plan Steps</h4>
                 <div className="space-y-2">
                   {planningData.execution_plan.steps && planningData.execution_plan.steps.length > 0 ? (
                     planningData.execution_plan.steps.map((step: any, index: number) => (
                       <div
                         key={index}
-                        className={`flex items-center gap-2 p-2 rounded text-xs border overflow-hidden ${
+                        className={`flex items-center gap-2 p-2 rounded text-xs border overflow-hidden break-words ${
                           step.status === 'completed'
                             ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
                             : step.status === 'running'
