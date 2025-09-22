@@ -21,38 +21,44 @@ class DynamicToolParser:
         self.tool_instances = tool_instances
         
     async def parse_tool_parameters(
-        self, 
-        tool_name: str, 
-        query: str, 
-        agent_provider=None
+        self,
+        tool_name: str,
+        query: str,
+        agent_provider_name: str = None,
+        tenant_id: str = None
     ) -> Dict[str, Any]:
         """
         Parse natural language query to tool-specific parameters using tool's schema
-        
+
         Args:
             tool_name: Name of the tool
             query: Natural language query
-            agent_provider: LLM provider for parsing
-            
+            agent_provider_name: Name of LLM provider for parsing
+            tenant_id: Tenant identifier for API access
+
         Returns:
             Dict of parsed parameters
-            
+
         Raises:
             ValueError: If parsing fails or tool not found
         """
-        if not agent_provider:
-            raise ValueError(f"Agent provider is required for parsing {tool_name} tool parameters")
-        
+        if not agent_provider_name:
+            raise ValueError(f"Agent provider name is required for parsing {tool_name} tool parameters")
+
+        from services.orchestrator.orchestrator import Orchestrator
+        orchestrator = Orchestrator()
+        agent_provider = await orchestrator.llm(agent_provider_name)
+
         tool_instance = self.tool_instances.get(tool_name)
         if not tool_instance:
             raise ValueError(f"Tool {tool_name} not found in registry")
-        
+
         schema_info = self._extract_tool_schema(tool_instance)
-        
+
         prompt = self._build_parsing_prompt(tool_name, tool_instance, query, schema_info)
-        
+
         try:
-            response = await agent_provider.ainvoke(prompt)
+            response = await agent_provider.ainvoke(prompt, tenant_id)
             
             if hasattr(response, 'content'):
                 response_text = response.content
@@ -144,7 +150,6 @@ class DynamicToolParser:
             "Parameter details:"
         ]
         
-        # Add parameter details
         for param, detail in schema_info['param_details'].items():
             prompt_parts.append(f"- {param}: {detail}")
         
@@ -275,12 +280,10 @@ class DynamicToolParser:
         
         schema_info = self._extract_tool_schema(tool_instance)
         
-        # If tool only has 'query' parameter, no need for complex parsing
         if (schema_info['required_params'] == ['query'] and 
             len(schema_info['optional_params']) == 0):
             return False
         
-        # If tool has complex schema, use parameter parsing
         if (len(schema_info['required_params']) > 1 or 
             len(schema_info['optional_params']) > 0):
             return True
