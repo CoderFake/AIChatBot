@@ -94,183 +94,306 @@ class BaseLLMProvider(ABC):
         """Check provider health"""
         pass
 
-
+# -----------------------------------------------------------------------------
+# GeminiProvider
+# -----------------------------------------------------------------------------
 class GeminiProvider(BaseLLMProvider):
-    """Google Gemini provider using official SDK"""
+    """Google Gemini provider using the official SDK.
+
+    Features
+    - SAFETY FILTERS DISABLED - allows ALL content types
+    - Streaming with async generator
+    - JSON mode (response_mime_type)
+    - Key rotation across multiple API keys
+    """
 
     def __init__(self, config: LLMProviderConfig):
         super().__init__(config)
         self._client = None
-        self._api_keys = config.config.get("api_keys", [])
-        self._current_key_index = 0
-    
+        self._api_keys: List[str] = config.config.get("api_keys", []) or []
+        self._current_key_index: int = 0
+        self._safety_settings = None  # built in initialize()
+
     async def initialize(self) -> bool:
-        """Initialize Gemini provider"""
         try:
-            if self._api_keys:
-                import google.generativeai as genai
-                genai.configure(api_key=self._api_keys[0])
+            # Import new google-genai SDK
+            from google import genai  # noqa: F401
+            from google.genai import types  # noqa: F401
 
             self._initialized = True
-            logger.info(f"Gemini provider initialized with {len(self._api_keys)} API keys")
+            logger.info(
+                "Gemini provider initialized successfully with new google-genai SDK (API keys will be loaded at runtime)"
+            )
             return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini provider: {e}")
+        except ImportError as e:
+            logger.error("Failed to import google.genai: %s", e)
             return False
-    
-    async def _invoke_llm(self, prompt: str, model: Optional[str] = None, **kwargs) -> Union[LLMResponse, AsyncGenerator[str, None]]:
-        """Invoke Gemini API with streaming support based on markdown parameter"""
+        except Exception as e:
+            logger.error("Failed to initialize Gemini provider: %s", e)
+            return False
+
+    def _should_stream(self, kwargs: Dict[str, Any]) -> bool:
+        return bool(kwargs.get("markdown", False))
+
+    # ------------------------ core invoke ------------------------
+    async def _invoke_llm(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Union[LLMResponse, AsyncGenerator[str, None]]:
         if not self._initialized:
             raise RuntimeError("Gemini provider not initialized")
-        
-        import google.generativeai as genai
-        
+
+        import json
+        from google import genai
+        from google.genai import types
+
+        print("*"*100)
+        print(f"GeminiProvider invoke_llm: {prompt}")
+        print("*"*100)
+
         model_name = model or self.config.default_model
+
         runtime_keys = kwargs.get("api_keys")
         if runtime_keys and isinstance(runtime_keys, list) and any(runtime_keys):
             keys = [k for k in runtime_keys if k]
-            current_key_index = 0  
+            current_key_index = 0
         else:
             keys = self._api_keys
             current_key_index = self._current_key_index
-        
+
         if not keys:
             raise RuntimeError("No API keys provided for Gemini at runtime")
-        max_retries = len(keys)
-        
-        response_format = kwargs.get("response_format")
-        temperature = kwargs.get("temperature")
-        markdown = kwargs.get("markdown", False)
 
-        generation_config = {
-            "max_output_tokens": kwargs.get("max_tokens", self.config.config.get("max_tokens", 8192)),
-            "temperature": temperature,
-        }
-        
-        if response_format == "json_object" or kwargs.get("json_mode", False):
-            generation_config["response_mime_type"] = "application/json"
-            if not any(word in prompt.lower() for word in ["json", "format", "response_format"]):
+        max_retries = len(keys)
+
+        response_format = kwargs.get("response_format")
+        temperature = kwargs.get("temperature", self.config.config.get("temperature"))
+        top_p = kwargs.get("top_p", self.config.config.get("top_p"))
+        top_k = kwargs.get("top_k", self.config.config.get("top_k"))
+        max_tokens = kwargs.get(
+            "max_tokens", self.config.config.get("max_tokens", 8192)
+        )
+        system_instruction = kwargs.get("system_instruction")
+
+        json_mode = bool(
+            response_format == "json_object" or kwargs.get("json_mode", False)
+        )
+        if json_mode:
+            if not any(
+                w in (prompt or "").lower() for w in ("json", "format", "response_format")
+            ):
                 prompt = f"{prompt}\n\nPlease respond in valid JSON format."
-        
-        if markdown:
-            return self._stream_response(prompt, model_name, keys, generation_config)
-        
+
+        if self._should_stream(kwargs):
+            return self._stream_response(prompt, model_name, keys, temperature, top_p, top_k, max_tokens, system_instruction, json_mode)
+
         for attempt in range(max_retries):
             try:
                 current_key = keys[current_key_index]
-                genai.configure(api_key=current_key)
-                
-                llm_model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config=genai.GenerationConfig(**generation_config)
+
+                client = genai.Client(api_key=current_key)
+
+                # Create content
+                contents = [
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=prompt),
+                        ],
+                    ),
+                ]
+
+                safety_settings = [
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HARASSMENT",
+                        threshold="BLOCK_NONE"
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HATE_SPEECH",
+                        threshold="BLOCK_NONE"
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        threshold="BLOCK_NONE"
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_NONE"
+                    ),
+                ]
+
+                generate_content_config = types.GenerateContentConfig(
+                    temperature=temperature if temperature is not None else None,
+                    top_p=top_p if top_p is not None else None,
+                    top_k=top_k if top_k is not None else None,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json" if json_mode else None,
+                    safety_settings=safety_settings,
                 )
 
+                if system_instruction:
+                    generate_content_config.system_instruction = system_instruction
+
                 try:
-                    response = await asyncio.wait_for(
-                        llm_model.generate_content_async(prompt),
-                        timeout=30.0
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=generate_content_config,
                     )
-                    
-                    if not response.parts or not any(part.text for part in response.parts if hasattr(part, 'text')):
-                        finish_reason = None
-                        if hasattr(response, 'candidates') and response.candidates:
-                            finish_reason = getattr(response.candidates[0], 'finish_reason', None)
-                        
-                        if finish_reason == 2:  # SAFETY
-                            logger.warning("Gemini response blocked by safety filter for session")
-                            raise RuntimeError("Content blocked by Gemini safety filter")
-                        elif finish_reason == 3:  # RECITATION  
-                            logger.warning("Gemini response blocked due to recitation")
-                            raise RuntimeError("Content blocked by Gemini recitation filter")
-                        else:
-                            logger.warning(f"Gemini returned empty response with finish_reason: {finish_reason}")
-                            raise RuntimeError("Gemini returned empty response")
-                    
-                    content = response.text
-                    
-                    if response_format == "json_object" or kwargs.get("json_mode", False):
+
+                    text = ""
+                    if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                        for part in response.candidates[0].content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                text += part.text
+
+                    if not text:
+                        logger.warning("Gemini returned empty response")
+                        raise RuntimeError("Gemini returned empty response")
+
+                    content = text
+                    if json_mode:
                         try:
                             json.loads(content)
                         except json.JSONDecodeError:
                             content = json.dumps({"response": content})
-                    
-                    # Update global index only if using instance keys
-                    if runtime_keys:
-                        metadata_key_index = current_key_index
-                    else:
+
+                    if not runtime_keys:
                         self._current_key_index = current_key_index
                         metadata_key_index = current_key_index
-                    
+                    else:
+                        metadata_key_index = current_key_index
+
                     return LLMResponse(
                         content=content,
                         model=model_name,
                         provider="gemini",
                         usage=getattr(response, "usage_metadata", None),
-                        metadata={"api_key_index": metadata_key_index}
+                        metadata={"api_key_index": metadata_key_index},
                     )
 
                 except Exception as e:
-                    error_msg = str(e).lower()
-                    if 'protocol' in error_msg or 'grpc' in error_msg:
-                        logger.debug(f"Suppressing gRPC internal error: {e}")
-                        raise RuntimeError(f"Gemini API temporarily unavailable: {e}")
-                    else:
-                        raise
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Gemini API call timeout with key {current_key_index}")
-                current_key_index = (current_key_index + 1) % len(keys)
+                    logger.warning("Gemini API call failed with key %d: %s", current_key_index, e)
+                    current_key_index = (current_key_index + 1) % len(keys)
+                    if attempt == max_retries - 1:
+                        raise RuntimeError(f"All Gemini API keys failed: {e}")
 
             except Exception as e:
-                logger.warning(f"Gemini API call failed with key {current_key_index}: {e}")
+                logger.warning("Gemini API call failed with key %d: %s", current_key_index, e)
                 current_key_index = (current_key_index + 1) % len(keys)
-
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"All Gemini API keys failed: {e}")
-        
+
         raise RuntimeError("Gemini provider exhausted all retry attempts")
 
-    async def _stream_response(self, prompt: str, model_name: str, keys: List[str], generation_config: Dict) -> AsyncGenerator[str, None]:
-        """Stream Gemini response chunks"""
-        import google.generativeai as genai
-        
-        current_key_index = 0  # Always start from 0 for streaming
+    def _is_safety_block(self, finish_reason: Any) -> bool:
+        return False
+
+    def _is_recitation_block(self, finish_reason: Any) -> bool:
+        if finish_reason is None:
+            return False
+        if isinstance(finish_reason, (int,)):
+            return finish_reason == 3
+        s = str(finish_reason).upper()
+        return "RECITATION" in s
+
+    async def _stream_response(
+        self,
+        prompt: str,
+        model_name: str,
+        keys: List[str],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+        system_instruction: str,
+        json_mode: bool,
+    ) -> AsyncGenerator[str, None]:
+        from google import genai
+        from google.genai import types
+
+        current_key_index = 0
         current_key = keys[current_key_index]
-        genai.configure(api_key=current_key)
-        
-        llm_model = genai.GenerativeModel(
-            model_name=model_name,
-            generation_config=genai.GenerationConfig(**generation_config)
+
+        client = genai.Client(api_key=current_key)
+
+        # Create content
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text=prompt),
+                ],
+            ),
+        ]
+
+        # Create config with permissive safety settings
+        safety_settings = [
+            types.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT",
+                threshold="BLOCK_NONE"
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH",
+                threshold="BLOCK_NONE"
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                threshold="BLOCK_NONE"
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold="BLOCK_NONE"
+            ),
+        ]
+
+        generate_content_config = types.GenerateContentConfig(
+            temperature=temperature if temperature is not None else None,
+            top_p=top_p if top_p is not None else None,
+            top_k=top_k if top_k is not None else None,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json" if json_mode else None,
+            safety_settings=safety_settings,
         )
 
+        if system_instruction:
+            generate_content_config.system_instruction = system_instruction
+
         try:
-            stream = await llm_model.generate_content_async(prompt, stream=True)
-            async for chunk in stream:
-                text = getattr(chunk, "text", None)
-                if text:
-                    yield text
+            # Use streaming call
+            for chunk in client.models.generate_content_stream(
+                model=model_name,
+                contents=contents,
+                config=generate_content_config,
+            ):
+                if (
+                    chunk.candidates is None
+                    or chunk.candidates[0].content is None
+                    or chunk.candidates[0].content.parts is None
+                ):
+                    continue
+
+                for part in chunk.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        yield part.text
         except Exception as e:
-            logger.error(f"Gemini streaming failed: {e}")
+            logger.error("Gemini streaming failed: %s", e)
             raise RuntimeError(f"Gemini streaming error: {e}")
 
-
     async def cleanup(self) -> None:
-        """Cleanup gRPC connections"""
         try:
-            import google.generativeai as genai
-            genai.configure(api_key="")
             self._client = None
             logger.debug("Gemini provider connections cleaned up")
         except Exception as e:
-            logger.debug(f"Error during Gemini cleanup: {e}")
+            logger.debug("Error during Gemini cleanup: %s", e)
 
     async def health_check(self) -> bool:
-        """Check Gemini health"""
         try:
-            response = await self.ainvoke("Test", model=self.config.default_model)
-            if isinstance(response, LLMResponse):
-                return response.content is not None
+            resp = await self.ainvoke("Health check ping", model=self.config.default_model)
+            if isinstance(resp, LLMResponse):
+                return bool(resp.content)
             return False
         except Exception:
             return False
