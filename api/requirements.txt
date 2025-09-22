@@ -15,7 +15,7 @@ alembic==1.13.2
 
 # ML/AI Libraries
 sentence-transformers==2.6.0
-google-generativeai==0.8.4
+google-genai==0.8.0
 langchain==0.3.19
 langgraph==0.6.7
 langchain-docling==1.0.0
