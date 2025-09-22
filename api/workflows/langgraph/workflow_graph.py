@@ -76,11 +76,9 @@ class MultiAgentRAGWorkflow:
         current_loop = self._get_current_loop()
 
         if self._compile_lock is None or (self._loop is not None and current_loop is not self._loop):
-            # Create a new lock bound to the current loop
             self._compile_lock = asyncio.Lock()
 
         async with self._compile_lock:
-            # If the loop changed we must rebuild the graph so futures are tied to the new loop
             if self._loop is not None and current_loop is not self._loop:
                 logger.warning("Workflow event loop changed; rebuilding graph for new loop")
                 self._reset()
@@ -269,7 +267,7 @@ class MultiAgentRAGWorkflow:
             return False
 
 
-multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=True)
+multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=False)
 
 
 async def create_rag_workflow(enable_checkpointing: bool = True) -> MultiAgentRAGWorkflow:
