@@ -266,7 +266,13 @@ class ToolManager:
 
                     query = params.get("query", "")
                     tenant_id = user_context.get("tenant_id") if user_context else None
-                    parsed_params = await parser.parse_tool_parameters(tool_name, query, agent_provider_name, tenant_id)
+                    parsed_params = await parser.parse_tool_parameters(
+                        tool_name,
+                        query,
+                        agent_provider_name,
+                        tenant_id,
+                        user_context=user_context,
+                    )
                     execution_params = parsed_params
             
             if hasattr(tool_instance, '_arun'):

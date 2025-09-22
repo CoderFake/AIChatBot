@@ -4,9 +4,10 @@ Implements best practices for scalable tool parameter parsing
 """
 import json
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from langchain_core.tools import BaseTool
 from utils.logging import get_logger
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 
@@ -25,7 +26,8 @@ class DynamicToolParser:
         tool_name: str,
         query: str,
         agent_provider_name: str = None,
-        tenant_id: str = None
+        tenant_id: str = None,
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Parse natural language query to tool-specific parameters using tool's schema
@@ -55,7 +57,36 @@ class DynamicToolParser:
 
         schema_info = self._extract_tool_schema(tool_instance)
 
-        prompt = self._build_parsing_prompt(tool_name, tool_instance, query, schema_info)
+        tenant_timezone = None
+        tenant_current_datetime = None
+
+        if user_context:
+            tenant_timezone = user_context.get("timezone")
+            tenant_current_datetime = user_context.get("tenant_current_datetime")
+
+        if tenant_timezone is None and tenant_id:
+            try:
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(tenant_id)
+            except Exception:
+                tenant_timezone = None
+
+        if tenant_timezone is None:
+            tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+
+        if tenant_current_datetime is None:
+            try:
+                tenant_current_datetime = DateTimeManager.tenant_now(tenant_timezone).isoformat()
+            except Exception:
+                tenant_current_datetime = DateTimeManager.system_now().isoformat()
+
+        prompt = self._build_parsing_prompt(
+            tool_name,
+            tool_instance,
+            query,
+            schema_info,
+            tenant_timezone,
+            tenant_current_datetime,
+        )
 
         try:
             response = await agent_provider.ainvoke(prompt, tenant_id)
@@ -128,11 +159,13 @@ class DynamicToolParser:
             }
     
     def _build_parsing_prompt(
-        self, 
-        tool_name: str, 
-        tool_instance: BaseTool, 
-        query: str, 
-        schema_info: Dict[str, Any]
+        self,
+        tool_name: str,
+        tool_instance: BaseTool,
+        query: str,
+        schema_info: Dict[str, Any],
+        tenant_timezone: str,
+        tenant_current_datetime: str,
     ) -> str:
         """Build dynamic parsing prompt based on tool schema"""
         
@@ -153,9 +186,19 @@ class DynamicToolParser:
         for param, detail in schema_info['param_details'].items():
             prompt_parts.append(f"- {param}: {detail}")
         
+        prompt_parts.append("")
+        prompt_parts.append(self._get_dynamic_tool_instructions(tool_name, tool_instance))
+
+        if tool_name == "datetime":
+            prompt_parts.extend([
+                "",
+                "Tenant context:",
+                f"- Tenant timezone: {tenant_timezone}",
+                f"- Current tenant datetime: {tenant_current_datetime}",
+                "- Always interpret date/time queries using the tenant's local timezone instead of UTC.",
+            ])
+
         prompt_parts.extend([
-            "",
-            self._get_dynamic_tool_instructions(tool_name, tool_instance),
             "",
             "Return ONLY a JSON object with the extracted parameters.",
             "Use appropriate default values for missing optional parameters.",

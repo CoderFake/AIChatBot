@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from models.database.chat import ChatSession, ChatMessage
 from services.orchestrator.orchestrator import Orchestrator
 from utils.logging import get_logger
+from utils.datetime_utils import DateTimeManager
 import asyncio
 import json
 
@@ -541,8 +542,11 @@ class ChatService:
         try:
             from utils.datetime_utils import DateTimeManager
             
-            tenant_timezone = await DateTimeManager._get_tenant_timezone_cached(tenant_id, self.db)
+            tenant_timezone = await DateTimeManager.get_tenant_timezone(tenant_id, self.db)
+            tenant_now = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
+
             user_context["timezone"] = tenant_timezone
+            user_context["tenant_current_datetime"] = tenant_now.isoformat()
             logger.debug(f"Using tenant timezone: {tenant_timezone}")
             
             return user_context
@@ -550,6 +554,7 @@ class ChatService:
         except Exception as e:
             logger.warning(f"Failed to enrich user context with tenant timezone: {e}")
             user_context["timezone"] = "UTC"
+            user_context["tenant_current_datetime"] = DateTimeManager.system_now().isoformat()
             return user_context
 
     async def _get_conversation_history(self, session_id: uuid.UUID, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:

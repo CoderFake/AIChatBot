@@ -8,8 +8,11 @@ from workflows.langgraph.state.state import RAGState, AgentResponse
 from services.agents.agent_service import AgentService
 from utils.logging import get_logger
 from utils.language_utils import get_workflow_message
+from utils.datetime_utils import DateTimeManager
+from config.settings import get_settings
 
 logger = get_logger(__name__)
+settings = get_settings()
 
 
 class ExecutePlanningNode(ExecutionNode):
@@ -256,6 +259,43 @@ class ExecutePlanningNode(ExecutionNode):
         )
 
         return f"{base_message}{retry_instruction}"
+
+    def _ensure_datetime_context(
+        self,
+        base_query: str,
+        tenant_timezone: Optional[str],
+        tenant_current_datetime: Optional[str],
+    ) -> str:
+        """Append tenant datetime context for the datetime tool when missing."""
+
+        marker = "TENANT DATETIME CONTEXT"
+        if base_query and marker in base_query.upper():
+            return base_query
+
+        timezone_value = tenant_timezone or getattr(settings, "TIMEZONE", "UTC")
+        try:
+            timezone_value = timezone_value or getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+        except Exception:
+            timezone_value = getattr(settings, "TIMEZONE", "UTC")
+
+        if tenant_current_datetime:
+            current_value = tenant_current_datetime
+        else:
+            try:
+                current_value = DateTimeManager.tenant_now(timezone_value).isoformat()
+            except Exception:
+                current_value = DateTimeManager.system_now().isoformat()
+
+        context_block = (
+            f"\n\n{marker}:"
+            f"\n- Tenant timezone: {timezone_value}"
+            f"\n- Current tenant datetime: {current_value}"
+            "\n- Always interpret and report dates/times using this tenant timezone, not UTC."
+        )
+
+        if base_query:
+            return f"{base_query.rstrip()}{context_block}"
+        return context_block.lstrip()
 
     def _get_tool_display(self, tools_used: List[str], result: Dict[str, Any]) -> str:
         """Build a human-friendly representation of the tools used."""
@@ -801,6 +841,19 @@ class ExecutePlanningNode(ExecutionNode):
             detected_language = state.get("detected_language", "english")
 
             query_to_use = message if message else original_query
+
+            if tool_name == "datetime":
+                tenant_timezone = user_context.get("timezone") or state.get("tenant_timezone")
+                tenant_current_datetime = (
+                    user_context.get("tenant_current_datetime")
+                    or state.get("tenant_current_datetime")
+                )
+                query_to_use = self._ensure_datetime_context(
+                    query_to_use,
+                    tenant_timezone,
+                    tenant_current_datetime,
+                )
+
             query_to_use = self._augment_with_retry_context(query_to_use, retry_error, attempt)
             agent_providers = state.get("agent_providers", {})
 
@@ -918,6 +971,18 @@ class ExecutePlanningNode(ExecutionNode):
                         tool_message = queries[i]
                     else:
                         tool_message = purpose or original_query
+
+                if current_tool == "datetime":
+                    tenant_timezone = user_context.get("timezone") or state.get("tenant_timezone")
+                    tenant_current_datetime = (
+                        user_context.get("tenant_current_datetime")
+                        or state.get("tenant_current_datetime")
+                    )
+                    tool_message = self._ensure_datetime_context(
+                        tool_message,
+                        tenant_timezone,
+                        tenant_current_datetime,
+                    )
 
                 if retry_error and attempt > 1 and i == 0:
                     tool_message = self._augment_with_retry_context(tool_message, retry_error, attempt)

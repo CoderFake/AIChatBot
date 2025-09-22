@@ -297,6 +297,8 @@ async def execute_rag_query(
     agents_structure = None
     tenant_bot_name = bot_name
     tenant_org_name = organization_name
+    tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+    tenant_current_datetime = DateTimeManager.system_now().isoformat()
 
     if user_context.get("tenant_id"):
         try:
@@ -320,6 +322,12 @@ async def execute_rag_query(
                 tenant_bot_name = tenant_info["bot_name"]
                 tenant_org_name = tenant_info["organization_name"]
 
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(user_context["tenant_id"], db)
+                tenant_now = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+                tenant_current_datetime = tenant_now.isoformat()
+                user_context.setdefault("timezone", tenant_timezone)
+                user_context.setdefault("tenant_current_datetime", tenant_current_datetime)
+
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
             agents_structure = None
@@ -328,6 +336,8 @@ async def execute_rag_query(
         "query": query,
         "messages": messages or [],
         "user_context": user_context,
+        "tenant_timezone": tenant_timezone,
+        "tenant_current_datetime": tenant_current_datetime,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
         "provider_name": provider_name,
@@ -366,6 +376,7 @@ async def stream_rag_query(
     tenant_org_name = organization_name
     tenant_desc = tenant_description
     tenant_timezone = None
+    tenant_current_datetime = None
 
     if user_context.get("tenant_id"):
         try:
@@ -392,11 +403,24 @@ async def stream_rag_query(
                 tenant_bot_name = tenant_info["bot_name"]
                 tenant_org_name = tenant_info["organization_name"]
                 tenant_desc = tenant_info["description"]
-                tenant_timezone = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(user_context["tenant_id"], db)
+                tenant_now = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+                tenant_current_datetime = tenant_now.isoformat()
+                user_context.setdefault("timezone", tenant_timezone)
 
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
             agents_structure = None 
+
+    if not tenant_timezone:
+        tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+
+    if not tenant_current_datetime:
+        tenant_current_datetime = DateTimeManager.system_now().isoformat()
+
+    user_context.setdefault("timezone", tenant_timezone)
+    user_context.setdefault("tenant_current_datetime", tenant_current_datetime)
 
     langchain_messages = []
     if messages:
@@ -417,6 +441,7 @@ async def stream_rag_query(
         "messages": langchain_messages,
         "user_context": user_context,
         "tenant_timezone": tenant_timezone,
+        "tenant_current_datetime": tenant_current_datetime,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
         "tenant_description": tenant_desc,

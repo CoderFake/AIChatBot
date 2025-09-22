@@ -32,6 +32,7 @@ class RAGState(TypedDict):
     department_id: NotRequired[str]
     access_scope: NotRequired[str]
     tenant_timezone: NotRequired[str]
+    tenant_current_datetime: NotRequired[str]
     provider_name: NotRequired[str]
     agents_structure: NotRequired[Dict[str, Any]]
     agent_providers: NotRequired[Dict[str, Any]]
