@@ -274,7 +274,7 @@ class DateTimeTool(BaseTool):
         
         Args:
             operation: Type of datetime operation to perform
-            timezone: Source timezone
+            timezone: Source timezone (defaults to UTC, but should be set to tenant timezone by tool manager)
             datetime_string: DateTime string for operations
             format_string: Format string for output
             amount: Amount for add/subtract operations
@@ -286,7 +286,7 @@ class DateTimeTool(BaseTool):
         Returns:
             String result of the datetime operation
         """
-        logger.info(f"Performing datetime operation: {operation}")
+        logger.info(f"Performing datetime operation: {operation} with timezone: {timezone}")
         
         result = self._perform_operation(
             operation=operation,
@@ -319,7 +319,7 @@ class DateTimeTool(BaseTool):
         
         Args:
             operation: Type of datetime operation to perform
-            timezone: Source timezone
+            timezone: Source timezone (defaults to UTC, but should be set to tenant timezone by tool manager)
             datetime_string: DateTime string for operations
             format_string: Format string for output
             amount: Amount for add/subtract operations

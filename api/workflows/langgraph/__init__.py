@@ -8,6 +8,7 @@ from .nodes.nodes import OrchestratorNode
 from .nodes.semantic_reflection_node import SemanticReflectionNode
 from .nodes.execute_planning_node import ExecutePlanningNode
 from .nodes.conflict_resolution_node import ConflictResolutionNode
+from .nodes.progress_tracker_node import ProgressTrackerNode
 from .nodes.final_response_node import FinalResponseNode
 
 # Workflow edges
@@ -51,6 +52,7 @@ __all__ = [
     "SemanticReflectionNode",
     "ExecutePlanningNode",
     "ConflictResolutionNode",
+    "ProgressTrackerNode",
     "FinalResponseNode",
     
     # Edges

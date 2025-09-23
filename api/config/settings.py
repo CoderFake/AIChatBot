@@ -183,7 +183,7 @@ class Settings(BaseSettings):
     DEVICE: str = "cpu"
     
     # CORS
-    CORS_ORIGINS: List[str] | str = ["http://localhost:3001", "https://aichatbot.hoangdieuit.io.vn"]
+    CORS_ORIGINS: List[str] | str = ["http://localhost:3001", "https://aichatbot.hoangdieuit.io.vn", "http://192.168.31.23:3001",]
 
     # Email SMTP
     EMAIL_TEMPLATES_DIR: str = Field(default="templates/email", env="EMAIL_TEMPLATES_DIR")

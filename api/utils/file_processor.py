@@ -90,7 +90,26 @@ class FileProcessor:
             enable_hybrid_chunking: Enable HybridChunker for structure-aware chunking
         """
         self.tokenizer_name = tokenizer_name
-        self.max_tokens = max_tokens
+        # Comprehensive type checking and conversion for max_tokens
+        if isinstance(max_tokens, str):
+            try:
+                self.max_tokens = int(max_tokens)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert max_tokens '{max_tokens}' to int, using default: 1500")
+                self.max_tokens = 1500
+        elif isinstance(max_tokens, float):
+            self.max_tokens = int(max_tokens)
+        elif isinstance(max_tokens, int):
+            self.max_tokens = max_tokens
+        else:
+            logger.warning(f"Invalid max_tokens type: {type(max_tokens)}, using default: 1500")
+            self.max_tokens = 1500
+            
+        # Ensure max_tokens is positive
+        if self.max_tokens <= 0:
+            logger.warning(f"Invalid max_tokens value: {max_tokens}, using default: 1500")
+            self.max_tokens = 1500
+            
         self.enable_hybrid_chunking = enable_hybrid_chunking
         
         self._initialize_tokenizer()
@@ -120,7 +139,7 @@ class FileProcessor:
             try:
                 hf_tokenizer = HuggingFaceTokenizer(
                     tokenizer=self.tokenizer,
-                    max_tokens=self.max_tokens
+                    max_tokens=int(self.max_tokens) 
                 )
                 
                 self.hybrid_chunker = HybridChunker(
@@ -137,6 +156,23 @@ class FileProcessor:
     def _initialize_fallback_text_splitter(self):
         """Initialize fallback RecursiveCharacterTextSplitter with token-based length function."""
         try:
+            chunk_size = self.max_tokens
+            if isinstance(chunk_size, str):
+                try:
+                    chunk_size = int(chunk_size)
+                except (ValueError, TypeError):
+                    chunk_size = 1500
+                    logger.warning(f"Could not convert max_tokens '{self.max_tokens}' to int, using default: 1500")
+            elif isinstance(chunk_size, float):
+                chunk_size = int(chunk_size)
+            elif not isinstance(chunk_size, int):
+                chunk_size = 1500
+                logger.warning(f"Invalid max_tokens type: {type(self.max_tokens)}, using default: 1500")
+            
+            if chunk_size <= 0:
+                chunk_size = 1500
+                logger.warning(f"Invalid max_tokens value: {self.max_tokens}, using default: 1500")
+            
             if self.tokenizer:
                 def token_length_function(text: str) -> int:
                     """Calculate exact token count using AutoTokenizer."""
@@ -146,17 +182,17 @@ class FileProcessor:
                         return len(text.split())
                 
                 self.text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=self.max_tokens,
-                    chunk_overlap=200,
+                    chunk_size=int(chunk_size),  
+                    chunk_overlap=int(200), 
                     length_function=token_length_function,
                     separators=["\n\n", "\n", ". ", " ", ""],
                     add_start_index=True
                 )
-                logger.info("RecursiveCharacterTextSplitter with AutoTokenizer-based length function")
+                logger.info(f"RecursiveCharacterTextSplitter with AutoTokenizer-based length function (chunk_size: {chunk_size})")
             else:
                 self.text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1500,
-                    chunk_overlap=200,
+                    chunk_size=int(1500),  
+                    chunk_overlap=int(200),  
                     separators=["\n\n", "\n", ". ", " ", ""],
                     add_start_index=True
                 )
@@ -164,7 +200,10 @@ class FileProcessor:
                 
         except Exception as e:
             logger.error(f"Failed to initialize text splitter: {e}")
-            self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=int(1500), 
+                chunk_overlap=int(200)
+            )
     
     def _setup_docling_converter(self):
         """Setup Docling DocumentConverter for advanced document processing."""

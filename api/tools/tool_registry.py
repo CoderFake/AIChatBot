@@ -30,6 +30,7 @@ class ToolRegistry:
         from tools.web_search_tool import WebSearchTool
         from tools.summary_tool import SummaryTool
         from tools.rag_tool import RAGSearchTool
+        from tools.late_minutes_tool import LateMinutesTool
         
         tools_to_register = [
             CalculatorTool(),
@@ -37,7 +38,8 @@ class ToolRegistry:
             WeatherTool(),
             WebSearchTool(),
             SummaryTool(),
-            RAGSearchTool()
+            RAGSearchTool(),
+            LateMinutesTool()
         ]
         
         for tool in tools_to_register:

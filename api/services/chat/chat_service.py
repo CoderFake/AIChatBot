@@ -147,25 +147,51 @@ class ChatService:
         response: Optional[str] = None
     ) -> ChatMessage:
         """
-        Save a chat message to database with cache-first approach
+        Save a chat message to database with proper connection handling
         """
         try:
-            message_data = {
-                "session_id": session_id,
-                "query": query,
-                "language": language,
-                "processing_time": processing_time,
-                "model_used": model_used,
-                "confidence_score": confidence_score,
-                "chat_metadata": chat_metadata,
-                "response": response
-            }
+            # Check if session exists before saving message
+            from config.database import get_db_context
+            
+            # Use a fresh database session to avoid connection issues
+            async with get_db_context() as fresh_db:
+                # Verify session exists
+                session_check = await fresh_db.execute(
+                    select(ChatSession).where(ChatSession.id == session_id)
+                )
+                existing_session = session_check.scalar_one_or_none()
+                
+                if not existing_session:
+                    logger.warning(f"Session {session_id} not found, cannot save message")
+                    raise ValueError(f"Session {session_id} not found")
+                
+                message_data = {
+                    "session_id": session_id,
+                    "query": query,
+                    "language": language,
+                    "processing_time": processing_time,
+                    "model_used": model_used or "workflow",  # Default to workflow if not provided
+                    "confidence_score": confidence_score,
+                    "chat_metadata": chat_metadata,
+                    "response": response
+                }
 
-            message = ChatMessage(**message_data)
+                message = ChatMessage(**message_data)
+                fresh_db.add(message)
+                await fresh_db.commit()
+                await fresh_db.refresh(message)
+                
+                logger.info(f"Successfully saved message for session {session_id}")
+                return message
 
-            self.db.add(message)
-            await self.db.commit()
-            await self.db.refresh(message)
+        except Exception as e:
+            logger.error(f"Failed to save message: {e}")
+            try:
+                if hasattr(self, 'db') and self.db:
+                    await self.db.rollback()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to save message: {e}")
 
             updated_message_data = {
                 "session_id": message.session_id,
@@ -542,11 +568,8 @@ class ChatService:
         try:
             from utils.datetime_utils import DateTimeManager
             
-            tenant_timezone = await DateTimeManager.get_tenant_timezone(tenant_id, self.db)
-            tenant_now = await DateTimeManager.tenant_now_cached(tenant_id, self.db)
-
+            tenant_timezone = await DateTimeManager._get_tenant_timezone_cached(tenant_id, self.db)
             user_context["timezone"] = tenant_timezone
-            user_context["tenant_current_datetime"] = tenant_now.isoformat()
             logger.debug(f"Using tenant timezone: {tenant_timezone}")
             
             return user_context
@@ -554,7 +577,6 @@ class ChatService:
         except Exception as e:
             logger.warning(f"Failed to enrich user context with tenant timezone: {e}")
             user_context["timezone"] = "UTC"
-            user_context["tenant_current_datetime"] = DateTimeManager.system_now().isoformat()
             return user_context
 
     async def _get_conversation_history(self, session_id: uuid.UUID, user_context: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -675,6 +697,9 @@ class ChatService:
                         })
                         logger.debug(f"CAPTURED_PROGRESS: {len(progress_messages)} messages so far")
 
+                    logger.info(f"WORKFLOW_OUTPUT: node={node_name}, has_formatted_tasks={output.get('formatted_tasks') is not None}, has_task_status_update={output.get('task_status_update') is not None}")
+
+                    # IMMEDIATE YIELD: Plan events
                     if node_name == "execute_planning" and output.get("formatted_tasks") is not None:
                         plan_event = {
                             "execution_plan": output.get("execution_plan"),
@@ -684,9 +709,28 @@ class ChatService:
                             "message": output.get("progress_message"),
                             "semantic_routing": output.get("semantic_routing"),
                             "current_step": output.get("current_step"),
-                            "total_steps": output.get("total_steps")
+                            "total_steps": output.get("total_steps"),
+                            "task_status_update": output.get("task_status_update")  # Include task status info
                         }
                         yield self._create_sse_event(2, "plan", plan_event)
+                        logger.info(f"IMMEDIATE_YIELD: Plan event with {len(output.get('formatted_tasks', []))} tasks")
+
+                        await asyncio.sleep(0)
+                   
+                    if output.get("task_status_update"):
+                        task_update = output.get("task_status_update")
+                        task_event = {
+                            "task_update": task_update,
+                            "formatted_tasks": output.get("formatted_tasks"),
+                            "progress": output.get("progress_percentage", 0),
+                            "message": output.get("progress_message"),
+                            "current_step": output.get("current_step"),
+                            "total_steps": output.get("total_steps")
+                        }
+                        yield self._create_sse_event(6, "task_status", task_event)
+                        logger.info(f"IMMEDIATE_YIELD: Task status update - task_index={task_update.get('task_index')}, status={task_update.get('status')}, color={task_update.get('color')}")
+
+                        await asyncio.sleep(0)
 
                 final_payload = output.get("final_response")
                 provider_name = output.get("provider_name")
@@ -1016,16 +1060,43 @@ class ChatService:
         return f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
 
     def _get_model_used(self, provider) -> str:
-        """Extract model name from provider for logging"""
+        """Extract model name from provider for logging with comprehensive fallbacks"""
         try:
+            # Try to get provider name and model information
             prov_name = getattr(provider, 'name', None)
-            default_model = getattr(getattr(provider, 'config', None), 'default_model', None)
+            config = getattr(provider, 'config', None)
+            default_model = getattr(config, 'default_model', None) if config else None
+            
+            # Try alternative attribute names
+            if not prov_name:
+                prov_name = getattr(provider, 'provider_name', None)
+            if not default_model:
+                default_model = getattr(provider, 'model_name', None)
+                if not default_model and config:
+                    default_model = config.get('model', None)
+            
+            # Construct the model identifier
             if prov_name and default_model:
                 return f"{prov_name}:{default_model}"
+            elif prov_name:
+                return prov_name
+            elif default_model:
+                return f"unknown_provider:{default_model}"
             else:
-                return default_model or prov_name or "unknown"
-        except Exception:
-            return "unknown"
+                # Last resort - try to extract from string representation
+                provider_str = str(provider)
+                if 'gpt' in provider_str.lower():
+                    return "openai:gpt-4"
+                elif 'claude' in provider_str.lower():
+                    return "anthropic:claude"
+                elif 'gemini' in provider_str.lower():
+                    return "google:gemini"
+                else:
+                    return "workflow:unknown_model"
+                    
+        except Exception as e:
+            logger.warning(f"Failed to extract model information: {e}")
+            return "workflow:extraction_failed"
 
     def _get_error_response(self, detected_language: str, error_type: str = "general") -> str:
         """Get localized error response based on language"""
@@ -1048,10 +1119,57 @@ class ChatService:
 
     def _create_workflow_metadata(self, output: Dict, progress_messages: List, response_type: str = "response",
                                 error_details: str = None, detected_language: str = "english") -> Dict:
-        """Create standardized workflow metadata"""
+        """Create comprehensive workflow metadata for persistence"""
+        
+        execution_plan = output.get("execution_plan", {})
+        agent_responses = output.get("agent_responses", [])
+        
+        processed_agent_responses = []
+        for response in agent_responses:
+            if isinstance(response, dict):
+                processed_response = {
+                    "agent_name": response.get("agent_name", "unknown"),
+                    "content": response.get("content", ""),
+                    "status": response.get("status", "unknown"),
+                    "confidence": response.get("confidence", 0.0),
+                    "execution_time": response.get("execution_time", 0.0),
+                    "tools_used": response.get("tools_used", []),
+                    "sources": response.get("sources", []),
+                    "task_index": response.get("task_index"),
+                    "retry_attempts": response.get("retry_attempts", 0)
+                }
+                processed_agent_responses.append(processed_response)
+        
+        semantic_routing = output.get("semantic_routing", {})
+        if isinstance(semantic_routing, dict):
+            routing_decision = semantic_routing.get("routing_decision", "unknown")
+            confidence = semantic_routing.get("confidence", 0.0)
+        else:
+            routing_decision = "unknown"
+            confidence = 0.0
+            
+        processed_execution_plan = {}
+        if isinstance(execution_plan, dict):
+            processed_execution_plan = {
+                "total_steps": len(execution_plan.get("steps", [])),
+                "routing_decision": execution_plan.get("routing_decision", routing_decision),
+                "agents_involved": execution_plan.get("agents_involved", []),
+                "tools_planned": execution_plan.get("tools_planned", []),
+                "steps": execution_plan.get("steps", [])
+            }
+        
         return {
             "reasoning": output.get("reasoning", error_details or ""),
-            "execution_metadata": output.get("execution_metadata", {}),
+            "execution_metadata": {
+                **output.get("execution_metadata", {}),
+                "workflow_version": "1.0.0",
+                "processing_time_ms": output.get("processing_time_ms"),
+                "total_agents_used": len(processed_agent_responses),
+                "routing_decision": routing_decision,
+                "routing_confidence": confidence,
+                "execution_successful": response_type != "error",
+                "checkpointing_enabled": True
+            },
             "sources": output.get("final_sources", []),
             "response_type": response_type,
             "confidence_score": output.get("confidence_score", 0.0),
@@ -1063,10 +1181,15 @@ class ChatService:
             "progress_percentage": output.get("progress_percentage", 100),
             "progress_message": output.get("progress_message", ""),
             "progress_messages": progress_messages,
-            "semantic_routing": output.get("semantic_routing", {}),
-            "agent_responses": output.get("agent_responses", []),
+            "semantic_routing": {
+                "routing_decision": routing_decision,
+                "confidence": confidence,
+                "alternatives_considered": semantic_routing.get("alternatives_considered", []),
+                "reasoning": semantic_routing.get("reasoning", "")
+            },
+            "agent_responses": processed_agent_responses,
             "conflict_resolution": output.get("conflict_resolution", {}),
-            "execution_plan": output.get("execution_plan", {}),
+            "execution_plan": processed_execution_plan,
             "agent_providers_loaded": output.get("agent_providers_loaded", 0),
             "error_details": error_details
         }

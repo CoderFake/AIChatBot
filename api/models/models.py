@@ -128,3 +128,25 @@ class SummaryInput(BaseModel):
     )
 
 
+class LateMinutesInput(BaseModel):
+    """Input schema for late minutes tracking tool"""
+    users: List[str] = Field(
+        description="List of usernames, names, or emails to check late minutes for"
+    )
+    time_period: str = Field(
+        description="Time period to check: 'day', 'week', 'month', 'year'"
+    )
+    specific_date: Optional[str] = Field(
+        default=None,
+        description="Specific date in YYYY-MM-DD format (optional, defaults to current period)"
+    )
+    checkin_time: Optional[str] = Field(
+        default=None,
+        description="Expected checkin time in HH:MM format (e.g., '09:00')"
+    )
+    checkout_time: Optional[str] = Field(
+        default=None,
+        description="Expected checkout time in HH:MM format (e.g., '18:00')"
+    )
+
+

@@ -1,5 +1,6 @@
 import asyncio
 import time
+import asyncio
 from asyncio import Queue
 from typing import Dict, Any, List, Optional
 from langchain_core.runnables import RunnableConfig
@@ -11,6 +12,13 @@ from utils.language_utils import get_workflow_message
 from utils.datetime_utils import DateTimeManager
 from config.settings import get_settings
 
+# Import progress tracker utility
+try:
+    from .progress_tracker_node import ProgressTrackerNode
+    progress_tracker_utility = ProgressTrackerNode()
+except ImportError:
+    progress_tracker_utility = None
+    
 logger = get_logger(__name__)
 settings = get_settings()
 
@@ -30,13 +38,13 @@ class ExecutePlanningNode(ExecutionNode):
     def _calculate_progress_percentage(self, step: str, current_step: int = 0, total_steps: int = 0) -> int:
         """Calculate real progress percentage based on workflow step and completion"""
         base_progress = {
-            "plan_ready": 20,
+            "plan_ready": 50,  # Immediately show 50% when plan is ready
             "executing_agents": 75,
             "executing_task": 75,
             "task_completed": 75,
-            "completed": 85,
+            "completed": 100,  # Show 100% only when truly completed
             "conflict_resolution_needed": 85,
-            "failed": 85
+            "failed": 0  # Show 0% for failed state
         }
 
         progress = base_progress.get(step, 75)
@@ -46,6 +54,28 @@ class ExecutePlanningNode(ExecutionNode):
             progress = min(85, progress + task_progress)
 
         return progress
+        
+    def _calculate_exact_progress_percentage(self, formatted_tasks: List[Dict[str, Any]], step: str = None) -> float:
+        """Calculate exact progress percentage using progress tracker utility"""
+        if progress_tracker_utility:
+            try:
+                return progress_tracker_utility._calculate_exact_progress(formatted_tasks, step or "executing")
+            except Exception as e:
+                logger.warning(f"Progress tracker utility failed: {e}")
+                
+        # Fallback to basic calculation
+        if not formatted_tasks:
+            return 0.0
+            
+        total_tasks = len(formatted_tasks)
+        completed_tasks = sum(1 for task in formatted_tasks if task.get("status") == "completed")
+        in_progress_tasks = sum(1 for task in formatted_tasks if task.get("status") in ["in_progress", "retrying"])
+        
+        # Simple calculation: completed=100%, in_progress=50%, others=0%
+        total_progress = (completed_tasks * 100) + (in_progress_tasks * 50)
+        max_possible = total_tasks * 100
+        
+        return (total_progress / max_possible * 100) if max_possible > 0 else 0.0
 
     async def execute(self, state: RAGState, config: RunnableConfig) -> Dict[str, Any]:
         """Execute the structured planning with agent coordination"""
@@ -84,6 +114,11 @@ class ExecutePlanningNode(ExecutionNode):
                 "progress_message": get_workflow_message("execution_plan_ready", detected_language),
                 "execution_plan": execution_plan,
                 "formatted_tasks": formatted_tasks,
+                "task_status_update": {
+                    "type": "plan_ready",
+                    "all_tasks_status": "pending",
+                    "color": "primary"
+                },
                 "should_yield": True
             }
 
@@ -145,40 +180,61 @@ class ExecutePlanningNode(ExecutionNode):
 
             if routing_decision == "single_agent_sequential":
                 logger.info("Routing to final_response: Single agent with sequential tools")
+                all_completed = all(task.get("status") == "completed" for task in formatted_tasks)
+                final_progress = self._calculate_exact_progress_percentage(formatted_tasks, "final_routing")
                 yield {
                     "agent_responses": successful_responses,
                     "next_action": "final_response",
                     "routing_decision": routing_decision,
                     "processing_status": "completed",
-                    "progress_percentage": self._calculate_progress_percentage("completed"),
+                    "progress_percentage": final_progress,
                     "progress_message": progress_msg,
                     "formatted_tasks": formatted_tasks,
+                    "task_status_update": {
+                        "type": "all_completed" if all_completed else "mostly_completed",
+                        "all_tasks_status": "completed" if all_completed else "partial",
+                        "color": "success" if all_completed else "primary"
+                    },
                     "should_yield": True
                 }
 
             elif routing_decision == "multiple_agents":
                 logger.info("Routing to conflict_resolution: Multiple agents detected")
+                all_completed = all(task.get("status") == "completed" for task in formatted_tasks)
+                conflict_progress = self._calculate_exact_progress_percentage(formatted_tasks, "conflict_resolution")
                 yield {
                     "agent_responses": successful_responses,
                     "next_action": "conflict_resolution",
                     "routing_decision": routing_decision,
                     "processing_status": "ready_for_resolution",
-                    "progress_percentage": self._calculate_progress_percentage("conflict_resolution_needed"),
+                    "progress_percentage": conflict_progress,
                     "progress_message": get_workflow_message("conflict_resolution_needed", detected_language),
                     "formatted_tasks": formatted_tasks,
+                    "task_status_update": {
+                        "type": "conflict_resolution" if not all_completed else "all_completed",
+                        "all_tasks_status": "completed" if all_completed else "partial",
+                        "color": "success" if all_completed else "primary"
+                    },
                     "should_yield": True
                 }
 
             else:
                 logger.info("Routing to conflict_resolution: Complex execution plan")
+                all_completed = all(task.get("status") == "completed" for task in formatted_tasks)
+                complex_progress = self._calculate_exact_progress_percentage(formatted_tasks, "complex_resolution")
                 yield {
                     "agent_responses": successful_responses,
                     "next_action": "conflict_resolution",
                     "routing_decision": routing_decision,
                     "processing_status": "ready_for_resolution",
-                    "progress_percentage": self._calculate_progress_percentage("conflict_resolution_needed"),
+                    "progress_percentage": complex_progress,
                     "progress_message": get_workflow_message("conflict_resolution_needed", detected_language),
                     "formatted_tasks": formatted_tasks,
+                    "task_status_update": {
+                        "type": "complex_resolution" if not all_completed else "all_completed",
+                        "all_tasks_status": "completed" if all_completed else "partial",
+                        "color": "success" if all_completed else "primary"
+                    },
                     "should_yield": True
                 }
 
@@ -241,7 +297,8 @@ class ExecutePlanningNode(ExecutionNode):
                             "retry_attempts": 0,
                             "retry_history": [],
                             "max_retries": self.MAX_RETRY_ATTEMPTS,
-                            "severity": "pending"
+                            "severity": "pending",
+                            "color": "primary"  # Default primary color for pending
                         }
                         formatted_tasks.append(formatted_task)
         
@@ -419,12 +476,46 @@ class ExecutePlanningNode(ExecutionNode):
                 try:
                     if isinstance(task, dict):
                         if i < len(formatted_tasks):
+                            # Update to in_progress status immediately
                             formatted_tasks[i]["status"] = "in_progress"
                             formatted_tasks[i]["severity"] = "info"
+                            formatted_tasks[i]["color"] = "primary"  # Primary color for in progress
                             formatted_tasks[i]["agent"] = task.get("agent", formatted_tasks[i].get("agent", ""))
                             formatted_tasks[i]["retry_count"] = 0
                             formatted_tasks[i].pop("error", None)
                             formatted_tasks[i].pop("last_error", None)
+                            
+                            # Pass data with exact progress calculation
+                            exact_progress = self._calculate_exact_progress_percentage(formatted_tasks, "task_started")
+                            yield {
+                                "type": "progress",
+                                "node": "execute_planning",
+                                "output": {
+                                    "processing_status": "task_started",
+                                    "progress_percentage": exact_progress,
+                                    "progress_message": get_workflow_message(
+                                        "task_started",
+                                        detected_language,
+                                        current=i+1,
+                                        total=len(all_tasks),
+                                        agent=task.get("agent", "Agent")
+                                    ),
+                                    "current_step": "task_execution",
+                                    "total_steps": len(all_tasks),
+                                    "formatted_tasks": formatted_tasks,
+                                    "task_status_update": {
+                                        "type": "task_started",
+                                        "task_index": i,
+                                        "status": "in_progress",
+                                        "color": "primary"
+                                    },
+                                    "should_yield": True
+                                }
+                            }
+                            # Force immediate yielding to prevent async buffering
+                            await asyncio.sleep(0)
+                            
+                        logger.info(f"YIELDED_TASK_START: task_index={i}, agent={task.get('agent', 'Agent')}")
                         task_future = asyncio.create_task(
                             self._execute_single_task(
                                 state,
@@ -479,6 +570,7 @@ class ExecutePlanningNode(ExecutionNode):
                             if task_idx is not None and 0 <= task_idx < len(formatted_tasks):
                                 formatted_tasks[task_idx]["status"] = "retrying"
                                 formatted_tasks[task_idx]["severity"] = "danger"
+                                formatted_tasks[task_idx]["color"] = "danger"  # Danger color for retry
                                 formatted_tasks[task_idx]["retry_count"] = retry_event.get("attempt", 0)
                                 formatted_tasks[task_idx]["max_retries"] = retry_event.get("max_attempts", self.MAX_RETRY_ATTEMPTS)
                                 formatted_tasks[task_idx]["retry_attempts"] = retry_event.get("attempt", 0)
@@ -490,24 +582,35 @@ class ExecutePlanningNode(ExecutionNode):
                                 detected_language
                             )
 
+                            exact_progress = self._calculate_exact_progress_percentage(formatted_tasks, "task_retry")
+                            progress_message = self._build_retry_progress_message(
+                                retry_event,
+                                detected_language
+                            )
+                            
                             yield {
                                 "type": "progress",
                                 "node": "execute_planning",
                                 "output": {
                                     "processing_status": "task_retrying",
-                                    "progress_percentage": self._calculate_progress_percentage(
-                                        "executing_task",
-                                        processed_count,
-                                        len(all_tasks)
-                                    ),
+                                    "progress_percentage": exact_progress,
                                     "progress_message": progress_message,
-                                    "current_step": processed_count,
+                                    "current_step": "task_retry",
                                     "total_steps": len(all_tasks),
                                     "formatted_tasks": formatted_tasks,
+                                    "task_status_update": {
+                                        "type": "task_retry",
+                                        "task_index": task_idx,
+                                        "status": "retrying",
+                                        "color": "danger",
+                                        "attempt": retry_event.get("attempt", 0)
+                                    },
                                     "should_yield": True
                                 }
                             }
-
+                            # Force immediate yielding for retry events
+                            await asyncio.sleep(0)
+                            
                         if pending_tasks:
                             queue_listener = asyncio.create_task(progress_queue.get())
                         else:
@@ -551,16 +654,23 @@ class ExecutePlanningNode(ExecutionNode):
                             completed_success += 1
 
                         if task_idx < len(formatted_tasks):
-                            formatted_tasks[task_idx]["status"] = "completed" if status == "completed" else "failed"
-                            formatted_tasks[task_idx]["severity"] = (
-                                "success" if status == "completed" else "danger"
-                            )
+                            task_status = "completed" if status == "completed" else "failed"
+                            formatted_tasks[task_idx]["status"] = task_status
+                            
+                            if status == "completed":
+                                formatted_tasks[task_idx]["severity"] = "success"
+                                formatted_tasks[task_idx]["color"] = "success"  
+                            else:
+                                formatted_tasks[task_idx]["severity"] = "danger"
+                                formatted_tasks[task_idx]["color"] = "danger"  
+                            
                             formatted_tasks[task_idx]["result"] = result
                             attempts_used = result.get("retry_attempts", result.get("attempts", 0))
                             formatted_tasks[task_idx]["retry_count"] = attempts_used
                             formatted_tasks[task_idx]["retry_attempts"] = attempts_used
                             formatted_tasks[task_idx]["retry_history"] = result.get("retry_history", [])
                             formatted_tasks[task_idx]["max_retries"] = result.get("max_retries", self.MAX_RETRY_ATTEMPTS)
+                            
                             if status != "completed":
                                 error_message = result.get("error") or result.get("content")
                                 formatted_tasks[task_idx]["error"] = error_message
@@ -608,27 +718,70 @@ class ExecutePlanningNode(ExecutionNode):
                                 )
                             )
 
+                        exact_progress = self._calculate_exact_progress_percentage(formatted_tasks, "task_completion")
+                        
+                        if status == "completed":
+                            if attempts_used > 1:
+                                progress_message = get_workflow_message(
+                                    "task_recovered",
+                                    detected_language,
+                                    current=completed_success,
+                                    total=len(all_tasks),
+                                    agent=agent_display,
+                                    tool=tool_display,
+                                    attempts=attempts_used
+                                )
+                            else:
+                                progress_message = get_workflow_message(
+                                    "task_completed_sequential",
+                                    detected_language,
+                                    current=completed_success,
+                                    total=len(all_tasks),
+                                    agent=agent_display,
+                                    tool=tool_display
+                                )
+                        else:
+                            error_detail = result.get("error") or result.get("content", "")
+                            base_error = error_detail or get_workflow_message("generic_error", detected_language)
+                            progress_message = (
+                                f"Task {agent_display} failed after {attempts_used} attempts: {base_error}" if base_error else get_workflow_message(
+                                    "task_failed",
+                                    detected_language,
+                                    agent=agent_display,
+                                    tool=tool_display,
+                                    error=""
+                                )
+                            )
+
                         yield {
                             "type": "progress",
                             "node": "execute_planning",
                             "output": {
                                 "processing_status": "task_completed" if status == "completed" else "task_failed",
-                                "progress_percentage": self._calculate_progress_percentage(
-                                    "task_completed", processed_count, len(all_tasks)
-                                ),
+                                "progress_percentage": exact_progress,
                                 "progress_message": progress_message,
-                                "current_step": processed_count,
+                                "current_step": "task_completion",
                                 "total_steps": len(all_tasks),
                                 "formatted_tasks": formatted_tasks,
+                                "task_status_update": {
+                                    "type": "task_completed" if status == "completed" else "task_failed",
+                                    "task_index": task_idx,
+                                    "status": "completed" if status == "completed" else "failed",
+                                    "color": "success" if status == "completed" else "danger",
+                                    "retry_attempts": attempts_used,
+                                    "is_retry_success": status == "completed" and attempts_used > 1, 
+                                    "enhanced_success": status == "completed" and attempts_used > 1 
+                                },
                                 "should_yield": True
                             }
                         }
-
+                        await asyncio.sleep(0)
+                        
                         pending_tasks.discard(completed_task)
 
                 except Exception as wait_exc:
                     logger.error(f"Error in asyncio.wait: {wait_exc}")
-                    # Cancel remaining tasks
+            
                     for task in list(pending_tasks):
                         if not task.done():
                             task.cancel()
@@ -654,12 +807,10 @@ class ExecutePlanningNode(ExecutionNode):
         except Exception as e:
             logger.error(f"Parallel execution failed: {e}")
 
-            # Cancel all pending tasks
             for task_future, _ in execution_tasks:
                 if not task_future.done():
                     task_future.cancel()
 
-            # Re-raise the exception to let the caller handle it
             raise e
 
     async def _execute_single_task(

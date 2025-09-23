@@ -173,6 +173,8 @@ IMPORTANT:
 - Combine information from multiple agents when they complement each other
 - Clearly explain your reasoning process
 - Focus on factual accuracy over agent confidence scores
+
+CRITICAL RULE: PROHIBITED TO FABRICATE INFORMATION IF NOT INCLUDED IN THE PROVIDED CONTENT
 """
             tenant_id = state.get("tenant_id")
             response = await provider.ainvoke(

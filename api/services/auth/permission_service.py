@@ -4,7 +4,7 @@ Core permission management: create default groups and validate user permissions
 """
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, delete, update
+from sqlalchemy import select
 from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime
 import uuid
@@ -811,6 +811,13 @@ class PermissionService:
         Returns: List of permission dictionaries with id, permission_code, permission_name, resource_type, action
         """
         try:
+            # Validate user_id is a valid UUID
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get effective permissions.")
+                return []
+
             result = await self.db.execute(
                 select(User)
                 .options(
@@ -962,6 +969,12 @@ class PermissionService:
     async def _invalidate_user_permission_cache(self, user_id: str) -> None:
         """Invalidate cached effective permissions for a user (scoped by tenant)."""
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.debug(f"Invalid user_id format: {user_id}. Skipping cache invalidation.")
+                return
+
             result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
             row = result.first()
             if not row or not row[0]:
@@ -994,6 +1007,12 @@ class PermissionService:
 
     async def _get_tenant_id_from_user(self, user_id: str) -> Optional[str]:
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.debug(f"Invalid user_id format: {user_id}. Cannot get tenant_id.")
+                return None
+
             result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
             row = result.first()
             return str(row[0]) if row and row[0] else None
@@ -1045,6 +1064,13 @@ class RAGPermissionService:
         USER -> public collections only.
         """
         try:
+            # Validate user_id is a valid UUID
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot perform RAG access check.")
+                return False, [], AccessLevel.PUBLIC.value
+
             if requested_access_level not in [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]:
                 logger.warning(
                     f"Unsupported requested access level '{requested_access_level}' for user {user_id}; falling back to public"
@@ -1162,6 +1188,11 @@ class RAGPermissionService:
             (has_access, accessible_collections, effective_access_level)
         """
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot perform RAG access check.")
+                return False, [], AccessLevel.PUBLIC.value
             from sqlalchemy import select
 
             normalized_department = (department_name or "").strip()
@@ -1248,6 +1279,12 @@ class RAGPermissionService:
         try:
             from sqlalchemy import select
 
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get public access only.")
+                return False, [], AccessLevel.PUBLIC.value
+
             # Get user to find tenant
             user_result = await self.db.execute(
                 select(User).where(User.id == user_id)
@@ -1285,7 +1322,12 @@ class RAGPermissionService:
         try:
             from sqlalchemy import select
 
-            # Get user with roles
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get private access only.")
+                return False, [], AccessLevel.PUBLIC.value
+
             user_result = await self.db.execute(
                 select(User)
                 .options(
@@ -1361,7 +1403,12 @@ class RAGPermissionService:
         try:
             from sqlalchemy import select
 
-            # Get user with roles
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get both access.")
+                return False, [], AccessLevel.PUBLIC.value
+
             user_result = await self.db.execute(
                 select(User)
                 .options(
@@ -1497,6 +1544,12 @@ class RAGPermissionService:
         """
         try:
             from sqlalchemy import select
+
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot check admin RAG access.")
+                return False, [], AccessLevel.PUBLIC.value
 
             user_result = await self.db.execute(
                 select(User)

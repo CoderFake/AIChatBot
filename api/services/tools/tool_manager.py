@@ -3,6 +3,7 @@ Tool Manager Service
 Manages tool instances, configurations, and execution
 """
 import asyncio
+import inspect
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_
@@ -219,7 +220,7 @@ class ToolManager:
             return []
 
 
-    async def execute_tool(self, tool_name: str, params: Dict[str, Any], agent_providers: Dict[str, Any] = None, agent_id: str = None, user_context: Dict[str, Any] = None) -> Any:
+    async def execute_tool(self, tool_name: str, params: Dict[str, Any], agent_providers: Dict[str, Any] = None, agent_id: str = None, user_context: Dict[str, Any] = None, retry_context: Dict[str, Any] = None) -> Any:
         """
         Execute a tool with given parameters
         
@@ -243,9 +244,14 @@ class ToolManager:
 
             if tool_name == "datetime" and user_context:
                 tenant_timezone = user_context.get("timezone", "UTC")
-                if "timezone" not in params or params.get("timezone") == "UTC":
+                original_timezone = params.get("timezone", "UTC")
+                
+                # Always use tenant timezone for datetime operations unless explicitly overridden
+                if original_timezone == "UTC" or "timezone" not in params:
                     params["timezone"] = tenant_timezone
-                    logger.debug(f"Using tenant timezone for datetime tool: {tenant_timezone}")
+                    logger.info(f"DateTime tool: Using tenant timezone '{tenant_timezone}' (was '{original_timezone}') for user in tenant {user_context.get('tenant_id')}")
+                else:
+                    logger.info(f"DateTime tool: Using explicitly provided timezone '{original_timezone}' for user in tenant {user_context.get('tenant_id')}")
 
             agent_provider_name = None
             if agent_providers and agent_id and agent_id in agent_providers:
@@ -266,14 +272,20 @@ class ToolManager:
 
                     query = params.get("query", "")
                     tenant_id = user_context.get("tenant_id") if user_context else None
+                    
+                    logger.debug(f"Parsing {tool_name} parameters - Original params: {list(params.keys())}")
                     parsed_params = await parser.parse_tool_parameters(
                         tool_name,
                         query,
                         agent_provider_name,
                         tenant_id,
                         user_context=user_context,
+                        original_params=params,
                     )
                     execution_params = parsed_params
+                    logger.debug(f"Parsed {tool_name} execution params: {list(execution_params.keys())}")
+            
+            execution_params = self._filter_tool_parameters(tool_name, tool_instance, execution_params)
             
             if hasattr(tool_instance, '_arun'):
                 result = await tool_instance._arun(**execution_params)
@@ -289,6 +301,47 @@ class ToolManager:
         except Exception as e:
             logger.error(f"Failed to execute tool {tool_name}: {e}")
             raise
+
+    def _filter_tool_parameters(self, tool_name: str, tool_instance: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Filter parameters to only include what the tool actually accepts
+        This prevents 'unexpected keyword argument' errors
+        """
+        try:
+            # Get the tool's method signature
+            if hasattr(tool_instance, '_arun'):
+                method = tool_instance._arun
+            elif hasattr(tool_instance, 'arun'):
+                method = tool_instance.arun
+            elif hasattr(tool_instance, 'run'):
+                method = tool_instance.run
+            else:
+                logger.warning(f"Tool {tool_name} has no execution method, returning all params")
+                return params
+
+            sig = inspect.signature(method)
+            
+            # Get parameter names that the method accepts
+            accepted_params = set(sig.parameters.keys())
+            
+            # Remove 'self' and 'run_manager' from the accepted params as they're handled automatically
+            accepted_params.discard('self')
+            accepted_params.discard('run_manager')
+            
+            # Filter input params to only include accepted ones
+            filtered_params = {k: v for k, v in params.items() if k in accepted_params}
+            
+            # Log any filtered out parameters for debugging
+            filtered_out = {k: v for k, v in params.items() if k not in accepted_params}
+            if filtered_out:
+                logger.debug(f"Tool {tool_name} - Filtered out parameters: {list(filtered_out.keys())}")
+            
+            logger.debug(f"Tool {tool_name} - Accepted parameters: {list(filtered_params.keys())}")
+            return filtered_params
+            
+        except Exception as e:
+            logger.warning(f"Failed to filter parameters for tool {tool_name}: {e}, returning all params")
+            return params
 
 
 tool_manager = ToolManager()

@@ -3,7 +3,7 @@ Authentication Middleware for FastAPI
 JWT-based authentication with role verification for Depends()
 Integrates AuthService for authentication and ValidatePermission for authorization
 """
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 from fastapi import HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
@@ -15,7 +15,6 @@ from common.types import UserRole, ROLE_LEVEL
 from services.auth.auth_service import AuthService
 from services.auth.validate_permission import ValidatePermission
 from utils.logging import get_logger
-from utils.request_utils import get_tenant_identifier_from_request
 
 logger = get_logger(__name__)
 settings = get_settings()
