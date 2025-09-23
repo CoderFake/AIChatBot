@@ -85,9 +85,14 @@ class FinalResponseNode(BaseWorkflowNode):
 
             elif len(agent_responses) == 1:
                 response = agent_responses[0]
-                final_content = await self._build_final_synthesis_prompt(
-                    [response], original_query, detected_language, user_context, semantic_routing, state
-                )
+                content = response.get("content", "")
+                
+                if self._is_complete_response(content, original_query, detected_language):
+                    final_content = content 
+                else:
+                    final_content = await self._build_final_synthesis_prompt(
+                        [response], original_query, detected_language, user_context, semantic_routing, state
+                    )
                 sources = response.get("sources", [])
 
             elif len(agent_responses) > 1:
@@ -100,8 +105,26 @@ class FinalResponseNode(BaseWorkflowNode):
                 final_content = await self._build_no_response_prompt(original_query, detected_language, user_context, state)
                 sources = []
 
+            references_lines: List[str] = []
+            if sources:
+                reference_index = 1
+                for source in sources:
+                    if not isinstance(source, dict):
+                        continue
+                    url = source.get("url") or source.get("evidence_url")
+                    if not url:
+                        continue
+                    title = source.get("title") or source.get("document_id") or f"Reference {reference_index}"
+                    references_lines.append(f"[{reference_index}]. [{title}]({url})")
+                    reference_index += 1
+
+            final_output = final_content
+            if references_lines:
+                references_block = "\n".join(references_lines)
+                final_output = f"{final_content}\n\nReferences\n{references_block}"
+
             return {
-                "final_response": final_content,
+                "final_response": final_output,
                 "final_sources": sources,
                 "provider_name": state.get("provider_name"),
                 "processing_status": "completed",
@@ -124,6 +147,38 @@ class FinalResponseNode(BaseWorkflowNode):
                 "progress_percentage": self._calculate_progress_percentage("error"),
                 "should_yield": True
             }
+    
+    def _is_complete_response(self, content: str, original_query: str, detected_language: str) -> bool:
+        """
+        Check if the plan response is complete and ready for execution
+        Used in planning phase to determine if the response needs further synthesis
+        """
+        try:
+            if not content or len(content.strip()) < 5:
+                return False
+            
+            content_stripped = content.strip()
+            
+            # Check if this looks like a complete plan response
+            plan_indicators = {
+                'has_structure': any(marker in content_stripped for marker in ['1.', '2.', '-', '*', 'Step', 'Task']),
+                'has_action_words': any(word in content_stripped.lower() for word in ['will', 'analyze', 'search', 'find', 'check', 'get', 'retrieve']),
+                'sufficient_length': len(content_stripped) > 20,
+                'has_completion': any(punct in content_stripped for punct in ['.', '!', '?']),
+                'not_raw_data': not content_stripped.startswith(('{', '[', '```'))
+            }
+            
+            # Consider it complete if it has most plan characteristics
+            completion_score = sum(plan_indicators.values())
+            is_plan_complete = completion_score >= 3  # At least 3 out of 5 indicators
+            
+            logger.debug(f"Plan completeness check - Score: {completion_score}/5, Complete: {is_plan_complete}")
+            return is_plan_complete
+            
+        except Exception as e:
+            logger.warning(f"Error checking plan completeness: {e}")
+            # Default to False to ensure proper synthesis
+            return False
     
     def _generate_chitchat_response(
         self,
@@ -292,28 +347,31 @@ Response:"""
         return error_prompt
     
     async def _generate_no_response_message(self, detected_language: str) -> str:
-        """Generate no response message in appropriate language"""
-        no_response_messages = {
-            "vietnamese": "Xin lỗi, tôi không thể tạo phản hồi cho câu hỏi của bạn.",
-            "english": "I'm sorry, I couldn't generate a response to your query.",
-            "chinese": "抱歉，我无法为您的查询生成回复。",
-            "japanese": "申し訳ございませんが、お問い合わせに対する回答を生成できませんでした。",
-            "korean": "죄송합니다. 귀하의 질문에 대한 응답을 생성할 수 없었습니다."
-        }
-        
-        return no_response_messages.get(detected_language, "I'm sorry, I couldn't generate a response to your query.")
+        """Generate no response message using available utilities"""
+        try:
+            if hasattr(self, '_message_generator'):
+                return await self._message_generator.get_message("no_response", detected_language)
+            
+            return get_workflow_message("no_response", detected_language)
+        except Exception as e:
+            logger.warning(f"Failed to generate contextual no response message: {e}")
+            return f"Unable to process request. Language: {detected_language}"
+    
+    def _build_contextual_message(self, message_type: str, detected_language: str) -> str:
+        """Build messages using available context utilities"""
+        try:
+            return get_workflow_message(message_type, detected_language)
+        except Exception as e:
+            logger.warning(f"Failed to build contextual message: {e}")
+            return f"Status: {message_type}. Language: {detected_language}"
     
     def _get_completion_message(self, detected_language: str) -> str:
-        """Get completion message in appropriate language"""
-        completion_messages = {
-            "vietnamese": "Hoàn thành",
-            "english": "Completed",
-            "chinese": "完成",
-            "japanese": "完了",
-            "korean": "완료"
-        }
-        
-        return completion_messages.get(detected_language, "Completed")
+        """Get completion message using available utilities"""
+        try:
+            return get_workflow_message("completed", detected_language)
+        except Exception as e:
+            logger.warning(f"Failed to get completion message: {e}")
+            return f"Status: completed. Language: {detected_language}"
     
     def _extract_all_sources(self, agent_responses: List[Dict]) -> List[str]:
         """Extract all sources from agent responses"""

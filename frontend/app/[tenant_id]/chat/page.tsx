@@ -408,16 +408,15 @@ export default function ChatPage() {
 
                     case 4:
                     case 'end':
-                      updatedMsg.progress = 100
+                      const isCompleted = eventData.status === 'completed'
+                      updatedMsg.progress = isCompleted ? 100 : eventData.progress || 85
                       updatedMsg.status = eventData.status || 'completed'
                       updatedMsg.isStreaming = false
 
-                      // Chỉ override bằng final_response nếu chưa có nội dung stream
                       if (eventData.final_response && (!updatedMsg.content || !updatedMsg.content.trim())) {
                         updatedMsg.content = eventData.final_response
                       }
 
-                      // Store final planning data if available
                       if (eventData.execution_plan || eventData.execution_metadata) {
                         setCurrentPlanningData((prev: any) => ({
                           ...prev,
@@ -427,6 +426,26 @@ export default function ChatPage() {
                         }))
                       }
 
+                      break
+
+                    case 6:
+                    case 'task_status':
+                      // Handle individual task status updates
+                      if (eventData.task_update || eventData.formatted_tasks) {
+                        setCurrentPlanningData((prev: any) => ({
+                          ...(prev || {}),
+                          formatted_tasks: eventData.formatted_tasks || prev?.formatted_tasks,
+                          task_update: eventData.task_update,
+                          progress: eventData.progress
+                        }))
+
+                        updatedMsg.progress = eventData.progress || updatedMsg.progress
+                        updatedMsg.planningData = {
+                          ...(updatedMsg.planningData || {}),
+                          formatted_tasks: eventData.formatted_tasks || updatedMsg.planningData?.formatted_tasks,
+                          task_status_update: eventData.task_update
+                        }
+                      }
                       break
 
                     default:

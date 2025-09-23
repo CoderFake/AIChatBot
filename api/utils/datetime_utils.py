@@ -1,8 +1,13 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from typing import Any, Optional
+
+try:
+    from sqlalchemy.ext.asyncio import AsyncSession  # type: ignore
+    from sqlalchemy import select  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional during tests
+    AsyncSession = Any  # type: ignore
+    select = None  # type: ignore
 
 from config.settings import get_settings
 
@@ -59,6 +64,15 @@ class DateTimeManager:
             return cls._now()
     
     @classmethod
+    async def get_tenant_timezone(cls, tenant_id: Optional[str], db: Optional[AsyncSession] = None) -> str:
+        """Resolve the tenant timezone, falling back to the system default when unavailable."""
+
+        if not tenant_id:
+            return settings.TIMEZONE
+
+        return await cls._get_tenant_timezone_cached(tenant_id, db)
+
+    @classmethod
     async def tenant_now_cached(cls, tenant_id: Optional[str], db: Optional[AsyncSession] = None) -> datetime:
         """
         Get current datetime in tenant timezone with cache optimization.
@@ -68,7 +82,7 @@ class DateTimeManager:
         if not tenant_id:
             return cls._now()
         
-        tenant_timezone = await cls._get_tenant_timezone_cached(tenant_id, db)
+        tenant_timezone = await cls.get_tenant_timezone(tenant_id, db)
         return cls.tenant_now(tenant_timezone)
     
     @classmethod
@@ -89,7 +103,7 @@ class DateTimeManager:
         except Exception:
             pass
         
-        if db is not None:
+        if db is not None and select is not None:
             try:
                 from models.database.tenant import Tenant
                 result = await db.execute(select(Tenant.timezone).where(Tenant.id == tenant_id))

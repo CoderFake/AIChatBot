@@ -7,8 +7,16 @@ class RAGSearchInput(BaseModel):
     department: str = Field(description="User's department for access control")
     user_id: str = Field(description="User ID for permission checking")
     access_levels: List[str] = Field(
-        default=["public"], 
+        default=["public"],
         description="Access levels for search (public, private, etc.)"
+    )
+    access_scope_override: Optional[str] = Field(
+        default=None,
+        description="Explicit access scope override: 'public', 'private', or 'both'"
+    )
+    user_role: Optional[str] = Field(
+        default=None,
+        description="Role of the requesting user for cross-department checks"
     )
 
 
@@ -117,6 +125,28 @@ class SummaryInput(BaseModel):
     language: Optional[str] = Field(
         default="english",
         description="Language for the summary output"
+    )
+
+
+class LateMinutesInput(BaseModel):
+    """Input schema for late minutes tracking tool"""
+    users: List[str] = Field(
+        description="List of usernames, names, or emails to check late minutes for"
+    )
+    time_period: str = Field(
+        description="Time period to check: 'day', 'week', 'month', 'year'"
+    )
+    specific_date: Optional[str] = Field(
+        default=None,
+        description="Specific date in YYYY-MM-DD format (optional, defaults to current period)"
+    )
+    checkin_time: Optional[str] = Field(
+        default=None,
+        description="Expected checkin time in HH:MM format (e.g., '09:00')"
+    )
+    checkout_time: Optional[str] = Field(
+        default=None,
+        description="Expected checkout time in HH:MM format (e.g., '18:00')"
     )
 
 

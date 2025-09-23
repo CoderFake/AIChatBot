@@ -10,6 +10,7 @@ from workflows.langgraph.state.state import RAGState
 from utils.logging import get_logger
 from utils.language_utils import get_workflow_message
 from services.orchestrator.orchestrator import Orchestrator
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 
@@ -192,13 +193,15 @@ CRITICAL RULES:
             raise
 
     def _build_reflection_prompt(self,
-        query: str, detected_language: str,
+        query: str,
+        detected_language: str,
         user_access_levels: list,
         history_context: str,
         agents_json: str,
         semantic_result: dict,
         user_context: Dict[str, Any],
-        tenant_timezone: str
+        tenant_timezone: str,
+        tenant_current_datetime: str,
     ) -> str:
         """Build reflection prompt for execution planning (only called when NOT chitchat)"""
         return f"""You are an expert at planning and delegating tasks. Create detailed execution plan for the user's request.
@@ -210,6 +213,7 @@ ACCESS LEVELS: {user_access_levels}
 HISTORY CONTEXT: {history_context}
 CONVERSATION SUMMARY FOCUSING ON: {semantic_result.get("summary_history", "")}
 TENANT TIMEZONE: {tenant_timezone}
+CURRENT TENANT DATETIME: {tenant_current_datetime}
 
 QUERY YOU MUST FOLLOW: {semantic_result.get("refined_query", query)}
 
@@ -437,11 +441,19 @@ CRITICAL EXTRACTION RULES:
 
             history_context = self._format_message_history(state.get("messages", []), limit=3)
             tenant_timezone = state.get("tenant_timezone", "UTC")
+            tenant_current_datetime = state.get("tenant_current_datetime") or DateTimeManager.system_now().isoformat()
             user_access_levels = state.get("access_scope", "public")
 
             prompt = self._build_reflection_prompt(
-                query, detected_language, user_access_levels, history_context,
-                agents_json, semantic_routing, user_context, tenant_timezone
+                query,
+                detected_language,
+                user_access_levels,
+                history_context,
+                agents_json,
+                semantic_routing,
+                user_context,
+                tenant_timezone,
+                tenant_current_datetime,
             )
 
             temperature = user_context.get("temperature", 0.1)

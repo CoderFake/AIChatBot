@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "2.0.0"
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
+    API_URL: str = Field(default="http://localhost:8000", env="API_URL")
     ENV: str = "development"
     DEBUG: bool = True
     TIMEZONE: str = "Asia/Ho_Chi_Minh"
@@ -182,7 +183,7 @@ class Settings(BaseSettings):
     DEVICE: str = "cpu"
     
     # CORS
-    CORS_ORIGINS: List[str] | str = ["http://localhost:3001", "https://aichatbot.hoangdieuit.io.vn"]
+    CORS_ORIGINS: List[str] | str = ["http://localhost:3001", "https://aichatbot.hoangdieuit.io.vn", "http://192.168.31.23:3001",]
 
     # Email SMTP
     EMAIL_TEMPLATES_DIR: str = Field(default="templates/email", env="EMAIL_TEMPLATES_DIR")

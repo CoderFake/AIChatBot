@@ -127,15 +127,37 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                       const isCompleted = status === 'completed'
                       const isFailed = status === 'failed'
                       const isRunning = status === 'in_progress'
-                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
+                      const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : status === 'retrying' ? 'Retrying' : 'Pending'
 
-                      const baseClasses = allTasksCompleted && isCompleted
-                        ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
-                        : isCompleted
-                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
-                        : isFailed
-                        ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-                        : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                      const severity = task.severity || task.color || (isCompleted ? 'success' : isFailed ? 'danger' : isRunning || status === 'retrying' ? 'info' : 'pending')
+
+                      const baseClasses = (() => {
+                        const colorToUse = task.color || severity
+                        
+                        if (colorToUse === 'success') {
+                          // Enhanced green for successful retries
+                          const isRetrySuccess = task.retry_attempts > 0 || task.retry_count > 0
+                          return allTasksCompleted && isCompleted
+                            ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
+                            : isRetrySuccess && isCompleted
+                            ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200' // Special styling for retry success
+                            : 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                        }
+
+                        if (colorToUse === 'danger') {
+                          return 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                        }
+
+                        if (colorToUse === 'primary' || colorToUse === 'info') {
+                          return 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                        }
+
+                        return 'bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300'
+                      })()
+
+                      const retryHistory = Array.isArray(task.retry_history) ? task.retry_history : []
+                      const retryAttempts = typeof task.retry_attempts === 'number' ? task.retry_attempts : (typeof task.retry_count === 'number' ? task.retry_count : retryHistory.length) || 0
+                      const maxRetries = typeof task.max_retries === 'number' ? task.max_retries : 0
 
                       return (
                         <div
@@ -143,7 +165,13 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                           className={`flex items-start gap-2 border rounded-md px-2 py-2 text-[11px] ${baseClasses}`}
                         >
                           {isCompleted ? (
-                            <CheckCircle size={12} className={`mt-0.5 ${allTasksCompleted ? 'text-green-600' : 'text-green-500'}`} />
+                            <CheckCircle size={12} className={`mt-0.5 ${
+                              (task.retry_attempts > 0 || task.retry_count > 0) 
+                                ? 'text-green-600'
+                                : allTasksCompleted 
+                                ? 'text-green-600' 
+                                : 'text-green-500'
+                            }`} />
                           ) : isFailed ? (
                             <AlertCircle size={12} className="mt-0.5 text-red-500" />
                           ) : (
@@ -162,6 +190,40 @@ export function ThinkingIndicator({ className = "", planningData, executionData,
                           {task.error && (
                             <div className="text-[10px] mt-1 text-red-500 dark:text-red-300 truncate">
                               {task.error}
+                            </div>
+                          )}
+                          {retryHistory.length > 0 && (
+                            <div className="mt-1 space-y-1">
+                              <div className="text-[9px] uppercase tracking-wide font-semibold text-gray-500 dark:text-gray-400">
+                                Retry attempts ({Math.min(retryAttempts + 1, maxRetries || retryAttempts + 1)}/{maxRetries || retryAttempts + 1})
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {retryHistory.map((attempt: any, attemptIndex: number) => {
+                                  const attemptStatus = attempt?.status === 'completed' ? 'completed' : 'failed'
+                                  const chipClasses = attemptStatus === 'completed'
+                                    ? 'bg-green-100 text-green-700 dark:bg-green-900/60 dark:text-green-200 border border-green-200 dark:border-green-800'
+                                    : 'bg-red-100 text-red-700 dark:bg-red-900/60 dark:text-red-200 border border-red-200 dark:border-red-800'
+
+                                  const errorSnippet = typeof attempt?.error === 'string'
+                                    ? `${attempt.error.slice(0, 80)}${attempt.error.length > 80 ? '…' : ''}`
+                                    : ''
+
+                                  const toolLabel = attempt?.tool ? `${attempt.tool}` : 'Tool'
+
+                                  return (
+                                    <span
+                                      key={`${toolLabel}-${attempt?.attempt ?? attemptIndex}-${attemptStatus}`}
+                                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-medium ${chipClasses}`}
+                                    >
+                                      <span>#{attempt?.attempt ?? attemptIndex + 1}</span>
+                                      <span className="truncate">
+                                        {toolLabel}: {attemptStatus === 'completed' ? 'Success' : 'Failed'}
+                                        {errorSnippet ? ` — ${errorSnippet}` : ''}
+                                      </span>
+                                    </span>
+                                  )
+                                })}
+                              </div>
                             </div>
                           )}
                         </div>
@@ -272,6 +334,13 @@ interface PlanningData {
   progress?: number
   status?: string
   message?: string
+  task_status_update?: {
+    type: string
+    task_index?: number
+    status?: string
+    color?: 'primary' | 'success' | 'danger' | 'info'
+    all_tasks_status?: string
+  }
 }
 
 interface ExecutionData {
@@ -411,14 +480,25 @@ export function StreamingMessage({
                       const isRunning = status === 'in_progress'
                       const statusText = isCompleted ? 'Completed' : isFailed ? 'Failed' : isRunning ? 'Running' : 'Pending'
 
-                      // Enhanced green styling when all tasks are completed
-                      const taskClasses = allTasksCompleted && isCompleted
-                        ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
-                        : isCompleted
-                        ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
-                        : isFailed
-                        ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-                        : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                      const colorToUse = task.color || (isCompleted ? 'success' : isFailed ? 'danger' : isRunning ? 'primary' : 'pending')
+                      
+                      const taskClasses = (() => {
+                        if (colorToUse === 'success') {
+                          const isRetrySuccess = task.retry_attempts > 0 || task.retry_count > 0
+                          return allTasksCompleted && isCompleted
+                            ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200'
+                            : isRetrySuccess && isCompleted
+                            ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-600 text-green-800 dark:text-green-200' // Special styling for retry success
+                            : 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                        }
+                        if (colorToUse === 'danger') {
+                          return 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                        }
+                        if (colorToUse === 'primary') {
+                          return 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                        }
+                        return 'bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300'
+                      })()
 
                       return (
                         <div
@@ -426,7 +506,13 @@ export function StreamingMessage({
                           className={`flex items-start gap-3 p-2 rounded text-xs border ${taskClasses}`}
                         >
                         {isCompleted ? (
-                          <CheckCircle size={12} className={`mt-0.5 ${allTasksCompleted ? 'text-green-600' : 'text-green-500'}`} />
+                          <CheckCircle size={12} className={`mt-0.5 ${
+                            (task.retry_attempts > 0 || task.retry_count > 0) 
+                              ? 'text-green-600' // Bright green for successful retries
+                              : allTasksCompleted 
+                              ? 'text-green-600' 
+                              : 'text-green-500'
+                          }`} />
                         ) : isFailed ? (
                           <AlertCircle size={12} className="mt-0.5 text-red-500" />
                         ) : (

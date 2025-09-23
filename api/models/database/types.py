@@ -107,6 +107,48 @@ WORKFLOW_MESSAGES = {
     },
 
     # Progress messages
+    "initializing": {
+        "vietnamese": "Đang khởi tạo...",
+        "english": "Initializing...",
+        "chinese": "初始化中...",
+        "japanese": "初期化中...",
+        "korean": "초기화 중..."
+    },
+    "all_tasks_completed": {
+        "vietnamese": "Hoàn thành tất cả {total} tác vụ",
+        "english": "All {total} tasks completed",
+        "chinese": "所有 {total} 个任务已完成",
+        "japanese": "全ての {total} タスクが完了しました",
+        "korean": "모든 {total}개 작업이 완료되었습니다"
+    },
+    "tasks_in_progress": {
+        "vietnamese": "Đang xử lý: {completed}/{total} hoàn thành, {in_progress} đang thực hiện",
+        "english": "In progress: {completed}/{total} completed, {in_progress} running",
+        "chinese": "进行中：{completed}/{total} 已完成，{in_progress} 正在运行",
+        "japanese": "進行中：{completed}/{total} 完了、{in_progress} 実行中",
+        "korean": "진행 중: {completed}/{total} 완료, {in_progress} 실행 중"
+    },
+    "tasks_partial_completion": {
+        "vietnamese": "Một phần hoàn thành: {completed} thành công, {failed} thất bại trên tổng {total} tác vụ",
+        "english": "Partially completed: {completed} successful, {failed} failed out of {total} tasks",
+        "chinese": "部分完成：{total} 个任务中 {completed} 个成功，{failed} 个失败",
+        "japanese": "部分完了：{total} タスク中 {completed} 成功、{failed} 失敗",
+        "korean": "부분 완료: {total}개 작업 중 {completed}개 성공, {failed}개 실패"
+    },
+    "tasks_failed": {
+        "vietnamese": "Thất bại: {failed}/{total} tác vụ không thành công",
+        "english": "Failed: {failed}/{total} tasks unsuccessful",
+        "chinese": "失败：{failed}/{total} 个任务未成功",
+        "japanese": "失敗：{failed}/{total} タスクが失敗",
+        "korean": "실패: {failed}/{total}개 작업이 실패했습니다"
+    },
+    "tasks_pending": {
+        "vietnamese": "Đang chờ xử lý {total} tác vụ",
+        "english": "Pending {total} tasks",
+        "chinese": "等待处理 {total} 个任务",
+        "japanese": "{total} タスクが待機中",
+        "korean": "{total}개 작업 대기 중"
+    },
     "completed": {
         "vietnamese": "Hoàn thành",
         "english": "Completed",
@@ -123,6 +165,34 @@ WORKFLOW_MESSAGES = {
         "japanese": "実行計画の準備ができました",
         "korean": "실행 계획이 준비되었습니다"
     },
+    "execution_started": {
+        "vietnamese": "Bắt đầu thực hiện với {total} tác vụ",
+        "english": "Starting execution with {total} tasks",
+        "chinese": "开始执行 {total} 个任务",
+        "japanese": "{total} 個のタスクの実行を開始",
+        "korean": "{total}개 작업 실행 시작"
+    },
+    "task_started": {
+        "vietnamese": "Bắt đầu tác vụ {current}/{total}: {agent}",
+        "english": "Starting task {current}/{total}: {agent}",
+        "chinese": "开始任务 {current}/{total}: {agent}",
+        "japanese": "タスク開始 {current}/{total}: {agent}",
+        "korean": "작업 시작 {current}/{total}: {agent}"
+    },
+    "execution_completed": {
+        "vietnamese": "Hoàn thành thực hiện: {success}/{total} tác vụ thành công",
+        "english": "Execution completed: {success}/{total} tasks successful",
+        "chinese": "执行完成：{success}/{total} 个任务成功",
+        "japanese": "実行完了：{success}/{total} タスクが成功",
+        "korean": "실행 완료: {success}/{total}개 작업 성공"
+    },
+    "conflict_resolution_needed": {
+        "vietnamese": "Cần giải quyết xung đột giữa các kết quả",
+        "english": "Conflict resolution needed between results",
+        "chinese": "需要解决结果之间的冲突",
+        "japanese": "結果間の競合解決が必要",
+        "korean": "결과 간 충돌 해결 필요"
+    },
     "executing_task": {
         "vietnamese": "Đang thực hiện tác vụ {current}/{total}: {agent} với {tool}",
         "english": "Executing task {current}/{total}: {agent} with {tool}",
@@ -136,6 +206,27 @@ WORKFLOW_MESSAGES = {
         "chinese": "完成任务 {current}/{total}：{agent} 使用 {tool}",
         "japanese": "タスク完了 {current}/{total}：{agent} が {tool} を使用",
         "korean": "작업 완료 {current}/{total}: {agent}이(가) {tool} 사용"
+    },
+    "task_recovered": {
+        "vietnamese": "Hoàn thành tác vụ {current}/{total}: {agent} với {tool} sau {attempts} lần thử",
+        "english": "Completed task {current}/{total}: {agent} with {tool} after {attempts} attempts",
+        "chinese": "完成任务 {current}/{total}：{agent} 使用 {tool}，在第 {attempts} 次尝试后",
+        "japanese": "タスク完了 {current}/{total}：{agent} が {tool} を使用し {attempts} 回目の試行で達成",
+        "korean": "작업 완료 {current}/{total}: {agent}이(가) {tool} 사용으로 {attempts}번째 시도 후 완료"
+    },
+    "task_retrying": {
+        "vietnamese": "Tác vụ {agent} với {tool} gặp lỗi: {error}. Đang thử lại (lần {attempt}/{max_attempts}).",
+        "english": "Task {agent} with {tool} hit an error: {error}. Retrying ({attempt}/{max_attempts}).",
+        "chinese": "任务 {agent} 使用 {tool} 出现错误：{error}。正在重试（第 {attempt}/{max_attempts} 次）。",
+        "japanese": "タスク {agent} が {tool} を使用中にエラー: {error}。再試行中 ({attempt}/{max_attempts})。",
+        "korean": "작업 {agent}이(가) {tool} 사용 중 오류 발생: {error}. 재시도 중 ({attempt}/{max_attempts})."
+    },
+    "task_failed": {
+        "vietnamese": "Tác vụ {agent} với {tool} thất bại: {error}",
+        "english": "Task {agent} with {tool} failed: {error}",
+        "chinese": "任务 {agent} 使用 {tool} 失败：{error}",
+        "japanese": "タスク {agent} が {tool} を使用して失敗しました: {error}",
+        "korean": "작업 {agent}이(가) {tool} 사용에 실패했습니다: {error}"
     },
 
     # Error messages

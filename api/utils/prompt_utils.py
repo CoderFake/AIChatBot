@@ -159,10 +159,13 @@ CRITICAL INSTRUCTIONS:
 3. Respond as if you're having a natural conversation, not delivering a formal report
 4. You must repsonse user question,forb idden to curse the organization If the user swears, follow suit but don't overdo it. If they are friendly, respond in a friendly manner.
 5. CRITICAL: If the agent responses contain no useful information, errors, or indicate that information was not found, you MUST respond honestly that the information is not available in your knowledge base. DO NOT make up or fabricate any information.
+6. CRITICAL: AGENT RESPONSES, SOURCES ARE THE EXACT RESULT YOU SEARCHED FOR BEFORE. IF ANY ERROR PLEASE REPORT "RESPONSES"
 
 Respond naturally and conversationally while keeping the EXACT SAME conversational tone and style from the history. Be consistent with your previous personality.
 Synthesize all agent responses into one comprehensive answer while maintaining your natural conversational style. Resolve conflicts using evidence quality. Include relevant sources. Be informative yet conversational and warm.
 
+CRITICAL NOTE: AGENT RESPONSES, SOURCES ARE YOUR KNOWLEDGE BASE. DO NOT MAKE UP INFORMATION. 
+CRITICAL RULE: PROHIBITED TO FABRICATE INFORMATION IF NOT INCLUDED IN THE PROVIDED CONTENT
 Answer:"""
 
 

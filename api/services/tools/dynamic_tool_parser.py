@@ -4,9 +4,10 @@ Implements best practices for scalable tool parameter parsing
 """
 import json
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from langchain_core.tools import BaseTool
 from utils.logging import get_logger
+from utils.datetime_utils import DateTimeManager
 
 logger = get_logger(__name__)
 
@@ -25,7 +26,10 @@ class DynamicToolParser:
         tool_name: str,
         query: str,
         agent_provider_name: str = None,
-        tenant_id: str = None
+        tenant_id: str = None,
+        user_context: Optional[Dict[str, Any]] = None,
+        original_params: Optional[Dict[str, Any]] = None,
+        retry_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Parse natural language query to tool-specific parameters using tool's schema
@@ -35,9 +39,11 @@ class DynamicToolParser:
             query: Natural language query
             agent_provider_name: Name of LLM provider for parsing
             tenant_id: Tenant identifier for API access
+            user_context: User context for additional parameters
+            original_params: Original parameters to preserve (e.g., user_id, department)
 
         Returns:
-            Dict of parsed parameters
+            Dict of parsed parameters merged with original context
 
         Raises:
             ValueError: If parsing fails or tool not found
@@ -55,7 +61,37 @@ class DynamicToolParser:
 
         schema_info = self._extract_tool_schema(tool_instance)
 
-        prompt = self._build_parsing_prompt(tool_name, tool_instance, query, schema_info)
+        tenant_timezone = None
+        tenant_current_datetime = None
+
+        if user_context:
+            tenant_timezone = user_context.get("timezone")
+            tenant_current_datetime = user_context.get("tenant_current_datetime")
+
+        if tenant_timezone is None and tenant_id:
+            try:
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(tenant_id)
+            except Exception:
+                tenant_timezone = None
+
+        if tenant_timezone is None:
+            tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+
+        if tenant_current_datetime is None:
+            try:
+                tenant_current_datetime = DateTimeManager.tenant_now(tenant_timezone).isoformat()
+            except Exception:
+                tenant_current_datetime = DateTimeManager.system_now().isoformat()
+
+        prompt = self._build_parsing_prompt(
+            tool_name,
+            tool_instance,
+            query,
+            schema_info,
+            tenant_timezone,
+            tenant_current_datetime,
+            retry_context,
+        )
 
         try:
             response = await agent_provider.ainvoke(prompt, tenant_id)
@@ -69,8 +105,23 @@ class DynamicToolParser:
             
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
-                result = json.loads(json_match.group())
-                self._validate_tool_params(tool_name, result, schema_info)
+                parsed_result = json.loads(json_match.group())
+                
+                # Merge with original parameters to preserve context
+                if original_params:
+                    # Start with original params and update with parsed params
+                    result = original_params.copy()
+                    result.update(parsed_result)
+                    logger.debug(f"Merged parsed params with original: {list(parsed_result.keys())} + {list(original_params.keys())}")
+                else:
+                    result = parsed_result
+                
+                # Enhanced validation for retry scenarios
+                if retry_context:
+                    self._validate_retry_parameters(tool_name, result, schema_info, retry_context)
+                else:
+                    self._validate_tool_params(tool_name, result, schema_info)
+                
                 return result
             else:
                 raise ValueError("No JSON found in LLM response")
@@ -128,11 +179,14 @@ class DynamicToolParser:
             }
     
     def _build_parsing_prompt(
-        self, 
-        tool_name: str, 
-        tool_instance: BaseTool, 
-        query: str, 
-        schema_info: Dict[str, Any]
+        self,
+        tool_name: str,
+        tool_instance: BaseTool,
+        query: str,
+        schema_info: Dict[str, Any],
+        tenant_timezone: str,
+        tenant_current_datetime: str,
+        retry_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build dynamic parsing prompt based on tool schema"""
         
@@ -144,23 +198,74 @@ class DynamicToolParser:
             f"Tool: {tool_name}",
             f"Description: {tool_instance.description}",
             "",
-            f"Required parameters: {schema_info['required_params']}",
-            f"Optional parameters: {schema_info['optional_params']}",
-            "",
-            "Parameter details:"
         ]
         
-        for param, detail in schema_info['param_details'].items():
-            prompt_parts.append(f"- {param}: {detail}")
+        # Add retry context if this is a retry attempt
+        if retry_context:
+            prompt_parts.extend([
+                "RETRY ATTEMPT - Previous execution failed:",
+                f"Previous Error: {retry_context.get('error_message', 'Unknown error')}",
+                f"Failed Parameters: {retry_context.get('failed_params', {})}",
+                "",
+                "CRITICAL INSTRUCTIONS FOR RETRY:",
+                "1. Learn from the previous error and adjust parameter extraction",
+                "2. Ensure ALL required parameters are properly extracted",
+                "3. Validate parameter types and formats based on the error",
+                "4. If the error mentioned missing parameters, focus on extracting them",
+                "5. If the error mentioned invalid values, correct the format/type",
+                "",
+            ])
         
+        schema_info = self._extract_tool_schema(tool_instance)
+        
+        if (len(schema_info['required_params']) <= 1 and 
+            schema_info['required_params'] == ['query'] and 
+            len(schema_info['optional_params']) == 0):
+            prompt_parts.extend([
+                "Extract the main query or search terms from the user input.",
+                "Focus on the core intent and relevant keywords."
+            ])
+        else:
+            prompt_parts.extend([
+                f"Required parameters: {schema_info['required_params']}",
+                f"Optional parameters: {schema_info['optional_params']}",
+                "",
+                "Parameter details:"
+            ])
+            
+            for param, detail in schema_info['param_details'].items():
+                prompt_parts.append(f"- {param}: {detail}")
+        
+        prompt_parts.append("")
+        prompt_parts.append(self._get_dynamic_tool_instructions(tool_name, tool_instance))
+
+        if tool_name == "datetime":
+            prompt_parts.extend([
+                "",
+                "Tenant context:",
+                f"- Tenant timezone: {tenant_timezone}",
+                f"- Current tenant datetime: {tenant_current_datetime}",
+                "- Always interpret date/time queries using the tenant's local timezone instead of UTC.",
+            ])
+
         prompt_parts.extend([
             "",
-            self._get_dynamic_tool_instructions(tool_name, tool_instance),
-            "",
-            "Return ONLY a JSON object with the extracted parameters.",
-            "Use appropriate default values for missing optional parameters.",
+            "CRITICAL: Return ONLY a JSON object with the exact parameters required by the tool.",
+            "Ensure parameter names match the tool schema exactly.",
+            "Use appropriate data types for each parameter.",
             "Example format: {\"param1\": \"value1\", \"param2\": \"value2\"}"
         ])
+        
+        # Add retry-specific validation if this is a retry
+        if retry_context:
+            prompt_parts.extend([
+                "",
+                "RETRY VALIDATION:",
+                "- Double-check all required parameters are included",
+                "- Verify parameter types match schema requirements",
+                "- Ensure parameter values are in correct format",
+                "- Learn from the previous error to avoid repeating the same mistake"
+            ])
         
         return "\n".join(prompt_parts)
     
@@ -168,77 +273,76 @@ class DynamicToolParser:
         """Get dynamic instructions based on tool attributes and category"""
         instructions = []
         
-        # Check if tool has specific parsing hints
+        # Get category-specific instructions dynamically
+        category = getattr(tool_instance, 'category', 'general')
+        
+        # Add dynamic instructions based on tool attributes
         if hasattr(tool_instance, 'parsing_hints'):
             instructions.append(f"Parsing hints: {tool_instance.parsing_hints}")
         
-        # Add category-specific instructions
-        category = getattr(tool_instance, 'category', 'general')
-        
-        category_instructions = {
-            'datetime': [
-                "For time queries ('mấy giờ', 'what time', 'bây giờ'): use 'current_time' operation",
-                "For date queries ('ngày nào', 'today', 'hôm nay'): use 'current_date' operation", 
-                "For general time questions: use 'current_datetime' operation",
-                "Default timezone: 'Asia/Ho_Chi_Minh'",
-                "Default format: '%H:%M:%S %d/%m/%Y'",
-                "",
-                "RELATIVE TIME EXPRESSIONS (Vietnamese/English):",
-                "- 'ngày mai', 'mai', 'tomorrow' → operation: 'add_time', amount: 1, unit: 'days'",
-                "- 'ngày kia', 'kia' (day after tomorrow) → operation: 'add_time', amount: 2, unit: 'days'",
-                "- 'hôm qua', 'qua', 'yesterday' → operation: 'subtract_time', amount: 1, unit: 'days'",
-                "- 'hôm kia' (day before yesterday) → operation: 'subtract_time', amount: 2, unit: 'days'",
-                "- 'tuần sau', 'tuần tới', 'next week' → operation: 'add_time', amount: 1, unit: 'weeks'",
-                "- 'tuần trước', 'tuần rồi', 'last week' → operation: 'subtract_time', amount: 1, unit: 'weeks'",
-                "- 'tháng sau', 'tháng tới', 'next month' → operation: 'add_time', amount: 1, unit: 'months'",
-                "- 'tháng trước', 'tháng rồi', 'last month' → operation: 'subtract_time', amount: 1, unit: 'months'",
-                "- 'năm sau', 'năm tới', 'next year' → operation: 'add_time', amount: 1, unit: 'years'",
-                "- 'năm trước', 'năm ngoái', 'last year' → operation: 'subtract_time', amount: 1, unit: 'years'",
-                "",
-                "For relative time expressions, do NOT set datetime_string (let tool use current time automatically).",
-                "Context awareness: 'ngày kia thì sao' means 'what about the day after tomorrow' - use add_time with amount=2."
-            ],
-            'calculation': [
-                "Extract mathematical expressions from natural language",
-                "Convert word numbers to digits if needed",
-                "Handle Vietnamese math terms (cộng=+, trừ=-, nhân=*, chia=/)",
-                "Preserve mathematical operators and parentheses"
-            ],
-            'search': [
-                "Extract main search terms and keywords",
-                "Identify any filters or constraints mentioned",
-                "Consider context and intent of the search"
-            ],
-            'weather': [
-                "Extract location names (cities, countries, regions)",
-                "Identify specific weather information requested",
-                "Default units: 'metric'",
-                "Default forecast_days: 1"
-            ],
-            'web_search': [
-                "Extract search query terms",
-                "Identify any specific domains or sites mentioned",
-                "Consider search intent and scope"
-            ],
-            'summary': [
-                "Identify the content or text to be summarized",
-                "Determine summary length or format requested",
-                "Consider any specific focus areas mentioned"
-            ]
-        }
-        
-        if category in category_instructions:
-            instructions.extend(category_instructions[category])
-        else:
-            instructions.append("Extract relevant parameters based on the tool's purpose and user intent")
-        
-        # Add tool-specific instructions if available
         if hasattr(tool_instance, 'get_parsing_instructions'):
             custom_instructions = tool_instance.get_parsing_instructions()
             if custom_instructions:
-                instructions.append(f"Tool-specific instructions: {custom_instructions}")
+                instructions.extend(custom_instructions if isinstance(custom_instructions, list) else [custom_instructions])
+        
+        # Fallback to generic instructions if no custom instructions
+        if not instructions or len(instructions) == 0:
+            instructions.append(f"Analyze the user query and extract parameters suitable for {category} category operations")
+            instructions.append("Focus on the tool's defined schema and parameter requirements")
+            instructions.append("Extract only the information that matches the tool's expected input format")
         
         return "Instructions:\n" + "\n".join(f"- {inst}" for inst in instructions)
+    
+    def _validate_retry_parameters(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        schema_info: Dict[str, Any],
+        retry_context: Dict[str, Any]
+    ):
+        """Enhanced validation for retry scenarios with error context"""
+        try:
+            # First, do standard validation
+            self._validate_tool_params(tool_name, params, schema_info)
+            
+            # Additional retry-specific checks
+            previous_error = retry_context.get('error_message', '')
+            failed_params = retry_context.get('failed_params', {})
+            
+            # Check if previously missing parameters are now present
+            if 'missing' in previous_error.lower() or 'required' in previous_error.lower():
+                required_params = schema_info.get('required_params', [])
+                still_missing = [param for param in required_params if param not in params]
+                if still_missing:
+                    raise ValueError(
+                        f"Retry failed: Still missing required parameters for {tool_name}: {still_missing}. "
+                        f"Previous error: {previous_error}"
+                    )
+            
+            # Check if parameter types are corrected based on previous error
+            if 'type' in previous_error.lower() or 'format' in previous_error.lower():
+                full_schema = schema_info.get('full_schema', {})
+                properties = full_schema.get('properties', {})
+                
+                for param_name, param_value in params.items():
+                    if param_name in properties and param_name in failed_params:
+                        expected_type = properties[param_name].get('type')
+                        if expected_type == 'array' and not isinstance(param_value, list):
+                            raise ValueError(
+                                f"Retry validation failed: Parameter '{param_name}' should be a list, got {type(param_value)}. "
+                                f"Previous error: {previous_error}"
+                            )
+                        elif expected_type == 'string' and not isinstance(param_value, str):
+                            raise ValueError(
+                                f"Retry validation failed: Parameter '{param_name}' should be a string, got {type(param_value)}. "
+                                f"Previous error: {previous_error}"
+                            )
+            
+            logger.info(f"Retry validation passed for {tool_name} - parameters corrected from previous error")
+            
+        except Exception as e:
+            logger.error(f"Retry parameter validation failed for {tool_name}: {e}")
+            raise
     
     def _validate_tool_params(
         self, 
@@ -268,24 +372,3 @@ class DynamicToolParser:
                     logger.warning(f"Parameter {param_name} value '{param_value}' not in expected options: {enum_values}")
         
         logger.debug(f"Tool {tool_name} parameters validated successfully")
-    
-    def should_parse_parameters(self, tool_name: str) -> bool:
-        """
-        Determine if a tool needs parameter parsing
-        Tools with complex schemas need parsing, simple query-only tools don't
-        """
-        tool_instance = self.tool_instances.get(tool_name)
-        if not tool_instance:
-            return False
-        
-        schema_info = self._extract_tool_schema(tool_instance)
-        
-        if (schema_info['required_params'] == ['query'] and 
-            len(schema_info['optional_params']) == 0):
-            return False
-        
-        if (len(schema_info['required_params']) > 1 or 
-            len(schema_info['optional_params']) > 0):
-            return True
-        
-        return False

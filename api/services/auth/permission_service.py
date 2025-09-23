@@ -4,7 +4,7 @@ Core permission management: create default groups and validate user permissions
 """
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, delete, update
+from sqlalchemy import select
 from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime
 import uuid
@@ -811,6 +811,13 @@ class PermissionService:
         Returns: List of permission dictionaries with id, permission_code, permission_name, resource_type, action
         """
         try:
+            # Validate user_id is a valid UUID
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get effective permissions.")
+                return []
+
             result = await self.db.execute(
                 select(User)
                 .options(
@@ -962,6 +969,12 @@ class PermissionService:
     async def _invalidate_user_permission_cache(self, user_id: str) -> None:
         """Invalidate cached effective permissions for a user (scoped by tenant)."""
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.debug(f"Invalid user_id format: {user_id}. Skipping cache invalidation.")
+                return
+
             result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
             row = result.first()
             if not row or not row[0]:
@@ -994,6 +1007,12 @@ class PermissionService:
 
     async def _get_tenant_id_from_user(self, user_id: str) -> Optional[str]:
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.debug(f"Invalid user_id format: {user_id}. Cannot get tenant_id.")
+                return None
+
             result = await self.db.execute(select(User.tenant_id).where(User.id == user_id))
             row = result.first()
             return str(row[0]) if row and row[0] else None
@@ -1045,6 +1064,13 @@ class RAGPermissionService:
         USER -> public collections only.
         """
         try:
+            # Validate user_id is a valid UUID
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot perform RAG access check.")
+                return False, [], AccessLevel.PUBLIC.value
+
             if requested_access_level not in [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]:
                 logger.warning(
                     f"Unsupported requested access level '{requested_access_level}' for user {user_id}; falling back to public"
@@ -1162,71 +1188,87 @@ class RAGPermissionService:
             (has_access, accessible_collections, effective_access_level)
         """
         try:
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot perform RAG access check.")
+                return False, [], AccessLevel.PUBLIC.value
             from sqlalchemy import select
-            if admin_cross_department_access:
-                user_result = await self.db.execute(
-                    select(User)
-                    .options(
-                        selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
-                        selectinload(User.department),
-                    )
-                    .where(User.id == user_id)
-                    .where(User.is_active == True)
-                    .where(User.is_deleted == False)
+
+            normalized_department = (department_name or "").strip()
+            normalized_override = access_scope_override.lower() if isinstance(access_scope_override, str) else None
+
+            user_result = await self.db.execute(
+                select(User)
+                .options(
+                    selectinload(User.group_memberships).joinedload(UserGroupMembership.group),
+                    selectinload(User.department),
                 )
-                user = user_result.scalar_one_or_none()
+                .where(User.id == user_id)
+                .where(User.is_active == True)
+                .where(User.is_deleted == False)
+            )
+            user = user_result.scalar_one_or_none()
 
-                if user and user.tenant_id:
-                    resolved_roles: Set[UserRole] = set()
-                    if user.role:
-                        try:
-                            resolved_roles.add(UserRole(user.role))
-                        except ValueError:
-                            logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
+            if not user or not user.tenant_id:
+                return False, [], AccessLevel.PUBLIC.value
 
-                    for membership in user.group_memberships:
-                        if membership.is_deleted:
-                            continue
-                        group = membership.group
-                        if not group or not group.group_code:
-                            continue
-                        if "_MAINTAINER" in group.group_code:
-                            resolved_roles.add(UserRole.MAINTAINER)
-                        elif "_ADMIN" in group.group_code:
-                            resolved_roles.add(UserRole.ADMIN)
-                        elif "_DEPT_ADMIN" in group.group_code:
-                            resolved_roles.add(UserRole.DEPT_ADMIN)
-                        elif "_DEPT_MANAGER" in group.group_code:
-                            resolved_roles.add(UserRole.DEPT_MANAGER)
+            resolved_roles: Set[UserRole] = set()
+            if user.role:
+                try:
+                    resolved_roles.add(UserRole(user.role))
+                except ValueError:
+                    logger.debug(f"User {user_id} has unsupported role value '{user.role}'")
 
-                    if not resolved_roles:
-                        resolved_roles.add(UserRole.USER)
+            for membership in user.group_memberships:
+                if membership.is_deleted:
+                    continue
+                group = membership.group
+                if not group or not group.group_code:
+                    continue
+                if "_MAINTAINER" in group.group_code:
+                    resolved_roles.add(UserRole.MAINTAINER)
+                elif "_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.ADMIN)
+                elif "_DEPT_ADMIN" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_ADMIN)
+                elif "_DEPT_MANAGER" in group.group_code:
+                    resolved_roles.add(UserRole.DEPT_MANAGER)
 
-                    highest_role = max(resolved_roles, key=lambda role: ROLE_LEVEL.get(role.value, 0))
+            if not resolved_roles:
+                resolved_roles.add(UserRole.USER)
 
-                    if highest_role in {UserRole.ADMIN, UserRole.MAINTAINER}:
-                        return await self.check_admin_rag_access_all_departments(
-                            user_id, str(user.tenant_id), requested_access_level
-                        )
+            highest_role = max(resolved_roles, key=lambda role: ROLE_LEVEL.get(role.value, 0))
+            tenant_id = str(user.tenant_id)
 
-            # If there's an access scope override, use it directly
-            if access_scope_override:
-                if access_scope_override == "public":
-                    # Force public access only
-                    return await self._get_public_access_only(user_id, department_name)
-                elif access_scope_override == "private":
-                    # Force private access only (if user has permission)
-                    return await self._get_private_access_only(user_id, department_name)
-                elif access_scope_override == "both":
-                    # Force both public and private access (if user has permission)
-                    return await self._get_both_access(user_id, department_name)
-                else:
-                    logger.warning(f"Invalid access_scope_override: {access_scope_override}")
-                    # Fall back to normal permission check
-                    return await self.check_rag_access_permission(user_id, department_name, requested_access_level)
+            should_expand_cross_department = admin_cross_department_access
+            if highest_role in {UserRole.ADMIN, UserRole.MAINTAINER}:
+                if normalized_override == "both" or not normalized_department:
+                    should_expand_cross_department = True
+                elif normalized_department.lower() in {"all", "both", "*", "any"}:
+                    should_expand_cross_department = True
 
-            # No override, use normal permission check
-            return await self.check_rag_access_permission(user_id, department_name, requested_access_level)
+            if should_expand_cross_department and tenant_id:
+                effective_request = requested_access_level
+                if normalized_override == "both" and effective_request not in [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value, "both"]:
+                    effective_request = "both"
+                return await self.check_admin_rag_access_all_departments(
+                    user_id,
+                    tenant_id,
+                    effective_request
+                )
+
+            if normalized_override:
+                if normalized_override == "public":
+                    return await self._get_public_access_only(user_id, normalized_department)
+                if normalized_override == "private":
+                    return await self._get_private_access_only(user_id, normalized_department)
+                if normalized_override == "both":
+                    return await self._get_both_access(user_id, normalized_department)
+                logger.warning(f"Invalid access_scope_override: {access_scope_override}")
+                return await self.check_rag_access_permission(user_id, normalized_department, requested_access_level)
+
+            return await self.check_rag_access_permission(user_id, normalized_department, requested_access_level)
 
         except Exception as e:
             logger.error(f"Failed to check RAG access with override for user {user_id}: {e}")
@@ -1236,6 +1278,12 @@ class RAGPermissionService:
         """Get public access only, regardless of user permissions"""
         try:
             from sqlalchemy import select
+
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get public access only.")
+                return False, [], AccessLevel.PUBLIC.value
 
             # Get user to find tenant
             user_result = await self.db.execute(
@@ -1274,7 +1322,12 @@ class RAGPermissionService:
         try:
             from sqlalchemy import select
 
-            # Get user with roles
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get private access only.")
+                return False, [], AccessLevel.PUBLIC.value
+
             user_result = await self.db.execute(
                 select(User)
                 .options(
@@ -1350,7 +1403,12 @@ class RAGPermissionService:
         try:
             from sqlalchemy import select
 
-            # Get user with roles
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot get both access.")
+                return False, [], AccessLevel.PUBLIC.value
+
             user_result = await self.db.execute(
                 select(User)
                 .options(
@@ -1486,6 +1544,12 @@ class RAGPermissionService:
         """
         try:
             from sqlalchemy import select
+
+            try:
+                uuid.UUID(user_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user_id format: {user_id}. Cannot check admin RAG access.")
+                return False, [], AccessLevel.PUBLIC.value
 
             user_result = await self.db.execute(
                 select(User)

@@ -301,13 +301,8 @@ class AuthService:
             tenant_timezone = None
             if not is_maintainer and user.tenant_id:
                 try:
-                    from models.database.tenant import Tenant
-                    tenant_result = await self.db.execute(
-                        select(Tenant.timezone).where(Tenant.id == user.tenant_id)
-                    )
-                    tenant = tenant_result.scalar_one_or_none()
-                    if tenant and tenant.timezone:
-                        tenant_timezone = str(tenant.timezone)
+                    from utils.datetime_utils import DateTimeManager
+                    tenant_timezone = await DateTimeManager.get_tenant_timezone(str(user.tenant_id), self.db)
                 except Exception as e:
                     logger.warning(f"Failed to get tenant timezone for user {user_id}: {e}")
                     tenant_timezone = None

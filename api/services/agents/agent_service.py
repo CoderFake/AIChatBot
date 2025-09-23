@@ -11,10 +11,12 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
 import json
+import uuid
 
 from models.database.agent import Agent, AgentToolConfig
 from models.database.tenant import Department
 from models.database.tool import Tool, TenantToolConfig
+from common.types import AccessLevel, UserRole
 from utils.logging import get_logger
 from utils.datetime_utils import DateTimeManager
 
@@ -34,8 +36,16 @@ class AgentService:
     def _is_cache_valid(self) -> bool:
         """Check if agent cache is still valid"""
         if not self._cache_timestamp:
+            logger.debug("Cache invalid: No timestamp set")
             return False
-        return (DateTimeManager._now() - self._cache_timestamp).seconds < self._cache_ttl
+        
+        elapsed_seconds = (DateTimeManager._now() - self._cache_timestamp).total_seconds()
+        is_valid = elapsed_seconds < self._cache_ttl
+        
+        if not is_valid:
+            logger.debug(f"Cache invalid: Elapsed {elapsed_seconds}s > TTL {self._cache_ttl}s")
+        
+        return is_valid
     
     async def _refresh_cache(self) -> None:
         """Refresh agent cache from database"""
@@ -72,7 +82,9 @@ class AgentService:
     def invalidate_cache(self) -> None:
         """Force cache refresh on next request"""
         self._cache_timestamp = None
-        logger.info("Agent cache invalidated")
+        self._agent_cache.clear()
+        self._agents_structure_cache.clear()
+        logger.info("Agent cache invalidated - all caches cleared")
     
     async def _get_agent_tools(self, agent_id: str) -> List[Dict[str, Any]]:
         """Get tools for specific agent"""
@@ -745,13 +757,51 @@ class AgentService:
             
             from services.tools.tool_manager import tool_manager
 
+            raw_role = user_context.get("role")
+            normalized_role = raw_role.upper() if isinstance(raw_role, str) else ""
+
+            requested_scope = str(user_context.get("access_scope") or AccessLevel.PUBLIC.value).lower()
+            if requested_scope not in {AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value, "both"}:
+                requested_scope = AccessLevel.PUBLIC.value
+
+            if normalized_role == UserRole.USER.value:
+                requested_scope = AccessLevel.PUBLIC.value
+
+            if requested_scope == "both":
+                access_levels = [AccessLevel.PUBLIC.value, AccessLevel.PRIVATE.value]
+            elif requested_scope == AccessLevel.PRIVATE.value:
+                access_levels = [AccessLevel.PRIVATE.value]
+            else:
+                access_levels = [AccessLevel.PUBLIC.value]
+
+            department_value = user_context.get("department") or user_context.get("department_name")
+            if not department_value:
+                department_id = user_context.get("department_id")
+                if department_id:
+                    dept_lookup_id = department_id
+                    if isinstance(dept_lookup_id, str):
+                        try:
+                            dept_lookup_id = uuid.UUID(dept_lookup_id)
+                        except (ValueError, TypeError):
+                            dept_lookup_id = department_id
+                    dept_result = await self.db.execute(
+                        select(Department.department_name).where(Department.id == dept_lookup_id)
+                    )
+                    department_value = dept_result.scalar_one_or_none()
+
+            if not department_value:
+                if normalized_role in {UserRole.ADMIN.value, UserRole.MAINTAINER.value}:
+                    department_value = "all"
+                else:
+                    department_value = "general"
+
             tool_params = {
                 "query": query,
-                "department": user_context.get("department_name", "general"),
+                "department": department_value,
                 "user_id": user_context.get("user_id", ""),
-                "access_levels": ["public"],
-                "access_scope_override": user_context.get("access_scope"),
-                "detected_language": detected_language
+                "access_levels": access_levels,
+                "access_scope_override": requested_scope,
+                "user_role": raw_role
             }
             tool_result = await tool_manager.execute_tool(tool_name, tool_params, agent_providers, agent_id, user_context)
 
@@ -1004,12 +1054,18 @@ class AgentService:
 
         cache_key = f"agents_structure:{tenant_id}:{user_role}:{user_department_id or 'none'}"
 
+        # Check cache validity with proper logging
         cached_result = self._agents_structure_cache.get(cache_key)
-        if cached_result:
-            logger.info(f"✅ Cache HIT: Using cached agents structure for user role: {user_role}, tenant: {tenant_id}")
+        if cached_result and self._is_cache_valid():
+            logger.info(f"Cache HIT: Using cached agents structure for user role: {user_role}, tenant: {tenant_id}")
             return cached_result
         else:
-            logger.info(f"❌ Cache MISS: Building agents structure from database for user role: {user_role}, tenant_id: {tenant_id}, department_id: {user_department_id}")
+            # Log specific cache miss reason
+            if not cached_result:
+                logger.info(f"Cache MISS: No cached data for key {cache_key}")
+            elif not self._is_cache_valid():
+                logger.info(f"Cache MISS: Cache expired for key {cache_key}")
+            logger.info(f"Cache MISS: Building agents structure from database for user role: {user_role}, tenant_id: {tenant_id}, department_id: {user_department_id}")
 
 
         from models.database.agent import Agent, AgentToolConfig
@@ -1113,8 +1169,9 @@ class AgentService:
         rows = result.all()
         logger.info(f"Query returned {len(rows)} rows for user role {user_role}")
         
-        if len(rows) > 0:
-            self.invalidate_cache()
+        if len(rows) > 0 and not self._is_cache_valid():
+            self._cache_timestamp = DateTimeManager._now()
+            logger.info("Refreshed cache timestamp due to new query results")
 
         agents = {}
         for row in rows:
@@ -1140,9 +1197,10 @@ class AgentService:
             if not any(t["name"] == tool_info["name"] for t in agents[agent_name]["tools"]):
                 agents[agent_name]["tools"].append(tool_info)
 
-        # Cache the result
         self._agents_structure_cache[cache_key] = agents
-        logger.info(f"Cached agents structure for user role: {user_role} with {len(agents)} agents")
+        if not self._cache_timestamp:
+            self._cache_timestamp = DateTimeManager._now()
+        logger.info(f"Cached agents structure for user role: {user_role} with {len(agents)} agents, cache key: {cache_key}")
 
         return agents
 
@@ -1160,7 +1218,6 @@ class AgentService:
         try:
             agents_structure = await self.get_agents_structure_for_user(user_context)
             
-            # Search by agent_id in the structure
             for agent_key, agent_data in agents_structure.items():
                 if isinstance(agent_data, dict) and agent_data.get("agent_id") == agent_id:
                     return agent_data

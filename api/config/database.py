@@ -156,7 +156,6 @@ async def close_db():
 @asynccontextmanager
 async def get_db_context():
     """Context manager for database session with proper cancellation handling"""
-    # Ensure engine is initialized for the current event loop
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -165,7 +164,6 @@ async def get_db_context():
     if not db_manager._initialized:
         await db_manager.initialize()
     elif db_manager._loop is not None and current_loop is not db_manager._loop:
-        # Recreate engine/session factory for the new loop to prevent cross-loop futures
         try:
             await db_manager.close()
         except Exception:

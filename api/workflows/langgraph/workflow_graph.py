@@ -17,6 +17,7 @@ from .nodes.semantic_reflection_node import SemanticReflectionNode
 from .nodes.execute_planning_node import ExecutePlanningNode
 from .nodes.conflict_resolution_node import ConflictResolutionNode
 from .nodes.final_response_node import FinalResponseNode
+from .nodes.progress_tracker_node import ProgressTrackerNode
 from .edges.edges import (
     create_orchestrator_router,
     create_semantic_reflection_router,
@@ -158,7 +159,7 @@ class MultiAgentRAGWorkflow:
     
     def compile(self) -> None:
         """
-        Compile the workflow graph
+        Compile the workflow graph with enhanced checkpointing
         """
         try:
             if not self._graph:
@@ -168,17 +169,24 @@ class MultiAgentRAGWorkflow:
                 try:
                     from langgraph.checkpoint.memory import MemorySaver
                     checkpointer = MemorySaver()
-                    logger.info("Using MemorySaver for LangGraph checkpointing")
+                    logger.info("Using MemorySaver for LangGraph checkpointing - workflow state will be persisted")
                 except ImportError:
                     logger.warning("MemorySaver not available, disabling checkpointing")
                     checkpointer = None
             else:
                 checkpointer = None
+                logger.info("LangGraph checkpointing disabled")
             
-            self._compiled_graph = self._graph.compile(checkpointer=checkpointer)
+            compile_config = {}
+            if checkpointer:
+                compile_config["checkpointer"] = checkpointer
+                compile_config["interrupt_before"] = []  
+                compile_config["interrupt_after"] = []  
+            
+            self._compiled_graph = self._graph.compile(**compile_config)
             self._initialized = True
             
-            logger.info("Workflow compiled successfully")
+            logger.info(f"Workflow compiled successfully with checkpointing={self.enable_checkpointing}")
             
         except Exception as e:
             logger.error(f"Failed to compile workflow: {e}")
@@ -198,14 +206,27 @@ class MultiAgentRAGWorkflow:
 
     async def stream(self, input_data: Dict[str, Any], config: Optional[RunnableConfig] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Execute workflow with streaming - yields progress updates
+        Execute workflow with streaming - yields progress updates immediately
         """
         await self._ensure_runtime()
         try:
-            logger.info("Starting workflow streaming...")
+            logger.info("Starting workflow streaming with immediate yields and checkpointing...")
             emitted_runs = set()
+            
+            stream_config = config or {}
+            if self.enable_checkpointing:
+                session_id = input_data.get("session_id") or input_data.get("user_context", {}).get("session_id")
+                thread_id = f"workflow_{session_id}" if session_id else "default_workflow_thread"
+                stream_config = {
+                    **stream_config,
+                    "configurable": {
+                        **stream_config.get("configurable", {}),
+                        "thread_id": thread_id
+                    }
+                }
+                logger.info(f"Using thread_id for checkpointing: {thread_id}")
 
-            async for event in self._compiled_graph.astream_events(input_data, config=config):
+            async for event in self._compiled_graph.astream_events(input_data, config=stream_config, version="v1"):
                 event_type = event.get("event")
                 if event_type not in {"on_chain_stream", "on_chain_end"}:
                     continue
@@ -228,15 +249,28 @@ class MultiAgentRAGWorkflow:
                     continue
 
                 emitted_runs.add(event.get("run_id"))
+                
+                if output.get("task_status_update"):
+                    logger.info(f"WORKFLOW_GRAPH: Streaming task status update from node {node_name}: {output.get('task_status_update')}")
 
-                yield {
+                result = {
                     "type": "node",
                     "node": node_name,
-                    "output": output,
+                    "output": {
+                        **output,
+                        "execution_metadata": {
+                            "node_executed": node_name,
+                            "timestamp": asyncio.get_event_loop().time(),
+                            "checkpointing_enabled": self.enable_checkpointing
+                        }
+                    },
                     "progress": output.get("progress_percentage", 0),
                     "status": output.get("processing_status", "running"),
                     "message": output.get("progress_message"),
                 }
+                
+                yield result
+                await asyncio.sleep(0)
 
         except Exception as e:
             logger.error(f"Workflow streaming failed: {e}")
@@ -267,7 +301,7 @@ class MultiAgentRAGWorkflow:
             return False
 
 
-multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=False)
+multi_agent_rag_workflow = MultiAgentRAGWorkflow(enable_checkpointing=True)
 
 
 async def create_rag_workflow(enable_checkpointing: bool = True) -> MultiAgentRAGWorkflow:
@@ -297,6 +331,8 @@ async def execute_rag_query(
     agents_structure = None
     tenant_bot_name = bot_name
     tenant_org_name = organization_name
+    tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+    tenant_current_datetime = DateTimeManager.system_now().isoformat()
 
     if user_context.get("tenant_id"):
         try:
@@ -320,6 +356,12 @@ async def execute_rag_query(
                 tenant_bot_name = tenant_info["bot_name"]
                 tenant_org_name = tenant_info["organization_name"]
 
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(user_context["tenant_id"], db)
+                tenant_now = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+                tenant_current_datetime = tenant_now.isoformat()
+                user_context.setdefault("timezone", tenant_timezone)
+                user_context.setdefault("tenant_current_datetime", tenant_current_datetime)
+
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
             agents_structure = None
@@ -328,6 +370,8 @@ async def execute_rag_query(
         "query": query,
         "messages": messages or [],
         "user_context": user_context,
+        "tenant_timezone": tenant_timezone,
+        "tenant_current_datetime": tenant_current_datetime,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
         "provider_name": provider_name,
@@ -366,6 +410,7 @@ async def stream_rag_query(
     tenant_org_name = organization_name
     tenant_desc = tenant_description
     tenant_timezone = None
+    tenant_current_datetime = None
 
     if user_context.get("tenant_id"):
         try:
@@ -392,11 +437,24 @@ async def stream_rag_query(
                 tenant_bot_name = tenant_info["bot_name"]
                 tenant_org_name = tenant_info["organization_name"]
                 tenant_desc = tenant_info["description"]
-                tenant_timezone = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+
+                tenant_timezone = await DateTimeManager.get_tenant_timezone(user_context["tenant_id"], db)
+                tenant_now = await DateTimeManager.tenant_now_cached(user_context["tenant_id"], db)
+                tenant_current_datetime = tenant_now.isoformat()
+                user_context.setdefault("timezone", tenant_timezone)
 
         except Exception as e:
             logger.warning(f"Failed to initialize provider/agents/tenant info: {e}")
             agents_structure = None 
+
+    if not tenant_timezone:
+        tenant_timezone = getattr(DateTimeManager.system_tz, "key", str(DateTimeManager.system_tz))
+
+    if not tenant_current_datetime:
+        tenant_current_datetime = DateTimeManager.system_now().isoformat()
+
+    user_context.setdefault("timezone", tenant_timezone)
+    user_context.setdefault("tenant_current_datetime", tenant_current_datetime)
 
     langchain_messages = []
     if messages:
@@ -417,6 +475,7 @@ async def stream_rag_query(
         "messages": langchain_messages,
         "user_context": user_context,
         "tenant_timezone": tenant_timezone,
+        "tenant_current_datetime": tenant_current_datetime,
         "bot_name": tenant_bot_name,
         "organization_name": tenant_org_name,
         "tenant_description": tenant_desc,
